@@ -372,7 +372,17 @@ _SKILL_REVIEW_PROMPT = (
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
     "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
-    "WHETHER you update.\n\n" + _LESSON_LAYER_BLOCK +
+    "WHETHER you update.\n\n"
+    # Fork note (cyberyihu/sre): SKILL.md files grew past 100k chars and blew up per-turn
+    # context (skill_view returning 49k chars, sessions hitting compaction after ~20min).
+    "SKILL.md SIZE DISCIPLINE (hard rule): a SKILL.md carries the always-on rules, not a "
+    "knowledge store — keep every SKILL.md under ~25,000 characters. New troubleshooting knowledge, case "
+    "detail, or any guidance longer than one sentence goes into `references/<topic>.md` as a "
+    "complete standalone doc; the SKILL.md gains exactly ONE index line (trigger keywords / "
+    "exact error strings -> the reference path). NEVER append multi-sentence guidance "
+    "paragraphs to a SKILL.md body — if the detail matters, it belongs in the reference file. "
+    "If the SKILL.md you want to patch is already over budget, add only the one index line and "
+    "do not grow the body further.\n\n" + _LESSON_LAYER_BLOCK +
     "Signals to look for (any one of these warrants action):\n"
     "  • User corrected your style, tone, format, legibility, or verbosity. Frustration signals "
     "like 'stop doing X', 'this is too verbose', 'don't format like this', 'why are you "
@@ -461,7 +471,14 @@ _COMBINED_REVIEW_PROMPT = (
     "outcome.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
-    "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
+    "hoarding a references/ file per session.\n\n"
+    # Fork note (cyberyihu/sre): same SKILL.md size cap as _SKILL_REVIEW_PROMPT.
+    "SKILL.md SIZE DISCIPLINE (hard rule): a SKILL.md carries the always-on rules, not a "
+    "knowledge store — keep every SKILL.md under ~25,000 characters. Detail longer than one sentence "
+    "goes into `references/<topic>.md` as a complete standalone doc; SKILL.md gains exactly "
+    "ONE index line (trigger keywords / exact error strings -> the reference path). NEVER "
+    "append multi-sentence guidance paragraphs to a SKILL.md body; if it is already over "
+    "budget, add only the index line and do not grow it further.\n\n" + _LESSON_LAYER_BLOCK +
     "Signals that warrant a skill update (any one is enough):\n"
     "  • User corrected your style, tone, format, legibility, verbosity, or approach. Frustration "
     "is a FIRST-CLASS skill signal, not just a memory signal. 'stop doing X', 'don't format like "
