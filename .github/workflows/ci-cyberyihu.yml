@@ -1,0 +1,79 @@
+# Fork-specific CI for the cyberyihu patch branch.
+#
+# Upstream's tests.yml only triggers on main; this workflow validates the
+# carried patches (url_safety allowances, skill size discipline, curator
+# size audit) on every push/rebase of cyberyihu.
+# Kept as a separate additive file so rebases onto upstream never conflict.
+name: CI (cyberyihu)
+
+on:
+  push:
+    branches: [cyberyihu]
+  pull_request:
+    branches: [cyberyihu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cyberyihu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patched-area-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Import smoke test
+        run: |
+          uv run python -c "
+          import agent.curator as c
+          import agent.background_review as br
+          import gateway.run
+          import tools.url_safety as us
+          assert c._SKILL_BODY_BUDGET_CHARS == 25000
+          assert callable(c._audit_skill_body_sizes)
+          assert 'SIZE DISCIPLINE' in br._SKILL_REVIEW_PROMPT
+          assert 'SIZE DISCIPLINE' in br._COMBINED_REVIEW_PROMPT
+          assert '.myqcloud.com' in us._TRUSTED_PRIVATE_IP_SUFFIXES
+          assert us._allows_private_ip_resolution('cos.ap-guangzhou.myqcloud.com', 'https')
+          print('imports OK')
+          "
+
+      - name: Run tests for patched areas
+        run: |
+          uv run pytest -q \
+            tests/gateway/test_wecom.py \
+            tests/gateway/test_wecom_callback.py \
+            tests/gateway/test_telegram_noise_filter.py \
+            tests/agent/test_review_engine.py \
+            tests/agent/test_background_review_tool_call_guard.py \
+            tests/agent/test_curator.py \
+            tests/agent/test_curator_activity.py \
+            tests/agent/test_curator_backup.py \
+            tests/agent/test_curator_classification.py \
+            tests/agent/test_curator_reports.py \
+            tests/hermes_cli/test_curator_run.py \
+            tests/hermes_cli/test_curator_archive_prune.py \
+            tests/hermes_cli/test_curator_status.py \
+            tests/hermes_cli/test_curator_recent_run_notice.py \
+            tests/tools/test_url_safety.py \
+            tests/run_agent/test_413_compression.py
