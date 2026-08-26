@@ -442,9 +442,11 @@ CURATOR_REVIEW_PROMPT = (
     "trigger class in that window). One broad umbrella "
     "skill with labeled subsections beats five narrow siblings for "
     "discoverability, not the other way around.\n\n"
-    "The right target shape is CLASS-LEVEL skills with rich SKILL.md "
-    "bodies + `references/`, `templates/`, and `scripts/` subfiles for "
-    "session-specific detail — not one-session-one-skill micro-entries.\n\n"
+    "The right target shape is CLASS-LEVEL skills, each with an "
+    "index-style SKILL.md (routing skeleton + one-line pointers) + "
+    "`references/`, `templates/`, and `scripts/` subfiles carrying the "
+    "actual detail — not one-session-one-skill micro-entries, and not "
+    "monolithic SKILL.md bodies.\n\n"
     "Hard rules — do not violate:\n"
     "1. DO NOT touch bundled, hub-installed, or external-dir skills "
     "(`skills.external_dirs`). The candidate list below is already filtered "
@@ -477,6 +479,19 @@ CURATOR_REVIEW_PROMPT = (
     "right bar is: 'would a human maintainer write this as N separate "
     "skills, or as one skill with N labeled subsections?' When the "
     "answer is the latter, merge.\n\n"
+    "6. SKILL.md BODY BUDGET — every SKILL.md must stay under ~25,000 "
+    "characters. A SKILL.md is a ROUTING INDEX, not a knowledge store: "
+    "frontmatter, when-to-use triggers, a short workflow/decision "
+    "skeleton, and one-line pointers into `references/` (trigger "
+    "keywords / exact error strings -> file path). When you absorb a "
+    "sibling, move its body VERBATIM into "
+    "`<umbrella>/references/<topic>.md` and add exactly ONE index line "
+    "to the umbrella's SKILL.md — never paste the absorbed body into "
+    "the umbrella's SKILL.md. During the pass, slim any SKILL.md that "
+    "is already over budget the same way: demote body sections into "
+    "references/ files (verbatim, no content loss), deduplicate index "
+    "lines, keep the skeleton. Growing a SKILL.md past the budget is a "
+    "regression, not a consolidation win.\n\n"
     "How to work — not optional:\n"
     "1. Scan the full candidate list. Identify PREFIX CLUSTERS (skills "
     "sharing a first word or domain keyword). Examples you are likely "
@@ -491,9 +506,10 @@ CURATOR_REVIEW_PROMPT = (
     "3. Three ways to consolidate — use the right one per cluster:\n"
     "   a. MERGE INTO EXISTING UMBRELLA — one skill in the cluster is "
     "already broad enough to be the umbrella (example: `pr-triage-"
-    "salvage` for the PR review cluster). Patch it to add a labeled "
-    "section for each sibling's unique insight, then archive the "
-    "siblings.\n"
+    "salvage` for the PR review cluster). Move each sibling's unique "
+    "insight into `<umbrella>/references/<topic>.md` and patch the "
+    "umbrella's SKILL.md with one index line per absorbed sibling "
+    "(hard rule 6), then archive the siblings.\n"
     "   b. CREATE A NEW UMBRELLA SKILL.md — no existing member is broad "
     "enough. Use skill_manage action=create to write a new class-level "
     "skill whose SKILL.md covers the shared workflow and has short "
@@ -1113,6 +1129,61 @@ def _build_rename_summary(
     return "\n".join(lines)
 
 
+_SKILL_BODY_BUDGET_CHARS = 25000
+
+
+def _audit_skill_body_sizes() -> List[Dict[str, Any]]:
+    """Per-skill SKILL.md byte sizes across the whole library (depth 1-2).
+
+    Includes bundled/hub skills — the body budget applies to everything
+    skill_view can load. Skips .archive/ and other dot-directories.
+    Best-effort: OS errors drop the entry, never raise.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        root = get_hermes_home() / "skills"
+        candidates = list(root.glob("*/SKILL.md")) + list(root.glob("*/*/SKILL.md"))
+        for md_path in sorted(candidates):
+            rel_parts = md_path.parent.relative_to(root).parts
+            if any(p.startswith(".") for p in rel_parts):
+                continue
+            try:
+                size = md_path.stat().st_size
+            except OSError:
+                continue
+            out.append({
+                "skill": "/".join(rel_parts),
+                "bytes": size,
+                "over_budget": size > _SKILL_BODY_BUDGET_CHARS,
+            })
+    except Exception as e:
+        logger.debug("Curator skill-size audit failed: %s", e)
+    out.sort(key=lambda s: -s["bytes"])
+    return out
+
+
+def _render_size_audit_markdown(skill_sizes: List[Dict[str, Any]]) -> str:
+    """Markdown section appended to REPORT.md listing the largest SKILL.md files."""
+    if not skill_sizes:
+        return ""
+    over = [s for s in skill_sizes if s.get("over_budget")]
+    lines = [
+        "",
+        "## SKILL.md size audit",
+        "",
+        f"Budget: {_SKILL_BODY_BUDGET_CHARS:,} bytes per SKILL.md · "
+        f"files: {len(skill_sizes)} · over budget: {len(over)}",
+        "",
+    ]
+    for s in skill_sizes[:15]:
+        flag = " ⚠️ **OVER BUDGET**" if s.get("over_budget") else ""
+        lines.append(f"- `{s['skill']}` — {s['bytes']:,} bytes{flag}")
+    if len(skill_sizes) > 15:
+        lines.append(f"- … {len(skill_sizes) - 15} more in run.json `skill_md_sizes`")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _write_run_report(
     *,
     started_at: datetime,
@@ -1275,6 +1346,15 @@ def _write_run_report(
         "tool_calls": llm_meta.get("tool_calls", []),
     }
 
+    # SKILL.md size audit — bodies are meant to be routing indexes (hard
+    # rule 6 in the review prompt); surface per-file sizes every run so
+    # bloat regressions are visible without diffing the tree by hand.
+    skill_sizes = _audit_skill_body_sizes()
+    payload["skill_md_sizes"] = skill_sizes
+    payload["counts"]["skill_md_over_budget"] = sum(
+        1 for s in skill_sizes if s.get("over_budget")
+    )
+
     # run.json — machine-readable, full fidelity
     try:
         (run_dir / "run.json").write_text(
@@ -1287,6 +1367,7 @@ def _write_run_report(
     # REPORT.md — human-readable
     try:
         md = _render_report_markdown(payload)
+        md += _render_size_audit_markdown(skill_sizes)
         (run_dir / "REPORT.md").write_text(md, encoding="utf-8")
     except Exception as e:
         logger.debug("Curator REPORT.md write failed: %s", e)
