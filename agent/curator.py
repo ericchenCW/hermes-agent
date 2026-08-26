@@ -317,6 +317,19 @@ CURATOR_REVIEW_PROMPT = (
     "right bar is: 'would a human maintainer write this as N separate "
     "skills, or as one skill with N labeled subsections?' When the "
     "answer is the latter, merge.\n\n"
+    "6. SKILL.md BODY BUDGET — every SKILL.md must stay under ~25,000 "
+    "characters. A SKILL.md carries the always-on rules, not a knowledge "
+    "store: frontmatter, when-to-use triggers, a short workflow/decision "
+    "skeleton, and one-line pointers into `references/` (trigger "
+    "keywords / exact error strings -> file path). When you absorb a "
+    "sibling, DISTIL its body into rules (see the target shape above) "
+    "and land that depth in `<umbrella>/references/<topic>.md`, adding "
+    "exactly ONE index line to the umbrella's SKILL.md — never paste the "
+    "absorbed body into the umbrella's SKILL.md. During the pass, slim "
+    "any SKILL.md that is already over budget the same way: demote body "
+    "sections into references/ files (distilled, no rule lost), "
+    "deduplicate index lines, keep the skeleton. Growing a SKILL.md past "
+    "the budget is a regression, not a consolidation win.\n\n"
     "How to work — not optional:\n"
     "1. Scan the full candidate list. Identify PREFIX CLUSTERS (skills "
     "sharing a first word or domain keyword). Examples you are likely "
@@ -331,9 +344,10 @@ CURATOR_REVIEW_PROMPT = (
     "3. Three ways to consolidate — use the right one per cluster:\n"
     "   a. MERGE INTO EXISTING UMBRELLA — one skill in the cluster is "
     "already broad enough to be the umbrella (example: `pr-triage-"
-    "salvage` for the PR review cluster). Patch it to add a labeled "
-    "section for each sibling's unique insight, then archive the "
-    "siblings.\n"
+    "salvage` for the PR review cluster). Distil each sibling's unique "
+    "insight into `<umbrella>/references/<topic>.md` and patch the "
+    "umbrella's SKILL.md with one index line per absorbed sibling "
+    "(hard rule 6), then archive the siblings.\n"
     "   b. CREATE A NEW UMBRELLA SKILL.md — no existing member is broad "
     "enough. Use skill_manage action=create to write a new class-level "
     "skill whose SKILL.md covers the shared workflow and has short "
@@ -669,6 +683,52 @@ def _rewrite_cron_refs(consolidated: List[Dict[str, Any]], pruned: List[Dict[str
         return {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0, "error": str(e)}
 
 
+_SKILL_BODY_BUDGET_CHARS = 25000
+
+
+def _audit_skill_body_sizes() -> List[Dict[str, Any]]:
+    """Per-skill SKILL.md byte sizes across the whole library (depth 1-2).
+
+    Fork note (cyberyihu/sre): includes bundled/hub skills — the body budget applies to
+    everything skill_view can load. Skips .archive/ and other dot-directories.
+    Best-effort: OS errors drop the entry, never raise.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        root = get_hermes_home() / "skills"
+        candidates = list(root.glob("*/SKILL.md")) + list(root.glob("*/*/SKILL.md"))
+        for md_path in sorted(candidates):
+            rel_parts = md_path.parent.relative_to(root).parts
+            if any(p.startswith(".") for p in rel_parts):
+                continue
+            try:
+                size = md_path.stat().st_size
+            except OSError:
+                continue
+            out.append({"skill": "/".join(rel_parts), "bytes": size, "over_budget": size > _SKILL_BODY_BUDGET_CHARS})
+    except Exception as e:
+        logger.debug("Curator skill-size audit failed: %s", e)
+    out.sort(key=lambda s: -s["bytes"])
+    return out
+
+
+def _render_size_audit_markdown(skill_sizes: List[Dict[str, Any]]) -> str:
+    """Markdown section appended to REPORT.md listing the largest SKILL.md files."""
+    if not skill_sizes:
+        return ""
+    over = [s for s in skill_sizes if s.get("over_budget")]
+    lines = ["", "## SKILL.md size audit", "",
+             f"Budget: {_SKILL_BODY_BUDGET_CHARS:,} bytes per SKILL.md \u00b7 "
+             f"files: {len(skill_sizes)} \u00b7 over budget: {len(over)}", ""]
+    for s in skill_sizes[:15]:
+        flag = " \u26a0\ufe0f **OVER BUDGET**" if s.get("over_budget") else ""
+        lines.append(f"- `{s['skill']}` \u2014 {s['bytes']:,} bytes{flag}")
+    if len(skill_sizes) > 15:
+        lines.append(f"- \u2026 {len(skill_sizes) - 15} more in run.json `skill_md_sizes`")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _write_file(path: Path, label: str, render: Any) -> None:
     """Best-effort write of *render()* (or the JSON dump of a non-callable payload);
     rendering runs inside the guard so a serialisation error is logged, not raised."""
@@ -716,8 +776,15 @@ def _write_run_report(
         "llm_final": llm_meta.get("final", ""), "llm_summary": llm_meta.get("summary", ""),
         "llm_error": llm_meta.get("error"), "tool_calls": llm_meta.get("tool_calls", []),
     }
+    # Fork note (cyberyihu/sre): SKILL.md bodies are always-on rules under a hard size budget
+    # (rule 6 in the review prompt); surface per-file sizes every run so bloat regressions are
+    # visible without diffing the tree by hand.
+    skill_sizes = _audit_skill_body_sizes()
+    payload["skill_md_sizes"] = skill_sizes
+    payload["counts"]["skill_md_over_budget"] = sum(1 for s in skill_sizes if s.get("over_budget"))
     _write_file(run_dir / "run.json", "run.json", payload)
-    _write_file(run_dir / "REPORT.md", "REPORT.md", lambda: _render_report_markdown(payload))
+    _write_file(run_dir / "REPORT.md", "REPORT.md",
+                lambda: _render_report_markdown(payload) + _render_size_audit_markdown(skill_sizes))
     if jobs_updated > 0:  # only when a job was touched, to keep no-op run dirs uncluttered
         _write_file(run_dir / "cron_rewrites.json", "cron_rewrites.json", cron_rewrites)
     return run_dir
