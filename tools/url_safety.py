@@ -190,7 +190,10 @@ _ALWAYS_BLOCKED_IPS = frozenset({
     ipaddress.ip_address("::ffff:100.100.100.200"),
 })
 _ALWAYS_BLOCKED_NETWORKS = (
-    ipaddress.ip_network("169.254.0.0/16"),    # Entire link-local range (no legit agent target)
+    # Fork note (cyberyihu): upstream blocks the entire 169.254.0.0/16;
+    # narrowed to the metadata /24 so Tencent-internal link-local services
+    # stay reachable.  The IMDS literals above remain blocked outright.
+    ipaddress.ip_network("169.254.169.0/24"),  # Cloud metadata /24
     ipaddress.ip_network("::ffff:169.254.0.0/112"), # IPv4-mapped link-local range
 )
 
@@ -200,6 +203,16 @@ _ALWAYS_BLOCKED_NETWORKS = (
 _TRUSTED_PRIVATE_IP_HOSTS = frozenset({
     "multimedia.nt.qq.com.cn",
 })
+
+# Fork note (cyberyihu): hostname suffixes allowed to resolve to private
+# IPs.  Tencent Cloud COS endpoints (*.myqcloud.com) resolve to internal
+# addresses from inside a Tencent Cloud VPC, so the deployed gateway on
+# 10.9.0.1 cannot reach its own object storage without this allowance.
+# The always-blocked metadata floor (_ALWAYS_BLOCKED_IPS / _NETWORKS) is
+# evaluated before this allowance and still applies.
+_TRUSTED_PRIVATE_IP_SUFFIXES = (
+    ".myqcloud.com",
+)
 
 _MAX_SSRF_CONNECT_IPS = 8
 
@@ -408,8 +421,18 @@ def is_always_blocked_url(url: str) -> bool:
 
 
 def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
-    """Return True when a trusted HTTPS hostname may bypass IP-class blocking."""
-    return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
+    """Return True when a trusted hostname may bypass IP-class blocking.
+
+    Fork note (cyberyihu): besides upstream's exact-HTTPS-hostname set,
+    hostnames under ``_TRUSTED_PRIVATE_IP_SUFFIXES`` (Tencent Cloud COS)
+    are allowed on both schemes.  Routing the allowance through this
+    shared helper covers ``is_safe_url`` *and* ``_resolved_http_connect_ips``
+    so it survives the connect-time DNS-rebinding check too.
+    """
+    if scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS:
+        return True
+    host = (hostname or "").lower()
+    return any(host.endswith(suffix) for suffix in _TRUSTED_PRIVATE_IP_SUFFIXES)
 
 
 def is_safe_url(url: str) -> bool:
