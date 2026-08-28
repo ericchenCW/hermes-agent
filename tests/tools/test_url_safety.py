@@ -373,6 +373,21 @@ class TestAllowPrivateUrlsIntegration:
         monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
         assert is_safe_url("http://metadata.google.internal/computeMetadata/v1/") is False
 
+    def test_metadata_link_local_blocked_even_with_toggle(self, monkeypatch):
+        """The metadata /24 (169.254.169.0/24) is ALWAYS blocked, toggle or not.
+
+        Fork note (cyberyihu): upstream blocks the entire 169.254.0.0/16;
+        this fork narrows the always-blocked range to the metadata /24 so
+        Tencent-internal link-local services stay reachable when private
+        URLs are allowed. Non-metadata link-local therefore follows the
+        toggle instead of being unconditionally blocked.
+        """
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        with _resolves_to("169.254.169.99"):
+            assert is_safe_url("http://169.254.169.99/anything") is False
+        with _resolves_to("169.254.42.99"):
+            assert is_safe_url("http://169.254.42.99/anything") is True
+
     def test_dns_failure_still_blocked_with_toggle(self, monkeypatch):
         """DNS failures are still blocked even with toggle on."""
         monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
@@ -388,10 +403,16 @@ class TestIsAlwaysBlockedUrl:
     # -- The sentinel set that must always block --------------------------------
 
     @pytest.mark.parametrize("url", [
-        "http://169.254.42.1/",                      # any /16 link-local (incl. IMDS)
+        "http://169.254.169.1/",                     # metadata /24 link-local
         "http://100.100.100.200/latest/meta-data/",   # Alibaba Cloud
     ])
     def test_literal_imds_ips_always_blocked(self, url):
+        """Literal IMDS IPs and the metadata /24 link-local range always block.
+
+        Fork note (cyberyihu): the always-blocked range is narrowed from
+        169.254.0.0/16 to 169.254.169.0/24 so Tencent-internal link-local
+        services stay reachable; see tools/url_safety.py.
+        """
         assert is_always_blocked_url(url) is True
 
     def test_gcp_metadata_hostname_always_blocked_even_without_dns(self):
