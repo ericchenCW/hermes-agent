@@ -166,6 +166,30 @@ TOOLSETS = {
     "debugging": _ts("Debugging and troubleshooting toolkit", ["terminal", "process_manage"], includes=["web", "file"]),
     "safe": _ts("Safe toolkit without terminal access", [], includes=["web", "vision", "image_gen"]),
 
+    # AI SRE toolset (idcsre trimmed deployment): offline Q&A over a local corpus —
+    # retrieval via terminal/file tools, plus skills/todo/memory/clarify/vision. No web,
+    # browser, messaging, generation, delegation, cron, or code-execution tools.
+    # Activated explicitly via `platform_toolsets: {cli: [sre]}` (or per-user
+    # `user_toolsets`) — never auto-selected.
+    # posture=True: like `coding`, this is a whole-session posture that RE-LISTS core tools
+    # (terminal/read_file/…) without owning them. The flag keeps it out of the two places that
+    # enumerate user-facing toolsets — the non-configurable-toolset recovery loop
+    # (hermes_cli/tools_config.py) and the Blank Slate `disabled_toolsets` sweep
+    # (hermes_cli/setup_quick.py) — and makes `_apply_toolset_selection` subtract only the
+    # non-core delta if an operator ever lists it in `disabled_toolsets`. Without it, Blank Slate
+    # put `sre` in disabled_toolsets and that end-of-pipeline subtraction stripped the whole
+    # minimal file/terminal/vision/skills surface (#57315-class breakage).
+    "sre": _ts(
+        "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, memory, clarify, vision",
+        ["terminal", "process",
+         "read_file", "write_file", "patch", "search_files",
+         "vision_analyze",
+         "skills_list", "skill_view", "skill_manage",
+         "todo", "memory",
+         "clarify"],
+        posture=True,
+    ),
+
     # Coding posture, auto-selected in a code workspace (agent/coding_context.py).
     # `desktop_ui` is folded in separately by the GUI gateway for desktop sessions.
     # posture=True: per-session posture, never auto-recovered into platform tool
