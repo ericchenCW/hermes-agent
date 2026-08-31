@@ -373,6 +373,24 @@ TOOLSETS = {
         "includes": ["web", "vision", "image_gen"]
     },
 
+    # AI SRE toolset (idcsre trimmed deployment): offline Q&A over a local
+    # corpus — retrieval via terminal/file tools, plus skills/todo/memory/
+    # clarify/vision. No web, browser, messaging, generation, delegation,
+    # cron, or code-execution tools. Activated explicitly via
+    # `platform_toolsets: {cli: [sre]}`; not a posture (no auto-selection).
+    "sre": {
+        "description": "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, memory, clarify, vision",
+        "tools": [
+            "terminal", "process",
+            "read_file", "write_file", "patch", "search_files",
+            "vision_analyze",
+            "skills_list", "skill_view", "skill_manage",
+            "todo", "memory",
+            "clarify",
+        ],
+        "includes": [],
+    },
+
     # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a
     # code workspace; see agent/coding_context.py. Keeps everything you reach
     # for while pairing on code and drops the rest (messaging, tts, image_gen,
