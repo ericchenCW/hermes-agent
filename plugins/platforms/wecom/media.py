@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
+from utils import env_int
 from gateway.platforms.base import BasePlatformAdapter, SendResult, cache_document_from_bytes_async, cache_image_from_bytes_async
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
@@ -41,11 +42,15 @@ VOICE_SUPPORTED_MIMES = {"audio/amr"}
 # of trailing as separate image messages.  The gateway stages the final response
 # via ``stage_stream_media`` right before finalize; paths embedded successfully are
 # skipped by ``send_multiple_images``.  Any failure falls back to per-image delivery.
-INLINE_MSG_ITEM_MAX = 10
-# The finish frame travels on the one WebSocket shared by every chat, and WeCom's own
-# media uploads are chunked at 512KB, so keep the inline payload in the low-MB range.
+# Field test 2026-09-02 (dgx-spark hermes-sre): WeCom accepts msg_item images but its
+# clients render them as SEPARATE image messages after the bubble — not inline — and a
+# ~800KB frame (10 images) was acked with errcode 0 yet never updated the bubble text,
+# while a 126KB frame (3 images) worked.  The visible result therefore equals the
+# per-image path, with an undocumented size ceiling on top.  Default OFF; opt in with
+# WECOM_INLINE_MEDIA_MAX_ITEMS (1-10) and optionally WECOM_INLINE_MEDIA_MAX_BYTES.
+INLINE_MSG_ITEM_MAX = max(0, min(10, env_int("WECOM_INLINE_MEDIA_MAX_ITEMS", 0)))
 INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
-INLINE_TOTAL_MAX_BYTES = 4 * 1024 * 1024
+INLINE_TOTAL_MAX_BYTES = max(64 * 1024, env_int("WECOM_INLINE_MEDIA_MAX_BYTES", 300 * 1024))
 INLINE_STAGE_TTL_SECONDS = 120.0
 INLINE_EMBED_WAIT_SECONDS = 20.0
 INLINE_EMPTY_TEXT_PLACEHOLDER = "✅"
@@ -358,7 +363,7 @@ class WeComMediaMixin:
         """Stage the MEDIA: images of the authoritative final response for the upcoming finalize
         frame of ``chat_id`` (called by the gateway right before ``GatewayStreamConsumer.finish``).
         Returns the number of images staged; only local JPG/PNG paths qualify."""
-        if not chat_id or not response_text:
+        if not chat_id or not response_text or INLINE_MSG_ITEM_MAX <= 0:
             return 0
         self._sweep_inline_state()
         stage_key = self._inline_stage_key(chat_id, turn_id)
