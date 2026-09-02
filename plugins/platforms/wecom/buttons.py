@@ -188,6 +188,8 @@ class WeComButtonsMixin:
         elif not self._is_dm_intake_allowed(sender_id):
             logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
             return
+        if not chat_id or not label:
+            return  # malformed event: leave the card usable
         # Consume synchronously (no await yet): concurrent clicks on the same card are separate
         # tasks, and only the first one may route.
         if pending and not repeat:
@@ -207,9 +209,8 @@ class WeComButtonsMixin:
                 },
             }
             asyncio.ensure_future(self._send_card_update(req_id, update))
+            await asyncio.sleep(0)  # let the update frame go out before routing
         if repeat:
-            return
-        if not chat_id or not label:
             return
         msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")
         if self._dedup.is_duplicate(msg_id):
@@ -221,7 +222,18 @@ class WeComButtonsMixin:
         self._stream_expired_chats.add(chat_id)
         self._button_click_chats.add(chat_id)
         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None)
-        await self.handle_message(MessageEvent(
+        event_obj = MessageEvent(
             text=label, message_type=MessageType.TEXT, source=source, raw_message=payload,
             message_id=msg_id, media_urls=[], media_types=[], timestamp=datetime.now(tz=timezone.utc),
-        ))
+        )
+        try:
+            await self.handle_message(event_obj)
+        except Exception:
+            # let the user click again: un-consume the card and forget the dedup id
+            if pending:
+                pending["consumed"] = False
+                pending.pop("chosen", None)
+            discard = getattr(self._dedup, "discard", None)
+            if callable(discard):
+                discard(msg_id)
+            raise
