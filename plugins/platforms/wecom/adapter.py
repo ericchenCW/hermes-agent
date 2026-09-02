@@ -215,9 +215,12 @@ BUTTON_DIRECTIVE_RE = re.compile(
     re.M | re.I,
 )
 BUTTON_MAX = 6
-BUTTON_LABEL_MAX = 20
+BUTTON_LABEL_MAX = 10          # WeCom button text limit
+BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
+BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
+BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS[^\n]*\Z", re.I)
 _INLINE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
 _EMPTY_MD_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*\)")
 VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -467,6 +470,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._embedded_inline_media: Dict[str, Tuple[set, float, "asyncio.Future[bool]"]] = {}
         # task_id -> {"chat_id","title","options","keys","ts"} for cards we sent (button clicks map back here)
         self._pending_button_cards: Dict[str, Dict[str, Any]] = {}
+        # chats whose latest inbound was a button click: no usable req_id →
+        # replies go proactive (also in groups) until the next real message
+        self._button_click_chats: set[str] = set()
 
         # Per-chat FIFO send queue with token-bucket rate limiting.
         # Mirrors OpenClaw's chat-queue.ts (serial per chat) plus a
@@ -978,10 +984,9 @@ class WeComAdapter(BasePlatformAdapter):
             _event = body.get("event") if isinstance(body.get("event"), dict) else {}
             _eventtype = str(_event.get("eventtype") or "")
             if _eventtype == "template_card_event":
-                try:
-                    await self._on_template_card_event(payload)
-                except Exception as exc:
-                    logger.warning("[%s] template_card_event handling failed: %s", self.name, exc)
+                # Off the read loop: the update ack is resolved by this loop,
+                # so awaiting inline would self-deadlock for the full 5 s.
+                asyncio.ensure_future(self._on_template_card_event_guarded(payload))
                 return
             if _eventtype in ("feedback_event", "enter_chat"):
                 logger.info("[%s] Event %s: %s", self.name, _eventtype, json.dumps(_event, ensure_ascii=False)[:300])
@@ -1862,6 +1867,7 @@ class WeComAdapter(BasePlatformAdapter):
         # stale "stream is dead" marker from prior 846608 responses so the
         # next outbound turn can attempt native streaming again.
         self._stream_expired_chats.discard(normalized_chat_id)
+        self._button_click_chats.discard(normalized_chat_id)
         # A new inbound message starts a new "turn" — allow send_typing to
         # open a fresh stream again (the previous turn's delivery guard is
         # no longer relevant).
@@ -2149,48 +2155,69 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_button_directive(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Split a trailing ``BUTTONS[title]: a | b | c`` line off ``text``.
+
+        Only the *last* non-blank line counts, and not when it sits inside an
+        open triple-backtick fence (the skill docs quote the syntax verbatim).
         Returns (clean_text, spec) where spec = {"title", "options"} or None."""
         if not text or "BUTTONS" not in text.upper():
             return text, None
-        matches = list(BUTTON_DIRECTIVE_RE.finditer(text))
-        if not matches:
+        stripped = text.rstrip()
+        head, sep, last = stripped.rpartition("\n")
+        if not sep:
+            head, last = "", stripped
+        m = BUTTON_DIRECTIVE_RE.fullmatch(last.strip())
+        if not m or head.count("```") % 2 == 1:
             return text, None
-        m = matches[-1]
         raw = m.group("opts")
         parts = [p.strip(" \t*`\"'“”") for p in re.split(r"\s*[|｜]\s*", raw)]
         options: List[str] = []
         for p in parts:
-            p = p[:BUTTON_LABEL_MAX]
             if p and p not in options:
                 options.append(p)
-        options = options[:BUTTON_MAX]
-        clean = (text[: m.start()] + text[m.end():]).rstrip()
+        options = [p[:BUTTON_LABEL_MAX] for p in options[:BUTTON_MAX]]
         if not options:
-            return clean, None
-        title = (m.group("title") or BUTTON_DEFAULT_TITLE).strip()[:60]
-        return clean, {"title": title, "options": options}
+            return text, None
+        title = (m.group("title") or BUTTON_DEFAULT_TITLE).strip()[:BUTTON_TITLE_MAX]
+        return head.rstrip(), {"title": title, "options": options}
+
+    @staticmethod
+    def _strip_partial_button_line(text: str) -> str:
+        """Intermediate stream frames: hide a trailing (possibly half-written)
+        ``BUTTONS...`` line so the directive never shows up in the bubble."""
+        if not text or "BUTTONS" not in text.upper():
+            return text
+        m = BUTTON_PARTIAL_LINE_RE.search(text)
+        return text[: m.start()].rstrip() if m else text
+
+    def _sweep_button_cards(self) -> None:
+        cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS
+        for k, v in list(self._pending_button_cards.items()):
+            if v["ts"] < cutoff:
+                self._pending_button_cards.pop(k, None)
+        overflow = len(self._pending_button_cards) - BUTTON_CARDS_MAX
+        if overflow > 0:
+            for k in sorted(self._pending_button_cards, key=lambda k: self._pending_button_cards[k]["ts"])[:overflow]:
+                self._pending_button_cards.pop(k, None)
 
     def _build_button_card(self, chat_id: str, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         task_id = f"btn-{uuid.uuid4().hex[:24]}"
-        keys = [f"opt{i}" for i in range(len(spec["options"]))]
+        # the label rides inside the key so a click can be decoded even after
+        # a gateway restart wiped the registry
+        keys = [f"opt{i}|{label}" for i, label in enumerate(spec["options"])]
         card = {
             "card_type": "button_interaction",
-            "main_title": {"title": spec["title"]},
+            "main_title": {"title": spec["title"][:BUTTON_TITLE_MAX]},
             "task_id": task_id,
             "button_list": [
                 {"text": label, "style": 1 if i == 0 else 4, "key": key}
                 for i, (label, key) in enumerate(zip(spec["options"], keys))
             ],
         }
+        self._sweep_button_cards()
         self._pending_button_cards[task_id] = {
             "chat_id": chat_id, "title": spec["title"], "options": list(spec["options"]),
-            "keys": keys, "ts": time.monotonic(),
+            "keys": keys, "ts": time.monotonic(), "consumed": False,
         }
-        # keep the registry bounded
-        cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS
-        for k, v in list(self._pending_button_cards.items()):
-            if v["ts"] < cutoff:
-                self._pending_button_cards.pop(k, None)
         return task_id, card
 
     async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str]) -> bool:
@@ -2215,24 +2242,38 @@ class WeComAdapter(BasePlatformAdapter):
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
+    async def _on_template_card_event_guarded(self, payload: Dict[str, Any]) -> None:
+        try:
+            await self._on_template_card_event(payload)
+        except Exception as exc:
+            logger.warning("[%s] template_card_event handling failed: %s", self.name, exc)
+
     async def _on_template_card_event(self, payload: Dict[str, Any]) -> None:
         """Button click: acknowledge by updating the card (<5 s), then hand the
-        chosen label to the agent as if the user had typed it."""
+        chosen label to the agent as if the user had typed it.
+
+        Runs as its own task (never inline in the read loop — the update ack
+        is delivered by that loop)."""
         body = payload.get("body") or {}
         req_id = self._payload_req_id(payload)
         event = body.get("event") if isinstance(body.get("event"), dict) else {}
-        detail = event.get("template_card_event") if isinstance(event.get("template_card_event"), dict) else {}
+        # WeCom may nest the detail under ``template_card_event``; the official
+        # example reads ``event_key`` straight off ``event`` — accept both.
+        detail = event.get("template_card_event") if isinstance(event.get("template_card_event"), dict) else event
         event_key = str(detail.get("event_key") or "").strip()
         task_id = str(detail.get("task_id") or "").strip()
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
-        chat_id = str(body.get("chatid") or sender_id).strip()
-        is_group = str(body.get("chattype") or "").lower() == "group"
+        self._sweep_button_cards()
         pending = self._pending_button_cards.get(task_id) or {}
-        label = event_key
+        chat_id = str(pending.get("chat_id") or body.get("chatid") or sender_id).strip()
+        is_group = chat_id in self._group_chat_ids or str(body.get("chattype") or "").lower() == "group"
         if pending and event_key in pending.get("keys", []):
             label = pending["options"][pending["keys"].index(event_key)]
-        # selected_items (dropdown / multi-select) → append chosen option ids as text
+        elif "|" in event_key:
+            label = event_key.split("|", 1)[1].strip()
+        else:
+            label = event_key
         sel = detail.get("selected_items")
         if isinstance(sel, dict):
             ids = []
@@ -2242,10 +2283,20 @@ class WeComAdapter(BasePlatformAdapter):
                     ids += list(oid.get("option_id") or []) if isinstance(oid, dict) else []
             if ids:
                 label = (label + " " if label else "") + ",".join(str(x) for x in ids)
+        repeat = bool(pending.get("consumed"))
         logger.info(
-            "[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s",
-            self.name, chat_id, sender_id, task_id, event_key, label, is_group,
+            "[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s repeat=%s",
+            self.name, chat_id, sender_id, task_id, event_key, label, is_group, repeat,
         )
+        # 0) policy first — a blocked user gets neither the update nor a routed message
+        if is_group:
+            self._group_chat_ids.add(chat_id)
+            if not self._is_group_allowed(chat_id, sender_id):
+                logger.info("[%s] Button click DROPPED by group policy: chat=%s", self.name, chat_id)
+                return
+        elif not self._is_dm_intake_allowed(sender_id):
+            logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
+            return
         # 1) acknowledge within 5 s — card becomes a text notice with the choice
         if req_id and task_id:
             title = (pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE
@@ -2253,8 +2304,8 @@ class WeComAdapter(BasePlatformAdapter):
                 "response_type": "update_template_card",
                 "template_card": {
                     "card_type": "text_notice",
-                    "main_title": {"title": title[:60]},
-                    "sub_title_text": f"已选择：{label or event_key}"[:160],
+                    "main_title": {"title": title[:BUTTON_TITLE_MAX]},
+                    "sub_title_text": f"已选择：{label or event_key}"[:100],
                     "task_id": task_id,
                 },
             }
@@ -2265,24 +2316,22 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
             except Exception as exc:
                 logger.warning("[%s] update_template_card failed: %s", self.name, exc)
+        if repeat:
+            return
+        if pending:
+            pending["consumed"] = True
         if not chat_id or not label:
             return
-        # 2) policy + dedup, then route the label as a user message
-        if is_group:
-            self._group_chat_ids.add(chat_id)
-            if not self._is_group_allowed(chat_id, sender_id):
-                logger.info("[%s] Button click DROPPED by group policy: chat=%s", self.name, chat_id)
-                return
-        elif not self._is_dm_intake_allowed(sender_id):
-            logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
-            return
-        msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}-{int(time.time())}")
+        msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")
         if self._dedup.is_duplicate(msg_id):
             return
-        self._remember_reply_req_id(msg_id, req_id)
-        if req_id:
-            self._remember_chat_req_id(chat_id, req_id)
-        self._pending_button_cards.pop(task_id, None)
+        # 2) This turn has no usable inbound req_id: the event's req_id is spent
+        #    on the update frame and the previous message's already served its
+        #    reply. Drop the stale one so the reply goes proactive (aibot_send_msg)
+        #    instead of opening a stream on a dead req_id.
+        self._last_chat_req_ids.pop(chat_id, None)
+        self._stream_expired_chats.add(chat_id)
+        self._button_click_chats.add(chat_id)
         source = self.build_source(
             chat_id=chat_id, chat_type="group" if is_group else "dm",
             user_id=sender_id or None, user_name=sender_id or None,
@@ -3044,13 +3093,19 @@ class WeComAdapter(BasePlatformAdapter):
 
             if reply_req_id:
                 try:
-                    if button_spec:
+                    if button_spec and self._find_active_turn_for_chat(chat_id) is None:
+                        # one-shot finish frame carrying the card; never while a
+                        # stream owns this req_id (shared reply queue → 6000)
                         _, _card = self._build_button_card(chat_id, button_spec)
                         response = await self._send_stream_reply(
                             reply_req_id, uuid.uuid4().hex, content[:self.MAX_MESSAGE_LENGTH],
                             finish=True, template_card=_card,
                         )
-                        card_embedded = True
+                        card_embedded = (
+                            isinstance(response, dict)
+                            and int(response.get("errcode", 0) or 0) == 0
+                            and not response.get("ack_pending")
+                        )
                     else:
                         response = await self._send_reply_markdown(reply_req_id, content)
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
@@ -3075,7 +3130,12 @@ class WeComAdapter(BasePlatformAdapter):
                 # Group chats cannot use APP_CMD_SEND (WeCom blocks it),
                 # so fail early with a clear error instead of making a
                 # doomed network request.
-                if chat_id in self._group_chat_ids:
+                if chat_id in self._group_chat_ids and chat_id in self._button_click_chats:
+                    logger.info(
+                        "[%s] Button-click turn in group %s: trying proactive send",
+                        self.name, chat_id,
+                    )
+                elif chat_id in self._group_chat_ids:
                     logger.warning(
                         "[%s] No cached req_id for group chat %s — "
                         "cannot send (groups require passive reply via req_id)",
@@ -3466,6 +3526,8 @@ class WeComAdapter(BasePlatformAdapter):
                 # Append a zero-width space to ensure the content differs when
                 # the text matches the last ACTUALLY SENT intermediate content.
                 text, button_spec = self._extract_button_directive(text)
+                if button_spec and not (text or "").strip():
+                    text = button_spec["title"]
                 button_card: Optional[Dict[str, Any]] = None
                 if button_spec:
                     _, button_card = self._build_button_card(chat, button_spec)
@@ -3501,7 +3563,6 @@ class WeComAdapter(BasePlatformAdapter):
                             msg_item=inline_items,
                             **card_kwargs,
                         )
-                        card_embedded = bool(button_card)
                     except asyncio.CancelledError:
                         # The frame is already queued on the control worker and
                         # will most likely land; treat as delivered so the
@@ -3519,6 +3580,7 @@ class WeComAdapter(BasePlatformAdapter):
                         and int(response.get("errcode", 0) or 0) == 0
                         and not response.get("ack_pending")
                     )
+                    card_embedded = bool(button_card) and bool(rendered)
                     if not inline_outcome.done():
                         inline_outcome.set_result(bool(rendered))
                     if rendered:
@@ -3538,14 +3600,19 @@ class WeComAdapter(BasePlatformAdapter):
                 else:
                     # Keep the pre-patch call shape so subclass / test doubles
                     # without the msg_item kwarg keep working.
-                    await self._send_stream_reply(
+                    _resp = await self._send_stream_reply(
                         turn.req_id,
                         turn.stream_id,
                         final_text,
                         finish=True,
                         **card_kwargs,
                     )
-                    card_embedded = bool(button_card)
+                    card_embedded = (
+                        bool(button_card)
+                        and isinstance(_resp, dict)
+                        and int(_resp.get("errcode", 0) or 0) == 0
+                        and not _resp.get("ack_pending")
+                    )
                 turn.finalized = True
                 if button_spec and not card_embedded:
                     # finish frame did not carry the card (fallback path) —
@@ -3576,6 +3643,7 @@ class WeComAdapter(BasePlatformAdapter):
                     return True
 
                 # Pure dedup: skip if content is identical to last sent frame.
+                text = self._strip_partial_button_line(text)
                 if text == turn.last_sent_content:
                     return True
 
