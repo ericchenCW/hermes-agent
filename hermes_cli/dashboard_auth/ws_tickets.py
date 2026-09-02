@@ -31,6 +31,7 @@ tests can patch ``time.time`` cleanly.
 
 from __future__ import annotations
 
+import os
 import secrets
 import threading
 import time
@@ -122,7 +123,13 @@ def internal_ws_credential() -> str:
     global _internal_credential
     with _lock:
         if _internal_credential is None:
-            _internal_credential = secrets.token_urlsafe(32)
+            # Haro (or another trusted backend on the same private network)
+            # may pin the credential through the environment so it can dial
+            # /api/ws?internal=... without a browser session. Unset → random.
+            _internal_credential = (
+                os.environ.get("HERMES_INTERNAL_WS_CREDENTIAL", "").strip()
+                or secrets.token_urlsafe(32)
+            )
         return _internal_credential
 
 
@@ -141,8 +148,7 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
     leaking length / prefix information on mismatch. If no internal
     credential has been minted yet, any value is rejected.
     """
-    with _lock:
-        expected = _internal_credential
+    expected = internal_ws_credential()
     if not value or expected is None:
         raise TicketInvalid("no internal credential")
     if not secrets.compare_digest(value.encode(), expected.encode()):

@@ -379,13 +379,15 @@ TOOLSETS = {
     # cron, or code-execution tools. Activated explicitly via
     # `platform_toolsets: {cli: [sre]}`; not a posture (no auto-selection).
     "sre": {
-        "description": "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, memory, clarify, vision",
+        "description": "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, clarify, vision",
+        # `memory` deliberately absent: one runtime serves several Haro users, so
+        # instance-level MEMORY.md / USER.md would mix their notes (idcsre 090 G24).
         "tools": [
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
-            "todo", "memory",
+            "todo",
             "clarify",
         ],
         "includes": [],
