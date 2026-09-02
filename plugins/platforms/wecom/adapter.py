@@ -220,7 +220,7 @@ BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
 BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
-BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS[^\n]*\Z", re.I)
+BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 _INLINE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
 _EMPTY_MD_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*\)")
 VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -2165,6 +2165,8 @@ class WeComAdapter(BasePlatformAdapter):
         head, sep, last = stripped.rpartition("\n")
         if not sep:
             head, last = "", stripped
+        if last.startswith("    ") or last.startswith("\t"):
+            return text, None  # indented code block
         m = BUTTON_DIRECTIVE_RE.fullmatch(last.strip())
         if not m or head.count("```") % 2 == 1:
             return text, None
@@ -2186,8 +2188,9 @@ class WeComAdapter(BasePlatformAdapter):
         ``BUTTONS...`` line so the directive never shows up in the bubble."""
         if not text or "BUTTONS" not in text.upper():
             return text
-        m = BUTTON_PARTIAL_LINE_RE.search(text)
-        return text[: m.start()].rstrip() if m else text
+        stripped = text.rstrip()
+        m = BUTTON_PARTIAL_LINE_RE.search(stripped)
+        return stripped[: m.start()].rstrip() if m else text
 
     def _sweep_button_cards(self) -> None:
         cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS
@@ -2241,6 +2244,15 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
+
+    async def _send_card_update(self, req_id: str, update: Dict[str, Any]) -> None:
+        try:
+            response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
+            errcode = int((response or {}).get("errcode", 0) or 0)
+            if errcode:
+                logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
+        except Exception as exc:
+            logger.warning("[%s] update_template_card failed: %s", self.name, exc)
 
     async def _on_template_card_event_guarded(self, payload: Dict[str, Any]) -> None:
         try:
@@ -2297,7 +2309,14 @@ class WeComAdapter(BasePlatformAdapter):
         elif not self._is_dm_intake_allowed(sender_id):
             logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
             return
-        # 1) acknowledge within 5 s — card becomes a text notice with the choice
+        # Consume synchronously (no await yet): concurrent clicks on the same
+        # card are separate tasks, and only the first one may route.
+        if pending and not repeat:
+            pending["consumed"] = True
+            pending["chosen"] = label
+        shown = (pending.get("chosen") if pending else None) or label or event_key
+        # 1) acknowledge within 5 s — card becomes a text notice showing the
+        #    (first) choice; sent as its own task so routing never waits on the ack
         if req_id and task_id:
             title = (pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE
             update = {
@@ -2305,21 +2324,13 @@ class WeComAdapter(BasePlatformAdapter):
                 "template_card": {
                     "card_type": "text_notice",
                     "main_title": {"title": title[:BUTTON_TITLE_MAX]},
-                    "sub_title_text": f"已选择：{label or event_key}"[:100],
+                    "sub_title_text": f"已选择：{shown}"[:100],
                     "task_id": task_id,
                 },
             }
-            try:
-                response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
-                errcode = int((response or {}).get("errcode", 0) or 0)
-                if errcode:
-                    logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
-            except Exception as exc:
-                logger.warning("[%s] update_template_card failed: %s", self.name, exc)
+            asyncio.ensure_future(self._send_card_update(req_id, update))
         if repeat:
             return
-        if pending:
-            pending["consumed"] = True
         if not chat_id or not label:
             return
         msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")

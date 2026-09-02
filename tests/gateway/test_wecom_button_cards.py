@@ -79,6 +79,10 @@ def test_directive_parsing_and_card_shape():
     assert ad._strip_partial_button_line("正文\nBUTTONS[请选") == "正文"
     assert ad._strip_partial_button_line("正文\n**BUTTONS") == "正文"
     assert ad._strip_partial_button_line("正文没有指令") == "正文没有指令"
+    assert ad._strip_partial_button_line("正文\nBUTTONS[t]: a | b\n") == "正文"
+    assert ad._strip_partial_button_line("BUTTONSTUFF 是一个产品") == "BUTTONSTUFF 是一个产品"
+    indented = "说明：\n\n    BUTTONS[x]: a | b"
+    assert ad._extract_button_directive(indented) == (indented, None)
 
 
 def test_click_updates_card_and_routes_label():
@@ -108,12 +112,23 @@ def test_click_updates_card_and_routes_label():
         assert "user1" not in ad._last_chat_req_ids
         assert "user1" in ad._stream_expired_chats and "user1" in ad._button_click_chats
         assert ad._pending_button_cards[tid]["consumed"] is True
-        # repeat click → update frame only, nothing routed
+        # repeat click (other option) → update frame echoing the FIRST choice, nothing routed
         n_upd, n_routed = len(upd), len(routed)
         await ad._dispatch_payload(_click(tid, "opt1|深圳", msgid="m-1b", req_id="evt-10"))
         await _settle()
-        assert len([x for x in sent if x[0] == "reply" and x[2] == m.APP_CMD_RESPONSE_UPDATE]) == n_upd + 1
+        upd = [x for x in sent if x[0] == "reply" and x[2] == m.APP_CMD_RESPONSE_UPDATE]
+        assert len(upd) == n_upd + 1 and upd[-1][3]["template_card"]["sub_title_text"] == "已选择：上海"
         assert len(routed) == n_routed
+        # concurrent double click (two options, back to back) → exactly one routed
+        assert await ad._send_button_card("user1", {"title": "t", "options": ["A", "B"]}, None) is True
+        tid2 = sent[-1][2]["template_card"]["task_id"]
+        n_routed = len(routed)
+        await asyncio.gather(
+            ad._dispatch_payload(_click(tid2, "opt0|A", msgid="m-c1", req_id="evt-11")),
+            ad._dispatch_payload(_click(tid2, "opt1|B", msgid="m-c2", req_id="evt-12")),
+        )
+        await _settle()
+        assert [e.text for e in routed[n_routed:]] == ["A"]
         # unknown task id (registry lost) → label decoded from the key; flat event shape
         await ad._dispatch_payload(_click("nope", "opt1|深圳", msgid="m-2", flat=True))
         await _settle()
