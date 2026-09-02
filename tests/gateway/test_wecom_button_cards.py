@@ -147,6 +147,24 @@ def test_click_updates_card_and_routes_label():
         await ad._dispatch_payload(p)
         await _settle()
         assert len(routed) == n
+        # malformed click (empty key) leaves the card usable; a failing handler un-consumes it
+        assert await ad._send_button_card("user1", {"title": "t", "options": ["X", "Y"]}, None) is True
+        tid3 = sent[-1][2]["template_card"]["task_id"]
+        await ad._dispatch_payload(_click(tid3, "", msgid="m-e1", req_id="evt-20"))
+        await _settle()
+        assert ad._pending_button_cards[tid3]["consumed"] is False
+
+        async def boom(event):
+            raise RuntimeError("agent down")
+
+        ad.handle_message = boom
+        await ad._dispatch_payload(_click(tid3, "opt0|X", msgid="m-e2", req_id="evt-21"))
+        await _settle()
+        assert ad._pending_button_cards[tid3]["consumed"] is False
+        ad.handle_message = fake_handle
+        await ad._dispatch_payload(_click(tid3, "opt0|X", msgid="m-e2", req_id="evt-22"))
+        await _settle()
+        assert routed[-1].text == "X" and ad._pending_button_cards[tid3]["consumed"] is True
         # a real inbound message clears the click marker
         ad._remember_chat_req_id("user1", "req-new")
         assert "user1" not in ad._button_click_chats and "user1" not in ad._stream_expired_chats
