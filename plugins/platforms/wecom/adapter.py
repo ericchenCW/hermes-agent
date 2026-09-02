@@ -34,6 +34,10 @@ from utils import env_float
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
+from plugins.platforms.wecom.buttons import (
+    WeComButtonsMixin, APP_CMD_RESPONSE_UPDATE, BUTTON_DEFAULT_TITLE, BUTTON_MAX,
+    BUTTON_LABEL_MAX, BUTTON_CARD_TTL_SECONDS, BUTTON_DIRECTIVE_RE,
+)
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
@@ -109,7 +113,7 @@ def _bounded_put(store: Dict[str, str], key: str, value: str) -> bool:
     return True
 
 
-class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePlatformAdapter):
+class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSendQueueMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -165,6 +169,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
         # finalize frame, ts, future resolving True once WeCom acked it) read by send_multiple_images.
         self._staged_inline_media: Dict[str, Tuple[List[str], float]] = {}
         self._embedded_inline_media: Dict[str, Tuple[set, float, "asyncio.Future[bool]"]] = {}
+        # task_id -> {"chat_id","title","options","keys","ts"} for cards we sent (clicks map back here)
+        self._pending_button_cards: Dict[str, Dict[str, Any]] = {}
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -359,6 +365,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
         elif cmd == APP_CMD_EVENT_CALLBACK:
+            # idcsre patch: button-card clicks and the informational bot events arrive here.
+            _event = (payload.get("body") or {}).get("event")
+            _eventtype = str((_event or {}).get("eventtype") or "") if isinstance(_event, dict) else ""
+            if _eventtype == "template_card_event":
+                try:
+                    await self._on_template_card_event(payload)
+                except Exception as exc:
+                    logger.warning("[%s] template_card_event handling failed: %s", self.name, exc)
+                return
+            if _eventtype in ("feedback_event", "enter_chat"):
+                logger.info("[%s] Event %s: %s", self.name, _eventtype, json.dumps(_event, ensure_ascii=False)[:300])
+                return
             # Kicked by server (another connection exists): suppress reconnect like the official SDK.
             if str((payload.get("body") or {}).get("event_type") or "") == "disconnected_event":
                 logger.warning("[%s] Kicked by server (another WS connection established). Suppressing reconnect to avoid mutual kicking. Check for duplicate gateway instances.", self.name)
@@ -445,7 +463,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
             # INFO: a msgid redelivered after a processing exception is dropped for the TTL.
             logger.info("[%s] Duplicate message %s ignored (dedup drop) req_id=%s sender=%r chattype=%r", self.name, msg_id, req_id, sender.get("userid") if sender else None, body.get("chattype"))
             return
-        _bounded_put(self._reply_req_ids, msg_id, req_id)
+        self._remember_reply_req_id(msg_id, req_id)
         chat_id = str(body.get("chatid") or sender_id).strip()
         logger.info("[%s] Inbound callback: chattype=%r chatid=%r sender=%r msgtype=%r has_chatid=%s", self.name, body.get("chattype"), body.get("chatid"), sender_id, body.get("msgtype"), bool(body.get("chatid")))
         if not chat_id:
@@ -590,6 +608,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
         candidates = (self._groups.get(chat_id), next((v for k, v in self._groups.items() if isinstance(k, str) and k.lower() == lowered and isinstance(v, dict)), None), self._groups.get("*"))
         return next((c for c in candidates if isinstance(c, dict)), {})
 
+    def _remember_reply_req_id(self, msg_id: str, req_id: Optional[str]) -> None:
+        """Cache the req_id that a message id may be answered on (bounded)."""
+        _bounded_put(self._reply_req_ids, msg_id, req_id)
+
     def _remember_chat_req_id(self, chat_id: str, req_id: str) -> None:
         """Cache the chat's latest inbound req_id; a fresh one also resurrects its stream channel."""
         if _bounded_put(self._last_chat_req_ids, chat_id, req_id):
@@ -647,12 +669,25 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
 
     async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False) -> SendResult:
         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
+        # idcsre patch: a trailing BUTTONS[...] line becomes a template card, not visible text.
+        content, button_spec = self._extract_button_directive(content)
+        card_embedded = False
+        if not (content or "").strip() and button_spec:
+            content = button_spec["title"]
         try:
             reply_req_id = None if force_proactive and chat_id not in self._group_chat_ids else self._cached_reply_req_id(chat_id, reply_to)
             if reply_req_id:
                 try:
-                    response = await self._send_reply_markdown(reply_req_id, content)
+                    if button_spec:
+                        # stream_with_template_card keeps card + text in ONE passive reply (works in
+                        # groups, and does not consume the req_id twice).
+                        _, _card = self._build_button_card(chat_id, button_spec)
+                        response = await self._send_stream_reply(reply_req_id, uuid.uuid4().hex, content[:MAX_MESSAGE_LENGTH], finish=True, template_card=_card)
+                        card_embedded = True
+                    else:
+                        response = await self._send_reply_markdown(reply_req_id, content)
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
+                    card_embedded = False
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
@@ -668,6 +703,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
             return self._send_failure(str(exc), str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(exc))
         if error := self._response_error(response):
             return self._send_failure(error, response.get("errcode", 0) == STREAM_NOT_SUBSCRIBED_ERRCODE)
+        if button_spec and not card_embedded:
+            await self._send_button_card(chat_id, button_spec, None)
         return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
 
     def _send_failure(self, error: str, subscription_lost: bool) -> SendResult:

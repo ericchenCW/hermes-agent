@@ -243,7 +243,7 @@ class WeComStreamMixin:
         encoded = content.encode("utf-8")
         return content if len(encoded) <= limit else encoded[:limit].decode("utf-8", errors="ignore")
 
-    async def _send_stream_reply(self, reply_req_id: str, stream_id: str, content: str, finish: bool = False, msg_item: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    async def _send_stream_reply(self, reply_req_id: str, stream_id: str, content: str, finish: bool = False, msg_item: Optional[List[Dict[str, Any]]] = None, template_card: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send one ``msgtype: "stream"`` frame: intermediates non-blocking/skip-if-pending, the final frame awaits
         its ack so 846608/6000 are detected. Raises WeComStreamExpiredError on expiry."""
         truncated = self._truncate_stream_content(content or "", self.MAX_STREAM_CONTENT_LENGTH)
@@ -253,6 +253,10 @@ class WeComStreamMixin:
         if finish and msg_item:
             # Inline attachments are only honoured on the finish=true frame ("image 仅当 finish=true 时设置").
             body["stream"]["msg_item"] = list(msg_item)[:INLINE_MSG_ITEM_MAX]
+        if finish and template_card:
+            # stream_with_template_card lets a button card ride along in the same passive reply.
+            body["msgtype"] = "stream_with_template_card"
+            body["template_card"] = template_card
         if not finish:
             return await self._send_reply_queued(reply_req_id, body, is_final=False, skip_if_pending=True)
         response = await self._send_reply_queued(reply_req_id, body, is_final=True, skip_if_pending=False)
@@ -319,19 +323,30 @@ class WeComStreamMixin:
                 self._expire_turn(turn, turn_id)
                 return False
         self._cancel_keepalive(turn)
+        # idcsre patch: a trailing BUTTONS[...] line becomes a card riding on the finish frame.
+        text, button_spec = self._extract_button_directive(text)
+        button_card: Optional[Dict[str, Any]] = None
+        if button_spec:
+            _, button_card = self._build_button_card(chat, button_spec)
         # A final frame identical to the last intermediate is silently dropped — differ via ZWSP.
         final_text = text + "\u200b" if text and text == turn.last_sent_content else text
         inline_items, inline_paths = await self._build_inline_msg_items(chat, turn_id)
+        card_kwargs = {"template_card": button_card} if button_card else {}
+        card_embedded = False
         if inline_items:
-            await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths)
+            card_embedded = await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths, card_kwargs) and bool(button_card)
         else:
             # Keep the pre-patch call shape so subclass / test doubles without msg_item keep working.
-            await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
+            await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, **card_kwargs)
+            card_embedded = bool(button_card)
         turn.finalized = True
+        if button_spec and not card_embedded:
+            # The finish frame did not carry the card (fallback path) — deliver it proactively.
+            asyncio.ensure_future(self._send_button_card(chat, button_spec, None))
         self._stream_turns.pop(f"{chat}:{turn_id or turn.req_id}", None)
         return True
 
-    async def _finalize_with_inline_media(self, turn: StreamTurn, final_text: str, chat: str, inline_items: List[Dict[str, Any]], inline_paths: List[str]) -> None:
+    async def _finalize_with_inline_media(self, turn: StreamTurn, final_text: str, chat: str, inline_items: List[Dict[str, Any]], inline_paths: List[str], card_kwargs: Optional[Dict[str, Any]] = None) -> bool:
         """idcsre patch: send the finish=true frame with ``msg_item`` images attached and record the
         outcome so ``send_multiple_images`` knows whether the pictures already landed."""
         # The model usually wrote ``![alt](MEDIA:...)``; after the gateway stripped the path an empty
@@ -346,7 +361,7 @@ class WeComStreamMixin:
         outcome: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
         self._embedded_inline_media[chat] = (set(inline_paths), time.monotonic(), outcome)
         try:
-            response = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, msg_item=inline_items)
+            response = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, msg_item=inline_items, **(card_kwargs or {}))
         except asyncio.CancelledError:
             # The frame is already queued on the control worker and will most likely land; treat as
             # delivered so the gateway does not send the pictures a second time.
@@ -368,6 +383,7 @@ class WeComStreamMixin:
             # bubble): the pictures are not on screen — let the per-image path send them.
             self._embedded_inline_media.pop(chat, None)
             logger.info("[%s] finalize frame with inline images not confirmed (%s); falling back to separate image sends", self.name, response if isinstance(response, dict) else type(response).__name__)
+        return True
 
     async def _send_stream_frame_inner(self, text: str, *, chat: str, reply_to: Optional[str] = None, finalize: bool = False, turn_id: Optional[str] = None) -> bool:
         turn: Optional[StreamTurn] = None
