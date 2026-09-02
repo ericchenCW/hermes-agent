@@ -1564,6 +1564,14 @@ class TurnRunner:
         if _final_for_stream is None:
             stream_consumer.finish()
             return
+        # idcsre patch: let adapters that can embed attachments in the finalize frame (WeCom
+        # stream.msg_item) see the final response before the consumer finalizes.
+        try:
+            _stage_fn = getattr(getattr(stream_consumer, "adapter", None), "stage_stream_media", None)
+            if callable(_stage_fn):
+                _stage_fn(ctx.source.chat_id, _final_for_stream, turn_id=getattr(stream_consumer, "_turn_id", None))
+        except Exception as _stage_err:
+            logger.debug("stage_stream_media failed: %s", _stage_err)
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
             stream_consumer.finish(_final_for_stream)

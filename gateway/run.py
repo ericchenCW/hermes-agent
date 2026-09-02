@@ -1531,6 +1531,13 @@ def _ensure_ssl_certs() -> None:
             os.environ["SSL_CERT_FILE"] = candidate
             return
 
+def _home_channel_nudge_enabled() -> bool:
+    """idcsre patch: ``HERMES_HOME_CHANNEL_NUDGE=0|false|off|no`` suppresses the first-contact
+    "No home channel is set" notice.  Hosted deployments (one gateway per tenant, no cron /
+    cross-platform delivery) have no home-channel concept, so the nudge is only noise there."""
+    return (os.getenv("HERMES_HOME_CHANNEL_NUDGE") or "").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _home_target_env_var(platform_name: str) -> str:
     """Home-target env var: built-in ``_HOME_TARGET_ENV_VARS``, plugin registry, then
     ``<PLATFORM>_HOME_CHANNEL``."""

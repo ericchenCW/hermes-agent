@@ -8,13 +8,15 @@ import base64
 import hashlib
 import logging
 import mimetypes
+import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from gateway.platforms.base import SendResult, cache_document_from_bytes_async, cache_image_from_bytes_async
+from gateway.platforms.base import BasePlatformAdapter, SendResult, cache_document_from_bytes_async, cache_image_from_bytes_async
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
 
@@ -31,6 +33,24 @@ ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
+
+# ── Inline images in the finalize frame (idcsre patch) ───────────────────────
+# WeCom AI-bot passive reply (doc path/101031): the finish=true stream frame may
+# carry ``stream.msg_item`` — up to 10 ``{"msgtype":"image","image":{"base64","md5"}}``
+# entries (JPG/PNG) — so the pictures land in the SAME bubble as the text instead
+# of trailing as separate image messages.  The gateway stages the final response
+# via ``stage_stream_media`` right before finalize; paths embedded successfully are
+# skipped by ``send_multiple_images``.  Any failure falls back to per-image delivery.
+INLINE_MSG_ITEM_MAX = 10
+# The finish frame travels on the one WebSocket shared by every chat, and WeCom's own
+# media uploads are chunked at 512KB, so keep the inline payload in the low-MB range.
+INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+INLINE_TOTAL_MAX_BYTES = 4 * 1024 * 1024
+INLINE_STAGE_TTL_SECONDS = 120.0
+INLINE_EMBED_WAIT_SECONDS = 20.0
+INLINE_EMPTY_TEXT_PLACEHOLDER = "✅"
+_INLINE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
+_EMPTY_MD_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*\)")
 
 _IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), ((b"GIF87a", b"GIF89a"), ".gif"))
 _MIME_PREFIX_KINDS = (("image/", "image"), ("video/", "video"), ("audio/", "voice"))
@@ -319,6 +339,138 @@ class WeComMediaMixin:
             raw[key] = followup.raw_response if followup else None
             raw[f"{key}_error"] = followup.error if followup and not followup.success else None
         return SendResult(success=True, message_id=self._payload_req_id(media_response) or uuid.uuid4().hex[:12], raw_response=raw)
+
+    # ── Inline images in the finalize frame (idcsre patch) ─────────────────
+    @staticmethod
+    def _inline_stage_key(chat_id: str, turn_id: Optional[str]) -> str:
+        return f"{chat_id}:{turn_id}" if turn_id else str(chat_id)
+
+    def _sweep_inline_state(self) -> None:
+        now = time.monotonic()
+        for key, (_paths, ts) in list(self._staged_inline_media.items()):
+            if now - ts > INLINE_STAGE_TTL_SECONDS:
+                self._staged_inline_media.pop(key, None)
+        for key, (_paths, ts, _fut) in list(self._embedded_inline_media.items()):
+            if now - ts > INLINE_STAGE_TTL_SECONDS:
+                self._embedded_inline_media.pop(key, None)
+
+    def stage_stream_media(self, chat_id: str, response_text: str, turn_id: Optional[str] = None) -> int:
+        """Stage the MEDIA: images of the authoritative final response for the upcoming finalize
+        frame of ``chat_id`` (called by the gateway right before ``GatewayStreamConsumer.finish``).
+        Returns the number of images staged; only local JPG/PNG paths qualify."""
+        if not chat_id or not response_text:
+            return 0
+        self._sweep_inline_state()
+        stage_key = self._inline_stage_key(chat_id, turn_id)
+        if "[[as_document]]" in response_text:
+            self._staged_inline_media.pop(stage_key, None)
+            return 0
+        try:
+            media_files, _cleaned = self.extract_media(response_text)
+            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        except Exception as exc:
+            logger.debug("[%s] stage_stream_media: extract failed: %s", self.name, exc)
+            return 0
+        paths: List[str] = []
+        for media_path, is_voice in media_files:
+            if is_voice:
+                continue
+            candidate = os.path.realpath(str(media_path))
+            if Path(candidate).suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            if candidate not in paths:
+                paths.append(candidate)
+        if not paths:
+            self._staged_inline_media.pop(stage_key, None)
+            return 0
+        if len(paths) > INLINE_MSG_ITEM_MAX:
+            logger.info(
+                "[%s] stage_stream_media: %d images staged, %d beyond the msg_item cap will be sent separately",
+                self.name, INLINE_MSG_ITEM_MAX, len(paths) - INLINE_MSG_ITEM_MAX,
+            )
+        staged = paths[:INLINE_MSG_ITEM_MAX]
+        self._staged_inline_media[stage_key] = (staged, time.monotonic())
+        return len(staged)
+
+    async def _build_inline_msg_items(self, chat_id: str, turn_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Pop the staged images for this chat/turn and encode them as WeCom ``msg_item`` entries.
+        Returns (items, paths_used); anything past the byte caps is left to the per-image path."""
+        staged = self._staged_inline_media.pop(self._inline_stage_key(chat_id, turn_id), None)
+        if staged is None and turn_id:
+            staged = self._staged_inline_media.pop(self._inline_stage_key(chat_id, None), None)
+        if staged is None and not turn_id:
+            # Caller without a turn id: adopt the most recent staging for this chat.
+            prefix = f"{chat_id}:"
+            candidates = [(v[1], k) for k, v in self._staged_inline_media.items() if k.startswith(prefix)]
+            if candidates:
+                staged = self._staged_inline_media.pop(max(candidates)[1], None)
+        if not staged:
+            return [], []
+        paths, staged_at = staged
+        if time.monotonic() - staged_at > INLINE_STAGE_TTL_SECONDS:
+            logger.debug("[%s] stale inline-media staging dropped for chat %s", self.name, chat_id)
+            return [], []
+
+        def _read(path: str) -> Tuple[bytes, str, str]:
+            local = Path(path)
+            data = local.read_bytes()
+            return data, self._normalize_content_type("", local.name), local.name
+
+        items: List[Dict[str, Any]] = []
+        used: List[str] = []
+        total = 0
+        for media_path in paths:
+            try:
+                data, content_type, _name = await asyncio.to_thread(_read, media_path)
+            except Exception as exc:
+                logger.warning("[%s] inline image skipped (%s): %s", self.name, media_path, exc)
+                continue
+            if content_type not in _INLINE_IMAGE_CONTENT_TYPES:
+                logger.info("[%s] inline image skipped, unsupported type %s: %s", self.name, content_type, media_path)
+                continue
+            if len(data) > INLINE_IMAGE_MAX_BYTES or total + len(data) > INLINE_TOTAL_MAX_BYTES:
+                logger.info("[%s] inline image left to separate delivery (%d bytes, %d so far): %s", self.name, len(data), total, media_path)
+                continue
+            encoded = await asyncio.to_thread(lambda d=data: (base64.b64encode(d).decode("ascii"), hashlib.md5(d).hexdigest()))
+            items.append({"msgtype": "image", "image": {"base64": encoded[0], "md5": encoded[1]}})
+            used.append(media_path)
+            total += len(data)
+        return items, used
+
+    @staticmethod
+    def _local_path_from_image_url(image_url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(str(image_url or ""))
+        except Exception:
+            return None
+        if parsed.scheme == "file":
+            return os.path.realpath(unquote(parsed.path))
+        if not parsed.scheme and image_url:
+            return os.path.realpath(str(image_url))
+        return None
+
+    async def send_multiple_images(self, chat_id: str, images: List[Tuple[str, str]], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> None:
+        """Skip images the finalize frame carried inline (waiting for WeCom's ack on that frame
+        first), then fall back to the base per-image delivery for the rest."""
+        embedded = self._embedded_inline_media.pop(chat_id, None)
+        if embedded:
+            embedded_paths, embedded_at, outcome = embedded
+            delivered = False
+            if time.monotonic() - embedded_at <= INLINE_STAGE_TTL_SECONDS:
+                try:
+                    delivered = bool(await asyncio.wait_for(asyncio.shield(outcome), timeout=INLINE_EMBED_WAIT_SECONDS))
+                except asyncio.TimeoutError:
+                    logger.warning("[%s] finalize frame with inline images not acked within %.0fs for chat %s; sending images separately", self.name, INLINE_EMBED_WAIT_SECONDS, chat_id)
+                except Exception as exc:
+                    logger.debug("[%s] inline embed outcome unavailable: %s", self.name, exc)
+            if delivered:
+                remaining = [(u, a) for u, a in images if not ((local := self._local_path_from_image_url(u)) and local in embedded_paths)]
+                if skipped := len(images) - len(remaining):
+                    logger.info("[%s] %d image(s) already embedded inline in the finalize frame for chat %s; skipping separate sends", self.name, skipped, chat_id)
+                images = remaining
+        if not images:
+            return
+        await super().send_multiple_images(chat_id=chat_id, images=images, metadata=metadata, human_delay=human_delay)
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         result = await self._send_media_source(chat_id=chat_id, media_source=image_url, caption=caption, reply_to=reply_to)

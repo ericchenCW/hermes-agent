@@ -1239,7 +1239,7 @@ class GatewayTurnMixin:
         """First-ever-message onboarding note + one-time 'no home channel' prompt (both only when
         the session has no history). Delivered on the user message (sidecar), NOT the ephemeral
         system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed prompt diff + rebuild."""
-        from gateway.run import _hermes_home, _home_target_env_var, _load_gateway_config
+        from gateway.run import _hermes_home, _home_channel_nudge_enabled, _home_target_env_var, _load_gateway_config
         if history:
             return
         if not await self.async_session_store.has_any_sessions():
@@ -1266,7 +1266,10 @@ class GatewayTurnMixin:
                 turn_sidecar_notes.append(_intro_note)
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
+        # idcsre patch: HERMES_HOME_CHANNEL_NUDGE=0 suppresses it entirely for hosted deployments.
         if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
+            return
+        if not _home_channel_nudge_enabled():
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)

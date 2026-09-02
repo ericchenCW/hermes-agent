@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
 
@@ -32,6 +32,10 @@ MAX_INTERMEDIATE_FRAMES = 85
 STREAM_SAFE_DURATION_SECONDS = 330.0
 STREAM_KEEPALIVE_INTERVAL_SECONDS = 120.0
 STREAM_KEEPALIVE_ENABLED_DEFAULT = False
+
+from plugins.platforms.wecom.media import (  # noqa: E402  (idcsre patch: inline finalize-frame images)
+    INLINE_MSG_ITEM_MAX, INLINE_EMPTY_TEXT_PLACEHOLDER, _EMPTY_MD_IMAGE_RE,
+)
 
 
 class WeComStreamExpiredError(RuntimeError):
@@ -184,6 +188,7 @@ class WeComStreamMixin:
     def _retire_turn(self, turn: StreamTurn, turn_id: Optional[str]) -> None:
         """Single choke point for "turn is dead": cancel the timer, then drop it from the registry."""
         self._cancel_keepalive(turn)
+        self._staged_inline_media.pop(self._inline_stage_key(turn.chat_id, turn_id), None)
         self._stream_turns.pop(f"{turn.chat_id}:{turn_id or turn.req_id}", None)
 
     def _expire_turn(self, turn: StreamTurn, turn_id: Optional[str]) -> None:
@@ -238,13 +243,16 @@ class WeComStreamMixin:
         encoded = content.encode("utf-8")
         return content if len(encoded) <= limit else encoded[:limit].decode("utf-8", errors="ignore")
 
-    async def _send_stream_reply(self, reply_req_id: str, stream_id: str, content: str, finish: bool = False) -> Dict[str, Any]:
+    async def _send_stream_reply(self, reply_req_id: str, stream_id: str, content: str, finish: bool = False, msg_item: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Send one ``msgtype: "stream"`` frame: intermediates non-blocking/skip-if-pending, the final frame awaits
         its ack so 846608/6000 are detected. Raises WeComStreamExpiredError on expiry."""
         truncated = self._truncate_stream_content(content or "", self.MAX_STREAM_CONTENT_LENGTH)
         if len(content or "") != len(truncated):
             logger.warning("[%s] Stream content truncated for stream_id=%s", self.name, stream_id)
         body: Dict[str, Any] = {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": truncated}}
+        if finish and msg_item:
+            # Inline attachments are only honoured on the finish=true frame ("image 仅当 finish=true 时设置").
+            body["stream"]["msg_item"] = list(msg_item)[:INLINE_MSG_ITEM_MAX]
         if not finish:
             return await self._send_reply_queued(reply_req_id, body, is_final=False, skip_if_pending=True)
         response = await self._send_reply_queued(reply_req_id, body, is_final=True, skip_if_pending=False)
@@ -313,10 +321,53 @@ class WeComStreamMixin:
         self._cancel_keepalive(turn)
         # A final frame identical to the last intermediate is silently dropped — differ via ZWSP.
         final_text = text + "\u200b" if text and text == turn.last_sent_content else text
-        await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
+        inline_items, inline_paths = await self._build_inline_msg_items(chat, turn_id)
+        if inline_items:
+            await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths)
+        else:
+            # Keep the pre-patch call shape so subclass / test doubles without msg_item keep working.
+            await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
         turn.finalized = True
         self._stream_turns.pop(f"{chat}:{turn_id or turn.req_id}", None)
         return True
+
+    async def _finalize_with_inline_media(self, turn: StreamTurn, final_text: str, chat: str, inline_items: List[Dict[str, Any]], inline_paths: List[str]) -> None:
+        """idcsre patch: send the finish=true frame with ``msg_item`` images attached and record the
+        outcome so ``send_multiple_images`` knows whether the pictures already landed."""
+        # The model usually wrote ``![alt](MEDIA:...)``; after the gateway stripped the path an empty
+        # image tag is left, which WeCom renders as a bare "[图片]" placeholder.  Drop it — the picture
+        # itself now rides in msg_item.  A reply that was nothing but pictures needs some visible text.
+        stripped = _EMPTY_MD_IMAGE_RE.sub("", final_text or "").strip()
+        final_text = stripped or INLINE_EMPTY_TEXT_PLACEHOLDER
+        if final_text == turn.last_sent_content:
+            final_text = final_text + "\u200b"
+        # Register the in-flight embed BEFORE awaiting the frame: the gateway only waits a few seconds
+        # for the stream task and then runs the per-image delivery, which awaits this future.
+        outcome: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        self._embedded_inline_media[chat] = (set(inline_paths), time.monotonic(), outcome)
+        try:
+            response = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, msg_item=inline_items)
+        except asyncio.CancelledError:
+            # The frame is already queued on the control worker and will most likely land; treat as
+            # delivered so the gateway does not send the pictures a second time.
+            if not outcome.done():
+                outcome.set_result(True)
+            raise
+        except BaseException:
+            if not outcome.done():
+                outcome.set_result(False)
+            self._embedded_inline_media.pop(chat, None)
+            raise
+        rendered = isinstance(response, dict) and int(response.get("errcode", 0) or 0) == 0 and not response.get("ack_pending")
+        if not outcome.done():
+            outcome.set_result(bool(rendered))
+        if rendered:
+            logger.info("[%s] Embedded %d inline image(s) in the finalize frame for chat %s", self.name, len(inline_paths), chat)
+        else:
+            # ack timeout (assumed delivery) or errcode 6000 (a newer frame without msg_item won the
+            # bubble): the pictures are not on screen — let the per-image path send them.
+            self._embedded_inline_media.pop(chat, None)
+            logger.info("[%s] finalize frame with inline images not confirmed (%s); falling back to separate image sends", self.name, response if isinstance(response, dict) else type(response).__name__)
 
     async def _send_stream_frame_inner(self, text: str, *, chat: str, reply_to: Optional[str] = None, finalize: bool = False, turn_id: Optional[str] = None) -> bool:
         turn: Optional[StreamTurn] = None

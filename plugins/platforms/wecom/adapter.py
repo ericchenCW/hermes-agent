@@ -160,6 +160,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups can't receive proactive APP_CMD_SEND
+        # Inline-media staging (idcsre patch, see media.INLINE_MSG_ITEM_MAX): "chat[:turn_id]" ->
+        # (paths, ts) staged by the gateway before finalize; chat_id -> (paths carried by the
+        # finalize frame, ts, future resolving True once WeCom acked it) read by send_multiple_images.
+        self._staged_inline_media: Dict[str, Tuple[List[str], float]] = {}
+        self._embedded_inline_media: Dict[str, Tuple[set, float, "asyncio.Future[bool]"]] = {}
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
