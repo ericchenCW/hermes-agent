@@ -167,7 +167,7 @@ TOOLSETS = {
     "safe": _ts("Safe toolkit without terminal access", [], includes=["web", "vision", "image_gen"]),
 
     # AI SRE toolset (idcsre trimmed deployment): offline Q&A over a local corpus —
-    # retrieval via terminal/file tools, plus skills/todo/memory/clarify/vision. No web,
+    # retrieval via terminal/file tools, plus skills/todo/clarify/vision. No web,
     # browser, messaging, generation, delegation, cron, or code-execution tools.
     # Activated explicitly via `platform_toolsets: {cli: [sre]}` (or per-user
     # `user_toolsets`) — never auto-selected.
@@ -180,12 +180,14 @@ TOOLSETS = {
     # put `sre` in disabled_toolsets and that end-of-pipeline subtraction stripped the whole
     # minimal file/terminal/vision/skills surface (#57315-class breakage).
     "sre": _ts(
-        "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, memory, clarify, vision",
+        "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, clarify, vision",
+        # `memory` deliberately absent: one runtime serves several Haro users, so
+        # instance-level MEMORY.md / USER.md would mix their notes (idcsre 090 G24).
         ["terminal", "process_manage",
          "read_file", "write_file", "patch", "search_files",
          "vision_analyze",
          "skills_list", "skill_view", "skill_manage",
-         "todo", "memory",
+         "todo",
          "clarify"],
         posture=True,
     ),

@@ -12,6 +12,7 @@ so browser XSS cannot read it; grants no more than a ticket). In-memory; ``time.
 """
 from __future__ import annotations
 
+import os
 import secrets
 import threading
 import time
@@ -72,7 +73,13 @@ def internal_ws_credential() -> str:
     global _internal_credential
     with _lock:
         if _internal_credential is None:
-            _internal_credential = secrets.token_urlsafe(32)
+            # Haro (or another trusted backend on the same private network)
+            # may pin the credential through the environment so it can dial
+            # /api/ws?internal=... without a browser session. Unset → random.
+            _internal_credential = (
+                os.environ.get("HERMES_INTERNAL_WS_CREDENTIAL", "").strip()
+                or secrets.token_urlsafe(32)
+            )
         return _internal_credential
 
 
@@ -80,8 +87,10 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
     """Validate an internal credential (NOT single-use); returns the fixed server-internal
     ``{user_id, provider}`` info dict, mirroring ``consume_ticket``. Constant-time compare; any
     value is rejected until a credential has been minted."""
-    with _lock:
-        expected = _internal_credential
+    # Fork note (idcsre): resolve through internal_ws_credential() rather than reading
+    # _internal_credential directly, so a HERMES_INTERNAL_WS_CREDENTIAL pinned in the
+    # environment is honoured even when nothing has minted the credential yet.
+    expected = internal_ws_credential()
     if not value or expected is None:
         raise TicketInvalid("no internal credential")
     if not secrets.compare_digest(value.encode(), expected.encode()):
