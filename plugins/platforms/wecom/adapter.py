@@ -36,7 +36,8 @@ from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.buttons import (
     WeComButtonsMixin, APP_CMD_RESPONSE_UPDATE, BUTTON_DEFAULT_TITLE, BUTTON_MAX,
-    BUTTON_LABEL_MAX, BUTTON_CARD_TTL_SECONDS, BUTTON_DIRECTIVE_RE,
+    BUTTON_LABEL_MAX, BUTTON_TITLE_MAX, BUTTON_CARDS_MAX, BUTTON_CARD_TTL_SECONDS,
+    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE,
 )
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
@@ -171,6 +172,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         self._embedded_inline_media: Dict[str, Tuple[set, float, "asyncio.Future[bool]"]] = {}
         # task_id -> {"chat_id","title","options","keys","ts"} for cards we sent (clicks map back here)
         self._pending_button_cards: Dict[str, Dict[str, Any]] = {}
+        # chats whose latest inbound was a button click: no usable req_id → replies go proactive
+        # (also in groups) until the next real message
+        self._button_click_chats: set[str] = set()
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -369,10 +373,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
             _event = (payload.get("body") or {}).get("event")
             _eventtype = str((_event or {}).get("eventtype") or "") if isinstance(_event, dict) else ""
             if _eventtype == "template_card_event":
-                try:
-                    await self._on_template_card_event(payload)
-                except Exception as exc:
-                    logger.warning("[%s] template_card_event handling failed: %s", self.name, exc)
+                # Off the read loop: the update ack is resolved by this loop, so awaiting inline
+                # would self-deadlock for the full 5 s.
+                asyncio.ensure_future(self._on_template_card_event_guarded(payload))
                 return
             if _eventtype in ("feedback_event", "enter_chat"):
                 logger.info("[%s] Event %s: %s", self.name, _eventtype, json.dumps(_event, ensure_ascii=False)[:300])
@@ -616,6 +619,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         """Cache the chat's latest inbound req_id; a fresh one also resurrects its stream channel."""
         if _bounded_put(self._last_chat_req_ids, chat_id, req_id):
             self._stream_expired_chats.discard(str(chat_id).strip())
+            self._button_click_chats.discard(str(chat_id).strip())
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -678,12 +682,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
             reply_req_id = None if force_proactive and chat_id not in self._group_chat_ids else self._cached_reply_req_id(chat_id, reply_to)
             if reply_req_id:
                 try:
-                    if button_spec:
-                        # stream_with_template_card keeps card + text in ONE passive reply (works in
-                        # groups, and does not consume the req_id twice).
+                    if button_spec and self._find_active_turn_for_chat(chat_id) is None:
+                        # one-shot finish frame carrying the card; never while a stream owns this
+                        # req_id (shared reply queue → 6000)
                         _, _card = self._build_button_card(chat_id, button_spec)
                         response = await self._send_stream_reply(reply_req_id, uuid.uuid4().hex, content[:MAX_MESSAGE_LENGTH], finish=True, template_card=_card)
-                        card_embedded = True
+                        card_embedded = isinstance(response, dict) and int(response.get("errcode", 0) or 0) == 0 and not response.get("ack_pending")
                     else:
                         response = await self._send_reply_markdown(reply_req_id, content)
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
@@ -691,6 +695,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
+            elif chat_id in self._group_chat_ids and chat_id in self._button_click_chats:
+                logger.info("[%s] Button-click turn in group %s: trying proactive send", self.name, chat_id)
+                response = await self._send_proactive_markdown(chat_id, content)
             elif chat_id in self._group_chat_ids:
                 logger.warning("[%s] No cached req_id for group chat %s — cannot send (groups require passive reply via req_id)", self.name, chat_id)
                 return SendResult(success=False, error="No req_id available for group chat (passive reply required)")

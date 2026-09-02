@@ -28,9 +28,12 @@ BUTTON_DIRECTIVE_RE = re.compile(
     re.M | re.I,
 )
 BUTTON_MAX = 6
-BUTTON_LABEL_MAX = 20
+BUTTON_LABEL_MAX = 10          # WeCom button text limit
+BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
+BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
+BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS[^\n]*\Z", re.I)
 
 
 class WeComButtonsMixin:
@@ -39,45 +42,66 @@ class WeComButtonsMixin:
     @staticmethod
     def _extract_button_directive(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Split a trailing ``BUTTONS[title]: a | b | c`` line off ``text``.
+
+        Only the *last* non-blank line counts, and not when it sits inside an open triple-backtick
+        fence (the skill docs quote the syntax verbatim).
         Returns (clean_text, spec) where spec = {"title", "options"} or None."""
         if not text or "BUTTONS" not in text.upper():
             return text, None
-        matches = list(BUTTON_DIRECTIVE_RE.finditer(text))
-        if not matches:
+        stripped = text.rstrip()
+        head, sep, last = stripped.rpartition("\n")
+        if not sep:
+            head, last = "", stripped
+        m = BUTTON_DIRECTIVE_RE.fullmatch(last.strip())
+        if not m or head.count("```") % 2 == 1:
             return text, None
-        m = matches[-1]
         parts = [p.strip(" \t*`\"'“”") for p in re.split(r"\s*[|｜]\s*", m.group("opts"))]
         options: List[str] = []
         for part in parts:
-            part = part[:BUTTON_LABEL_MAX]
             if part and part not in options:
                 options.append(part)
-        options = options[:BUTTON_MAX]
-        clean = (text[: m.start()] + text[m.end():]).rstrip()
+        options = [p[:BUTTON_LABEL_MAX] for p in options[:BUTTON_MAX]]
         if not options:
-            return clean, None
-        return clean, {"title": (m.group("title") or BUTTON_DEFAULT_TITLE).strip()[:60], "options": options}
+            return text, None
+        return head.rstrip(), {"title": (m.group("title") or BUTTON_DEFAULT_TITLE).strip()[:BUTTON_TITLE_MAX], "options": options}
+
+    @staticmethod
+    def _strip_partial_button_line(text: str) -> str:
+        """Intermediate stream frames: hide a trailing (possibly half-written) ``BUTTONS...`` line
+        so the directive never shows up in the bubble."""
+        if not text or "BUTTONS" not in text.upper():
+            return text
+        m = BUTTON_PARTIAL_LINE_RE.search(text)
+        return text[: m.start()].rstrip() if m else text
+
+    def _sweep_button_cards(self) -> None:
+        cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS
+        for key, value in list(self._pending_button_cards.items()):
+            if value["ts"] < cutoff:
+                self._pending_button_cards.pop(key, None)
+        overflow = len(self._pending_button_cards) - BUTTON_CARDS_MAX
+        if overflow > 0:
+            for key in sorted(self._pending_button_cards, key=lambda k: self._pending_button_cards[k]["ts"])[:overflow]:
+                self._pending_button_cards.pop(key, None)
 
     def _build_button_card(self, chat_id: str, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         task_id = f"btn-{uuid.uuid4().hex[:24]}"
-        keys = [f"opt{i}" for i in range(len(spec["options"]))]
+        # the label rides inside the key so a click can be decoded even after a restart wiped the registry
+        keys = [f"opt{i}|{label}" for i, label in enumerate(spec["options"])]
         card = {
             "card_type": "button_interaction",
-            "main_title": {"title": spec["title"]},
+            "main_title": {"title": spec["title"][:BUTTON_TITLE_MAX]},
             "task_id": task_id,
             "button_list": [
                 {"text": label, "style": 1 if i == 0 else 4, "key": key}
                 for i, (label, key) in enumerate(zip(spec["options"], keys))
             ],
         }
+        self._sweep_button_cards()
         self._pending_button_cards[task_id] = {
             "chat_id": chat_id, "title": spec["title"], "options": list(spec["options"]),
-            "keys": keys, "ts": time.monotonic(),
+            "keys": keys, "ts": time.monotonic(), "consumed": False,
         }
-        cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS  # keep the registry bounded
-        for key, value in list(self._pending_button_cards.items()):
-            if value["ts"] < cutoff:
-                self._pending_button_cards.pop(key, None)
         return task_id, card
 
     async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str]) -> bool:
@@ -100,23 +124,37 @@ class WeComButtonsMixin:
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
+    async def _on_template_card_event_guarded(self, payload: Dict[str, Any]) -> None:
+        try:
+            await self._on_template_card_event(payload)
+        except Exception as exc:
+            logger.warning("[%s] template_card_event handling failed: %s", self.name, exc)
+
     async def _on_template_card_event(self, payload: Dict[str, Any]) -> None:
         """Button click: acknowledge by updating the card (<5 s), then hand the chosen label to
-        the agent as if the user had typed it."""
+        the agent as if the user had typed it.
+
+        Runs as its own task (never inline in the read loop — the update ack is delivered by it)."""
         body = payload.get("body") or {}
         req_id = self._payload_req_id(payload)
         event = body.get("event") if isinstance(body.get("event"), dict) else {}
-        detail = event.get("template_card_event") if isinstance(event.get("template_card_event"), dict) else {}
+        # WeCom may nest the detail under ``template_card_event``; the official example reads
+        # ``event_key`` straight off ``event`` — accept both.
+        detail = event.get("template_card_event") if isinstance(event.get("template_card_event"), dict) else event
         event_key = str(detail.get("event_key") or "").strip()
         task_id = str(detail.get("task_id") or "").strip()
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
-        chat_id = str(body.get("chatid") or sender_id).strip()
-        is_group = str(body.get("chattype") or "").lower() == "group"
+        self._sweep_button_cards()
         pending = self._pending_button_cards.get(task_id) or {}
-        label = event_key
+        chat_id = str(pending.get("chat_id") or body.get("chatid") or sender_id).strip()
+        is_group = chat_id in self._group_chat_ids or str(body.get("chattype") or "").lower() == "group"
         if pending and event_key in pending.get("keys", []):
             label = pending["options"][pending["keys"].index(event_key)]
+        elif "|" in event_key:
+            label = event_key.split("|", 1)[1].strip()
+        else:
+            label = event_key
         # selected_items (dropdown / multi-select) → append chosen option ids as text
         sel = detail.get("selected_items")
         if isinstance(sel, dict):
@@ -127,15 +165,25 @@ class WeComButtonsMixin:
                     ids += list(oid.get("option_id") or []) if isinstance(oid, dict) else []
             if ids:
                 label = (label + " " if label else "") + ",".join(str(x) for x in ids)
-        logger.info("[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s", self.name, chat_id, sender_id, task_id, event_key, label, is_group)
+        repeat = bool(pending.get("consumed"))
+        logger.info("[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s repeat=%s", self.name, chat_id, sender_id, task_id, event_key, label, is_group, repeat)
+        # 0) policy first — a blocked user gets neither the update nor a routed message
+        if is_group:
+            self._group_chat_ids.add(chat_id)
+            if not self._is_group_allowed(chat_id, sender_id):
+                logger.info("[%s] Button click DROPPED by group policy: chat=%s", self.name, chat_id)
+                return
+        elif not self._is_dm_intake_allowed(sender_id):
+            logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
+            return
         # 1) acknowledge within 5 s — card becomes a text notice with the choice
         if req_id and task_id:
             update = {
                 "response_type": "update_template_card",
                 "template_card": {
                     "card_type": "text_notice",
-                    "main_title": {"title": ((pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE)[:60]},
-                    "sub_title_text": f"已选择：{label or event_key}"[:160],
+                    "main_title": {"title": ((pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE)[:BUTTON_TITLE_MAX]},
+                    "sub_title_text": f"已选择：{label or event_key}"[:100],
                     "task_id": task_id,
                 },
             }
@@ -145,24 +193,21 @@ class WeComButtonsMixin:
                     logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
             except Exception as exc:
                 logger.warning("[%s] update_template_card failed: %s", self.name, exc)
+        if repeat:
+            return
+        if pending:
+            pending["consumed"] = True
         if not chat_id or not label:
             return
-        # 2) policy + dedup, then route the label as a user message
-        if is_group:
-            self._group_chat_ids.add(chat_id)
-            if not self._is_group_allowed(chat_id, sender_id):
-                logger.info("[%s] Button click DROPPED by group policy: chat=%s", self.name, chat_id)
-                return
-        elif not self._is_dm_intake_allowed(sender_id):
-            logger.info("[%s] Button click from %s blocked by DM policy", self.name, sender_id)
-            return
-        msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}-{int(time.time())}")
+        msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")
         if self._dedup.is_duplicate(msg_id):
             return
-        self._remember_reply_req_id(msg_id, req_id)
-        if req_id:
-            self._remember_chat_req_id(chat_id, req_id)
-        self._pending_button_cards.pop(task_id, None)
+        # 2) This turn has no usable inbound req_id: the event's req_id is spent on the update
+        #    frame and the previous message's already served its reply.  Drop the stale one so the
+        #    reply goes proactive (aibot_send_msg) instead of streaming on a dead req_id.
+        self._last_chat_req_ids.pop(chat_id, None)
+        self._stream_expired_chats.add(chat_id)
+        self._button_click_chats.add(chat_id)
         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None)
         await self.handle_message(MessageEvent(
             text=label, message_type=MessageType.TEXT, source=source, raw_message=payload,

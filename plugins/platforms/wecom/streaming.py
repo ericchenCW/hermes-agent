@@ -325,6 +325,8 @@ class WeComStreamMixin:
         self._cancel_keepalive(turn)
         # idcsre patch: a trailing BUTTONS[...] line becomes a card riding on the finish frame.
         text, button_spec = self._extract_button_directive(text)
+        if button_spec and not (text or "").strip():
+            text = button_spec["title"]
         button_card: Optional[Dict[str, Any]] = None
         if button_spec:
             _, button_card = self._build_button_card(chat, button_spec)
@@ -334,11 +336,11 @@ class WeComStreamMixin:
         card_kwargs = {"template_card": button_card} if button_card else {}
         card_embedded = False
         if inline_items:
-            card_embedded = await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths, card_kwargs) and bool(button_card)
+            card_embedded = bool(button_card) and await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths, card_kwargs)
         else:
             # Keep the pre-patch call shape so subclass / test doubles without msg_item keep working.
-            await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, **card_kwargs)
-            card_embedded = bool(button_card)
+            _resp = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, **card_kwargs)
+            card_embedded = bool(button_card) and isinstance(_resp, dict) and int(_resp.get("errcode", 0) or 0) == 0 and not _resp.get("ack_pending")
         turn.finalized = True
         if button_spec and not card_embedded:
             # The finish frame did not carry the card (fallback path) — deliver it proactively.
@@ -383,7 +385,7 @@ class WeComStreamMixin:
             # bubble): the pictures are not on screen — let the per-image path send them.
             self._embedded_inline_media.pop(chat, None)
             logger.info("[%s] finalize frame with inline images not confirmed (%s); falling back to separate image sends", self.name, response if isinstance(response, dict) else type(response).__name__)
-        return True
+        return bool(rendered)
 
     async def _send_stream_frame_inner(self, text: str, *, chat: str, reply_to: Optional[str] = None, finalize: bool = False, turn_id: Optional[str] = None) -> bool:
         turn: Optional[StreamTurn] = None
@@ -401,6 +403,7 @@ class WeComStreamMixin:
             if finalize:
                 return await self._finalize_turn(turn, text, chat, turn_id)
             # Fire-and-forget: the gateway decides when to push (identity dedup in stream_consumer.py).
+            text = self._strip_partial_button_line(text)  # idcsre patch: hide a half-written directive
             turn.accumulated_text = text
             if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES or text == turn.last_sent_content:
                 return True  # cap reached (finalize drains the rest) or nothing new
