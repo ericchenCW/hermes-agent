@@ -3265,6 +3265,15 @@ def _event_media_is_video(event, index: int) -> bool:
     return getattr(event, "message_type", None) == MessageType.VIDEO
 
 
+def _home_channel_nudge_enabled() -> bool:
+    """idcsre patch: ``HERMES_HOME_CHANNEL_NUDGE=0|false|off|no`` suppresses the
+    first-contact "No home channel is set" notice.  Hosted deployments (one
+    gateway per tenant, no cron / cross-platform delivery) have no home-channel
+    concept, so the nudge is only noise there."""
+    value = (os.getenv("HERMES_HOME_CHANNEL_NUDGE") or "").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
 def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
@@ -6732,6 +6741,18 @@ class TurnRunner:
                 if isinstance(_fr, str) and _fr.strip() and _fr != "(empty)":
                     _final_for_stream = _fr
             if _final_for_stream is not None:
+                # idcsre patch: let adapters that can embed attachments in the
+                # finalize frame (WeCom stream.msg_item) see the final response
+                # before the consumer finalizes.
+                try:
+                    _stage_fn = getattr(getattr(_stream_consumer, "adapter", None), "stage_stream_media", None)
+                    if callable(_stage_fn):
+                        _stage_fn(
+                            ctx.source.chat_id, _final_for_stream,
+                            turn_id=getattr(_stream_consumer, "_turn_id", None),
+                        )
+                except Exception as _stage_err:
+                    logger.debug("stage_stream_media failed: %s", _stage_err)
                 # Duck-type safe: test doubles / older consumers may expose a
                 # zero-arg finish(). The payload is an optimization, not a
                 # requirement — fall back to the bare signal.
@@ -21202,7 +21223,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and _home_channel_nudge_enabled()
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
