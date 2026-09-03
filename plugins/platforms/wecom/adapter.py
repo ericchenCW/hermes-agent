@@ -479,6 +479,9 @@ class WeComAdapter(BasePlatformAdapter):
         # chats whose latest inbound was a button click: no usable req_id →
         # replies go proactive (also in groups) until the next real message
         self._button_click_chats: set[str] = set()
+        # inbound req_id -> sender userid (bounded), so a card sent in reply to a
+        # message can be locked to the person who asked
+        self._req_senders: Dict[str, str] = {}
 
         # Per-chat FIFO send queue with token-bucket rate limiting.
         # Mirrors OpenClaw's chat-queue.ts (serial per chat) plus a
@@ -1383,6 +1386,12 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         is_group = str(body.get("chattype") or "").lower() == "group"
+        _rid = self._payload_req_id(payload)
+        if _rid and sender_id:
+            self._req_senders[_rid] = sender_id
+            if len(self._req_senders) > 500:
+                for _k in list(self._req_senders)[:100]:
+                    self._req_senders.pop(_k, None)
         if is_group:
             self._group_chat_ids.add(chat_id)
             if not self._is_group_allowed(chat_id, sender_id):
@@ -2246,16 +2255,19 @@ class WeComAdapter(BasePlatformAdapter):
     def _display_width(text: str) -> int:
         return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
 
-    def _build_button_card(self, chat_id: str, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    def _build_button_card(self, chat_id: str, spec: Dict[str, Any], owner: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         task_id = f"btn-{uuid.uuid4().hex[:24]}"
         # the label rides inside the key so a click can be decoded even after
         # a gateway restart wiped the registry
         keys = [f"opt{i}|{label}" for i, label in enumerate(spec["options"])]
         title = spec["title"][:BUTTON_TITLE_MAX]
+        main_title = {"title": title}
+        if owner and chat_id in self._group_chat_ids:
+            main_title["desc"] = "请提问者本人选择，其他人点击无效"
         if all(self._display_width(l) <= BUTTON_SHORT_WIDTH for l in spec["options"]):
             card = {
                 "card_type": "button_interaction",
-                "main_title": {"title": title},
+                "main_title": main_title,
                 "task_id": task_id,
                 "button_list": [
                     {"text": label, "style": BUTTON_STYLE, "key": key}
@@ -2268,7 +2280,7 @@ class WeComAdapter(BasePlatformAdapter):
             # comes back as template_card_event.selected_items on submit.
             card = {
                 "card_type": "vote_interaction",
-                "main_title": {"title": title},
+                "main_title": main_title,
                 "task_id": task_id,
                 "checkbox": {
                     "question_key": "choice",
@@ -2283,15 +2295,17 @@ class WeComAdapter(BasePlatformAdapter):
         self._sweep_button_cards()
         self._pending_button_cards[task_id] = {
             "chat_id": chat_id, "title": spec["title"], "options": list(spec["options"]),
-            "keys": keys, "ts": time.monotonic(), "consumed": False,
+            "keys": keys, "ts": time.monotonic(), "consumed": False, "owner": owner or "",
         }
         return task_id, card
 
-    async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str]) -> bool:
+    async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str], owner: Optional[str] = None) -> bool:
         """Deliver a button card after the text: passive reply when a req_id is
         available (required in groups), proactive ``aibot_send_msg`` otherwise."""
         try:
-            task_id, card = self._build_button_card(chat_id, spec)
+            if not owner:
+                owner = self._req_senders.get(reply_req_id or "") or (chat_id if chat_id not in self._group_chat_ids else None)
+            task_id, card = self._build_button_card(chat_id, spec, owner)
             body = {"msgtype": "template_card", "template_card": card}
             if reply_req_id:
                 try:
@@ -2379,10 +2393,16 @@ class WeComAdapter(BasePlatformAdapter):
         else:                               # plain button card: the button key itself
             label = _decode(event_key)
         repeat = bool(pending.get("consumed"))
+        owner = str(pending.get("owner") or "")
         logger.info(
-            "[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s repeat=%s",
-            self.name, chat_id, sender_id, task_id, event_key, label, is_group, repeat,
+            "[%s] Button click: chat=%s sender=%s owner=%s task=%s key=%r label=%r group=%s repeat=%s",
+            self.name, chat_id, sender_id, owner or "-", task_id, event_key, label, is_group, repeat,
         )
+        if owner and sender_id and sender_id != owner:
+            # the card answers the asker's question: other members' clicks
+            # are ignored (no routing, no card rewrite)
+            logger.info("[%s] Button click by %s ignored: card belongs to %s", self.name, sender_id, owner)
+            return
         # 0) policy first — a blocked user gets neither the update nor a routed message
         if is_group:
             self._group_chat_ids.add(chat_id)
