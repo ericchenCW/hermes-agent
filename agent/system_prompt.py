@@ -65,6 +65,11 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 )
 
 
+
+def _prompt_section_enabled(env_name: str) -> bool:
+    """Operator switch for an optional built-in prompt section (default on)."""
+    return os.environ.get(env_name, "1").strip().lower() not in ("0", "false", "off", "no")
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -494,8 +499,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # this slot holds its position. Toolset and skill set are fixed
     # per-session, so cache-safe either way.
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
-    _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    # HERMES_PROMPT_HERMES_HELP=0 drops the pointer entirely (deployments
+    # where end users never configure Hermes, e.g. an IT-support bot).
+    _help_guidance_slot = None
+    if _prompt_section_enabled("HERMES_PROMPT_HERMES_HELP"):
+        _help_guidance_slot = len(stable_parts)
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -553,7 +562,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
-    if agent.valid_tool_names:
+    # HERMES_PROMPT_STEER_NOTE=0 drops it where mid-turn steering is never
+    # used (e.g. gateway deployments running busy_input_mode=queue).
+    if agent.valid_tool_names and _prompt_section_enabled("HERMES_PROMPT_STEER_NOTE"):
         stable_parts.append(STEER_CHANNEL_NOTE)
 
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -652,7 +663,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # the hermes-agent skill actually present in the index (gating on the
     # rendered index line keeps this a pure string check — no second
     # filesystem scan, and it inherits the index cache's stability).
-    if _has_skill_view and "- hermes-agent:" in skills_prompt:
+    if _help_guidance_slot is not None and _has_skill_view and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
