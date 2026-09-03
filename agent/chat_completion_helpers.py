@@ -4166,10 +4166,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     except Exception:
                         pass
 
+        _diag_last_chunks = []
         for chunk in _iter_provider_stream_chunks(
             stream,
             response=lambda: attempt_stream_response["value"],
         ):
+            try:
+                _diag_last_chunks.append(repr(chunk)[:400]); del _diag_last_chunks[:-3]
+            except Exception:
+                pass
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 
@@ -4278,16 +4283,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if delta_content:
                 content_parts.append(delta_content)
                 if not tool_calls_acc:
-                    if pending_text_parts or _provider_stream_text_may_be_sse(delta_content):
+                    # SSE-leak heuristic only makes sense at a line start: a
+                    # delta such as ":/opt/..." right after "MEDIA" or "https"
+                    # is ordinary text, not a leaked SSE comment line.
+                    _prev_tail = content_parts[-2][-1:] if len(content_parts) > 1 else ""
+                    _at_line_start = _prev_tail in ("", "\n", "\r")
+                    if pending_text_parts or (
+                        _at_line_start and _provider_stream_text_may_be_sse(delta_content)
+                    ):
                         pending_text_parts.append(delta_content)
                         pending_text = "".join(pending_text_parts)
-                        if _provider_stream_text_may_be_sse(pending_text):
-                            continue
-                        _flush_pending_stream_text()
-                        continue
-                    _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
-                    deltas_were_sent["yes"] = True
+                        if not _provider_stream_text_may_be_sse(pending_text):
+                            _flush_pending_stream_text()
+                        # No ``continue`` here: this very chunk may carry
+                        # finish_reason / usage (vLLM sets finish_reason on
+                        # the last content chunk).  Skipping the rest of the
+                        # loop turned a normal end-of-stream into a
+                        # "mid-stream drop" and a full retry of the call.
+                    else:
+                        _fire_first_delta()
+                        agent._fire_stream_delta(delta_content)
+                        deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -4557,6 +4573,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "Stream ended with no finish_reason after delivering text "
                 "with no tool calls; treating as a mid-stream drop."
             )
+            try:
+                logger.warning("[diag] chunks=%s pending_text=%r interrupt=%s cancelled=%s last_chunks=%s", _diag.get("chunks"), "".join(pending_text_parts)[:200], agent._interrupt_requested, _stream_attempt_was_cancelled(stream_attempt_id), _diag_last_chunks)
+            except Exception as _e:
+                logger.warning("[diag] failed: %s", _e)
             return _build_partial_stream_stub(
                 role, full_content,
                 "".join(reasoning_parts) or None,
