@@ -456,3 +456,100 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "工作階段資料庫無法使用"
     session_not_found:           "資料庫中找不到此工作階段。"
     warn_passthrough:            "⚠️ {error}"
+
+# Gateway runtime notices (busy acks, drain, auto-reset, error replies, media fallbacks).
+gateway_runtime:
+  provider_error:
+    auth: ⚠️ 模型服务认证失败，请联系管理员检查凭据配置；详细信息见网关日志。
+    policy: ⚠️ 模型服务拒绝了这次请求，可以换个说法再试；详细信息见网关日志。
+    rate_limit: ⏱️ 模型服务正在限流，请稍等片刻再试。
+    connection: ⚠️ 模型服务没有响应，可能尚未启动或网络不通，请联系管理员。
+    generic: ⚠️ 模型服务多次重试后仍然失败，请稍后再试；详细信息见网关日志。
+  turn:
+    storage_disk: ⚠️ 会话存储暂时不可用（磁盘空间不足），为保护对话记录本轮已中止。请联系管理员清理磁盘后重新发送。
+    storage_other: ⚠️ 会话存储暂时不可用，为保护对话记录本轮已中止。请稍后重新发送这条消息。
+    context_too_large: '⚠️ 当前会话内容过多，超出模型上下文窗口。
+
+      发送 /compact 压缩对话，或发送 /new 开始新会话。'
+    request_failed: '请求失败：{error}
+
+      请重试，或发送 /new 开始新会话。'
+    interrupted_before_start: ⚠️ 这条消息在开始处理前被中断了（通常是刚执行过 /stop），请重新发送。
+    processing_stopped: ⚠️ 处理中止：{error}。请重试。
+    no_response: ⚠️ 处理已完成但没有生成回复，可能是临时故障，请重新发送这条消息。
+    not_processed: ⚠️ 这条消息没有被处理（上一轮还在收尾），请重新发送。
+  busy:
+    steered: ⏩ 已并入当前任务{detail}，你的消息会在下一次工具调用后生效。
+    redirected: ↪ 已按你的补充调整当前任务{detail}。
+    queued_subagent: ⏳ 子任务进行中{detail}，你的消息已排队，完成后处理（发送 /stop 可全部取消）。
+    queued_compression: ⏳ 正在压缩上下文{detail}，你的消息已排队，完成后处理（发送 /stop 可全部取消）。
+    queued: ⏳ 你的消息已排队{detail}，当前任务完成后我会回复。
+    interrupting: ⚡ 正在中断当前任务{detail}，稍后回复你的消息。
+    detail_elapsed: 已进行 {minutes} 分钟
+    detail_iteration: 第 {iteration}/{max_iterations} 轮
+    detail_running: 正在执行：{tool}
+  unknown_command: 未知命令 `/{command}`。发送 /commands 查看可用命令；如果只是普通消息，请去掉开头的斜杠重新发送。
+  error:
+    unexpected: '抱歉，处理时遇到了意外错误。{hint}
+
+      请重试，或发送 /new 开始新会话。'
+    hint_401: ' 模型服务认证失败，请联系管理员检查凭据。'
+    hint_402: ' 模型服务额度已用尽，请联系管理员。'
+    hint_429_hours: ' 已达到用量上限，约 {hours} 小时后重置。'
+    hint_429_wait: ' 已达到用量上限，请等待重置。'
+    hint_429_rate: ' 请求过于频繁，请稍等片刻再试。'
+    hint_529: ' 模型服务暂时过载，请稍后再试。'
+    hint_400: ' 请求被模型服务拒绝。'
+  auto_reset:
+    notice: ◐ 会话已自动重置（{reason}），之前的对话记录已清空，现在是新会话。
+    reason_suspended: 上一个会话已停止或被中断
+    reason_resume_expired: 服务重启后恢复超时
+    reason_daily: 每日 {hour}:00 定时重置
+    reason_idle: 超过 {duration}没有对话
+    duration_h: '{hours} 小时'
+    duration_hm: '{hours} 小时 {minutes} 分钟'
+    duration_m: '{minutes} 分钟'
+  drain:
+    gerund_restarting: 重启
+    gerund_shutting_down: 停止
+    queued: ⏳ 服务正在{action}，你的消息已排队，恢复后处理。
+    not_accepting: ⏳ 服务正在{action}，暂时无法处理新消息，请稍后重发。
+    not_accepting_work: ⏳ 服务正在{action}，暂时无法处理新消息，请稍后重发。
+    external_drain: ⏳ 服务正在维护，暂时无法处理新消息，请稍后重发。
+    another_turn: ⏳ 当前会话还有一轮在处理中，这条消息没有被处理。请等它完成后重新发送。
+    agent_running_cmd: ⏳ 当前有任务在处理，`/{name}` 不能在任务中执行。请等回复完成，或先发送 /stop。
+    force_stopped: ⚡ 已强制停止（任务尚在启动中），会话已解锁。
+  restart_notice:
+    restarting: ⚠️ 服务即将重启，当前任务会被中断。重启完成后随便发一条消息，我会尝试接着处理。
+    shutting_down: ⚠️ 服务即将停止，当前任务会被中断。
+  progress:
+    working: ⏳ 处理中，已 {minutes} 分钟{detail}
+    no_activity: ⚠️ 已有 {elapsed} 分钟没有进展，若仍无响应将在 {remaining} 分钟后超时。可以继续等待，或发送 /new 重新开始。
+  onboarding:
+    busy_queue: 💡 提示：你的消息已排队，不会打断当前任务。发送 /stop 可以停止当前任务。此提示只显示一次。
+    busy_steer: 💡 提示：你的消息已并入当前任务，会在下一次工具调用后生效。发送 /stop 可以停止当前任务。此提示只显示一次。
+    busy_redirect: 💡 提示：已按你的补充调整当前任务，已完成的部分会保留。发送 /stop 可以停止当前任务。此提示只显示一次。
+    busy_interrupt: 💡 提示：新消息会打断当前任务并优先回复。此提示只显示一次。
+    tool_progress: 💡 提示：这一步耗时较长，我会逐步汇报进度。如果觉得进度消息太多，可发送 /verbose 切换模式。此提示只显示一次。
+  media:
+    audio: ⚠️ 音频附件发送失败。
+    video: ⚠️ 视频附件发送失败。
+    file_named: ⚠️ 文件附件发送失败（{file_name}）。
+    file: ⚠️ 文件附件发送失败。
+    image: ⚠️ 图片附件发送失败。
+    delivery_failed: ⚠️ 回复多次发送失败。你的请求已处理完成，但回复没能送达，请重试。
+    formatting_failed: '（回复排版失败，以下为纯文本：）
+
+
+      {content}'
+  agent:
+    thinking_exhausted: '⚠️ **思考预算已耗尽**
+
+
+      模型把输出额度全部用在了推理上，没有余量给出正式回答。请把问题拆小或换个更简短的问法再试；若反复出现，请联系管理员调整配置。'
+    repetition: '⚠️ **回复已中止：检测到重复输出**
+
+
+      模型在生成时陷入了重复循环，已丢弃这段回复。请重新发送你的消息（对话记录仍保留），或换个问法再试。'
+    error_processing: 抱歉，处理模型回复时出错：{error}
+    error_repeated: 抱歉，连续多次出错：{error}

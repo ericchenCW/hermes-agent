@@ -744,26 +744,14 @@ def _format_exec_approval_fallback(
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
-        return (
-            "⚠️ Provider authentication failed. Check the configured credentials; "
-            "raw provider details are in the gateway logs."
-        )
+        return t("gateway_runtime.provider_error.auth")
     if _GATEWAY_PROVIDER_POLICY_RE.search(text):
-        return (
-            "⚠️ The model provider rejected the request. I kept the raw provider "
-            "error out of chat; check gateway logs for details or try rephrasing."
-        )
+        return t("gateway_runtime.provider_error.policy")
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        return t("gateway_runtime.provider_error.rate_limit")
     if _GATEWAY_CONNECTION_ERROR_RE.search(text):
-        return (
-            "⚠️ The model server is not responding — it looks like the configured "
-            "model endpoint is not running or is unreachable."
-        )
-    return (
-        "⚠️ The model provider failed after retries. I kept raw provider details "
-        "out of chat; check gateway logs for diagnostics."
-    )
+        return t("gateway_runtime.provider_error.connection")
+    return t("gateway_runtime.provider_error.generic")
 
 
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
@@ -4181,32 +4169,15 @@ def _normalize_empty_agent_response(
             "session storage" in error_str
         ):
             if failure_reason.endswith(":disk") or "disk" in error_str:
-                return (
-                    "⚠️ Session storage was temporarily unavailable, so this "
-                    "turn was stopped to protect your conversation history. "
-                    "Please check available disk space, then send your "
-                    "message again."
-                )
-            return (
-                "⚠️ Session storage was temporarily unavailable, so this "
-                "turn was stopped to protect your conversation history. "
-                "Your message should already be saved — please send it "
-                "again in a moment."
-            )
+                return t("gateway_runtime.turn.storage_disk")
+            return t("gateway_runtime.turn.storage_other")
         is_context_failure = any(
             p in error_str
             for p in ("context", "token", "too large", "too long", "exceed", "payload")
         ) or ("400" in error_str and history_len > 50)
         if is_context_failure:
-            return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or "
-                "/reset to start fresh."
-            )
-        return (
-            f"The request failed: {str(error_detail)[:300]}\n"
-            "Try again or use /reset to start a fresh session."
-        )
+            return t("gateway_runtime.turn.context_too_large")
+        return t("gateway_runtime.turn.request_failed", error=str(error_detail)[:300])
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
@@ -4219,21 +4190,15 @@ def _normalize_empty_agent_response(
         # interrupt flag left over from a recent /stop (#44212).  Pure
         # silence there swallows a real user message, so surface it.
         if api_calls == 0:
-            return (
-                "⚠️ Your message was interrupted before processing started "
-                "(likely by a recent /stop). Please send it again."
-            )
+            return t("gateway_runtime.turn.interrupted_before_start")
         return response
     if api_calls > 0:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
-        return (
-            "⚠️ Processing completed but no response was generated. "
-            "This may be a transient error — try sending your message again."
-        )
+            return t("gateway_runtime.turn.processing_stopped", error=str(err)[:200])
+        return t("gateway_runtime.turn.no_response")
 
     # api_calls == 0, not failed, not interrupted: the agent never ran for
     # this turn. This is the post-/stop generation-race pattern where the
@@ -4246,10 +4211,7 @@ def _normalize_empty_agent_response(
         and not agent_result.get("failed")
         and not agent_result.get("partial")
     ):
-        return (
-            "⚠️ Your message wasn't processed (the previous turn was still "
-            "being cleaned up). Please send it again."
-        )
+        return t("gateway_runtime.turn.not_processed")
 
     return response
 
@@ -9333,7 +9295,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "restart" if self._restart_requested else "shutdown"
 
     def _status_action_gerund(self) -> str:
-        return "restarting" if self._restart_requested else "shutting down"
+        return t("gateway_runtime.drain.gerund_restarting") if self._restart_requested else t("gateway_runtime.drain.gerund_shutting_down")
 
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
@@ -10557,9 +10519,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = t("gateway_runtime.drain.queued", action=self._status_action_gerund())
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = t("gateway_runtime.drain.not_accepting", action=self._status_action_gerund())
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -10882,48 +10844,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if start_ts:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
+                        status_parts.append(t("gateway_runtime.busy.detail_elapsed", minutes=elapsed_min))
                 if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                    status_parts.append(t("gateway_runtime.busy.detail_iteration", iteration=iteration, max_iterations=max_iter))
                 if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                    status_parts.append(t("gateway_runtime.busy.detail_running", tool=current_tool))
             except Exception:
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
+            message = t("gateway_runtime.busy.steered", detail=status_detail)
         elif is_redirect_mode:
-            message = (
-                f"↪ Redirected current run{status_detail}. "
-                f"I'll adjust using your correction."
-            )
+            message = t("gateway_runtime.busy.redirected", detail=status_detail)
         elif is_queue_mode and demoted_for_subagents:
             # #30170 — explain the demotion so the user knows their
             # follow-up didn't accidentally kill the subagent and
             # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
-            )
+            message = t("gateway_runtime.busy.queued_subagent", detail=status_detail)
         elif is_queue_mode and demoted_for_compression:
-            message = (
-                f"⏳ Compressing context{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
-            )
+            message = t("gateway_runtime.busy.queued_compression", detail=status_detail)
         elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
-            )
+            message = t("gateway_runtime.busy.queued", detail=status_detail)
         else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
+            message = t("gateway_runtime.busy.interrupting", detail=status_detail)
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
@@ -11172,14 +11116,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
-        action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+        msg = (
+            t("gateway_runtime.restart_notice.restarting")
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else t("gateway_runtime.restart_notice.shutting_down")
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
@@ -17327,10 +17268,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Catch-all: any other recognized slash command reached the
         # running-agent guard. Reject gracefully rather than falling
         # through to interrupt + discard.
-        return (
-            f"⏳ Agent is running — `/{name}` can't run "
-            f"mid-turn. Wait for the current response or `/stop` first."
-        )
+        return t("gateway_runtime.drain.agent_running_cmd", name=name)
 
     async def _handle_pause_command(self, event: MessageEvent):
         """`/pause [reason]` engages the global emergency stop; `/pause off`
@@ -18166,7 +18104,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
-                    return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
+                    return EphemeralReply(t("gateway_runtime.drain.force_stopped"))
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self._adapter_for_source(source)
@@ -18185,9 +18123,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    t("gateway_runtime.drain.queued", action=self._status_action_gerund())
                     if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    else t("gateway_runtime.drain.not_accepting", action=self._status_action_gerund())
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -18749,7 +18687,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return t("gateway_runtime.drain.not_accepting_work", action=self._status_action_gerund())
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -18968,12 +18906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             command,
                             source.platform.value if source.platform else "?",
                         )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
-                        )
+                        return t("gateway_runtime.unknown_command", command=command)
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
@@ -19005,11 +18938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
-            return (
-                "⏳ This agent is draining for a maintenance action and isn't "
-                "accepting new turns right now. It'll be back in a moment — "
-                "please resend shortly."
-            )
+            return t("gateway_runtime.drain.external_drain")
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -19052,11 +18981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key,
                     exc.session_id,
                 )
-                return (
-                    "⏳ Another turn is still running on this session. To "
-                    "protect the transcript, this message was not processed. "
-                    "Wait for the active turn to finish, then resend it."
-                )
+                return t("gateway_runtime.drain.another_turn")
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result,
@@ -20112,22 +20037,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
+                            reason_text = t("gateway_runtime.auto_reset.reason_suspended")
                         elif reset_reason == "resume_pending_expired":
-                            reason_text = "gateway restart recovery timed out"
+                            reason_text = t("gateway_runtime.auto_reset.reason_resume_expired")
                         elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                            reason_text = t("gateway_runtime.auto_reset.reason_daily", hour=policy.at_hour)
                         else:
                             hours = policy.idle_minutes // 60
                             mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
-                        )
+                            if not mins:
+                                duration = t("gateway_runtime.auto_reset.duration_h", hours=hours)
+                            elif hours:
+                                duration = t("gateway_runtime.auto_reset.duration_hm", hours=hours, minutes=mins)
+                            else:
+                                duration = t("gateway_runtime.auto_reset.duration_m", minutes=mins)
+                            reason_text = t("gateway_runtime.auto_reset.reason_idle", duration=duration)
+                        notice = t("gateway_runtime.auto_reset.notice", reason=reason_text)
                         try:
                             session_info = await asyncio.to_thread(
                                 self._reset_notice_session_info, source
@@ -22102,9 +22027,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
             if status_code == 401:
-                status_hint = " Check your API key or run `claude /login` to refresh OAuth credentials."
+                status_hint = t("gateway_runtime.error.hint_401")
             elif status_code == 402:
-                status_hint = " Your API balance or quota is exhausted. Check your provider dashboard."
+                status_hint = t("gateway_runtime.error.hint_402")
             elif status_code == 429:
                 # Check if this is a plan usage limit (resets on a schedule) vs a transient rate limit
                 _err_body = getattr(e, "response", None)
@@ -22121,29 +22046,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _resets_in and _resets_in > 0:
                         import math
                         _hours = math.ceil(_resets_in / 3600)
-                        status_hint = f" Your plan's usage limit has been reached. It resets in ~{_hours}h."
+                        status_hint = t("gateway_runtime.error.hint_429_hours", hours=_hours)
                     else:
-                        status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
+                        status_hint = t("gateway_runtime.error.hint_429_wait")
                 else:
-                    status_hint = " You are being rate-limited. Please wait a moment and try again."
+                    status_hint = t("gateway_runtime.error.hint_429_rate")
             elif status_code == 529:
-                status_hint = " The API is temporarily overloaded. Please try again shortly."
+                status_hint = t("gateway_runtime.error.hint_529")
             elif status_code in {400, 500}:
                 # 400 with a large session is context overflow.
                 # 500 with a large session often means the payload is too large
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
-                    return (
-                        "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
-                        "/reset to start fresh."
-                    )
+                    return t("gateway_runtime.turn.context_too_large")
                 elif status_code == 400:
-                    status_hint = " The request was rejected by the API."
-            return (
-                f"Sorry, I encountered an unexpected error.{status_hint}\n"
-                "Try again or use /reset to start a fresh session."
-            )
+                    status_hint = t("gateway_runtime.error.hint_400")
+            return t("gateway_runtime.error.unexpected", hint=status_hint)
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
@@ -22175,6 +22093,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
         """
+        if os.environ.get("HERMES_GATEWAY_SESSION_INFO", "1").strip().lower() in ("0", "false", "off", "no"):
+            return ""
         resolved = _resolve_gateway_model_context()
         model = resolved.model
         provider = resolved.provider
@@ -30179,7 +30099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _heartbeat_text = (
                     _generic_status_phrase("status")
                     if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                    else t("gateway_runtime.progress.working", minutes=_elapsed_mins, detail=_status_detail)
                 )
                 try:
                     _notify_res = None
@@ -30424,10 +30344,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    t("gateway_runtime.progress.no_activity", elapsed=_elapsed_warn, remaining=_remaining_mins),
                                     metadata=_interim_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:

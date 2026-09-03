@@ -106,6 +106,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
+from agent.i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -3852,14 +3853,7 @@ def run_conversation(
                         # Return a user-friendly message as the response so
                         # CLI (response box) and gateway (chat message) both
                         # display it naturally instead of a suppressed error.
-                        _exhaust_response = (
-                            "⚠️ **Thinking Budget Exhausted**\n\n"
-                            "The model used all its output tokens on reasoning "
-                            "and had none left for the actual response.\n\n"
-                            "To fix this:\n"
-                            "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
-                            "→ Or switch to a larger/non-reasoning model with `/model`"
-                        )
+                        _exhaust_response = t("gateway_runtime.agent.thinking_exhausted")
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -3904,16 +3898,7 @@ def run_conversation(
                             f"continuing a degenerate response.",
                             force=True,
                         )
-                        _rep_response = (
-                            "⚠️ **Response Stopped — Repetition Detected**\n\n"
-                            "The model fell into a repetition loop while "
-                            "writing this response, so continuing would only "
-                            "produce more repeated text. The partial response "
-                            "was discarded.\n\n"
-                            "→ Switch to a different model with `/model`\n"
-                            "→ Or resend your message (your conversation "
-                            "history is preserved)"
-                        )
+                        _rep_response = t("gateway_runtime.agent.repetition")
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -8719,14 +8704,14 @@ def run_conversation(
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+                    final_response = t("gateway_runtime.agent.error_processing", error=error_msg)
                 elif _outer_error_count >= _outer_error_cap:
                     failed = True
                     _turn_exit_reason = f"repeated_outer_errors({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                    final_response = t("gateway_runtime.agent.error_repeated", error=error_msg)
                 else:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                    final_response = t("gateway_runtime.agent.error_repeated", error=error_msg)
                 # Don't append the assistant message here — a thinking-prefill
                 # or interim assistant may already be the tail, and appending
                 # would create assistant→assistant.  finalize_turn handles

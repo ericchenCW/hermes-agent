@@ -460,3 +460,116 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Níl bunachar sonraí na seisiún ar fáil"
     session_not_found:           "Seisiún gan a aimsiú sa bhunachar sonraí."
     warn_passthrough:            "⚠️ {error}"
+
+# Gateway runtime notices (busy acks, drain, auto-reset, error replies, media fallbacks).
+gateway_runtime:
+  provider_error:
+    auth: ⚠️ Provider authentication failed. Check the configured credentials; raw provider details are in the gateway logs.
+    policy: ⚠️ The model provider rejected the request. I kept the raw provider error out of chat; check gateway logs for details or try rephrasing.
+    rate_limit: ⏱️ The model provider is rate-limiting requests. Please wait a moment and try again.
+    connection: ⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.
+    generic: ⚠️ The model provider failed after retries. I kept raw provider details out of chat; check gateway logs for diagnostics.
+  turn:
+    storage_disk: ⚠️ Session storage was temporarily unavailable, so this turn was stopped to protect your conversation history. Please check available disk space, then send your message again.
+    storage_other: ⚠️ Session storage was temporarily unavailable, so this turn was stopped to protect your conversation history. Your message should already be saved — please send it again in a moment.
+    context_too_large: '⚠️ Session too large for the model''s context window.
+
+      Use /compact to compress the conversation, or /reset to start fresh.'
+    request_failed: 'The request failed: {error}
+
+      Try again or use /reset to start a fresh session.'
+    interrupted_before_start: ⚠️ Your message was interrupted before processing started (likely by a recent /stop). Please send it again.
+    processing_stopped: '⚠️ Processing stopped: {error}. Try again.'
+    no_response: ⚠️ Processing completed but no response was generated. This may be a transient error — try sending your message again.
+    not_processed: ⚠️ Your message wasn't processed (the previous turn was still being cleaned up). Please send it again.
+  busy:
+    steered: ⏩ Steered into current run{detail}. Your message arrives after the next tool call.
+    redirected: ↪ Redirected current run{detail}. I'll adjust using your correction.
+    queued_subagent: ⏳ Subagent working{detail} — your message is queued for when it finishes (use /stop to cancel everything).
+    queued_compression: ⏳ Compressing context{detail} — your message is queued for when it finishes (use /stop to cancel everything).
+    queued: ⏳ Queued for the next turn{detail}. I'll respond once the current task finishes.
+    interrupting: ⚡ Interrupting current task{detail}. I'll respond to your message shortly.
+    detail_elapsed: '{minutes} min elapsed'
+    detail_iteration: iteration {iteration}/{max_iterations}
+    detail_running: 'running: {tool}'
+  unknown_command: Unknown command `/{command}`. Type /commands to see what's available, or resend without the leading slash to send as a regular message.
+  error:
+    unexpected: 'Sorry, I encountered an unexpected error.{hint}
+
+      Try again or use /reset to start a fresh session.'
+    hint_401: ' Check your API key or run `claude /login` to refresh OAuth credentials.'
+    hint_402: ' Your API balance or quota is exhausted. Check your provider dashboard.'
+    hint_429_hours: ' Your plan''s usage limit has been reached. It resets in ~{hours}h.'
+    hint_429_wait: ' Your plan''s usage limit has been reached. Please wait until it resets.'
+    hint_429_rate: ' You are being rate-limited. Please wait a moment and try again.'
+    hint_529: ' The API is temporarily overloaded. Please try again shortly.'
+    hint_400: ' The request was rejected by the API.'
+  auto_reset:
+    notice: '◐ Session automatically reset ({reason}). Conversation history cleared.
+
+      Use /resume to browse and restore a previous session.
+
+      Adjust reset timing in config.yaml under session_reset.'
+    reason_suspended: previous session was stopped or interrupted
+    reason_resume_expired: gateway restart recovery timed out
+    reason_daily: daily schedule at {hour}:00
+    reason_idle: inactive for {duration}
+    duration_h: '{hours}h'
+    duration_hm: '{hours}h {minutes}m'
+    duration_m: '{minutes}m'
+  drain:
+    gerund_restarting: restarting
+    gerund_shutting_down: shutting down
+    queued: ⏳ Gateway {action} — queued for the next turn after it comes back.
+    not_accepting: ⏳ Gateway is {action} and is not accepting another turn right now.
+    not_accepting_work: ⏳ Gateway is {action} and is not accepting new work right now.
+    external_drain: ⏳ This agent is draining for a maintenance action and isn't accepting new turns right now. It'll be back in a moment — please resend shortly.
+    another_turn: ⏳ Another turn is still running on this session. To protect the transcript, this message was not processed. Wait for the active turn to finish, then resend it.
+    agent_running_cmd: ⏳ Agent is running — `/{name}` can't run mid-turn. Wait for the current response or `/stop` first.
+    force_stopped: ⚡ Force-stopped. The agent was still starting — session unlocked.
+  restart_notice:
+    restarting: ⚠️ Gateway restarting — Your current task will be interrupted. Send any message after restart and I'll try to resume where you left off.
+    shutting_down: ⚠️ Gateway shutting down — Your current task will be interrupted.
+  progress:
+    working: ⏳ Working — {minutes} min{detail}
+    no_activity: ⚠️ No activity for {elapsed} min. If the agent does not respond soon, it will be timed out in {remaining} min. You can continue waiting or use /reset.
+  onboarding:
+    busy_queue: 💡 First-time tip — I queued your message instead of interrupting. Send `/busy interrupt` to make new messages stop the current task immediately, or `/busy status` to check. This notice won't appear again.
+    busy_steer: 💡 First-time tip — I steered your message into the current run; it will arrive after the next tool call instead of interrupting. Send `/busy interrupt` or `/busy queue` to change this, or `/busy status` to check. This notice won't appear again.
+    busy_redirect: 💡 First-time tip — I redirected the current run using your message. Completed work stays in context, and `/stop` still cancels the task. Send `/busy queue` to wait for a separate turn, or `/busy status` to check. This notice won't appear again.
+    busy_interrupt: 💡 First-time tip — I just interrupted my current task to answer you. Send `/busy queue` to queue follow-ups for after the current task instead, `/busy steer` to inject them mid-run without interrupting, or `/busy status` to check. This notice won't appear again.
+    tool_progress: 💡 First-time tip — that tool took a while and I'm streaming every step. If the progress messages feel noisy, send `/verbose` to cycle modes (all → new → off). This notice won't appear again.
+  media:
+    audio: ⚠️ Couldn't deliver the audio attachment.
+    video: ⚠️ Couldn't deliver the video attachment.
+    file_named: ⚠️ Couldn't deliver the file attachment ({file_name}).
+    file: ⚠️ Couldn't deliver the file attachment.
+    image: ⚠️ Couldn't deliver the image attachment.
+    delivery_failed: ⚠️ Message delivery failed after multiple attempts. Please try again — your request was processed but the response could not be sent.
+    formatting_failed: '(Response formatting failed, plain text:)
+
+
+      {content}'
+  agent:
+    thinking_exhausted: '⚠️ **Thinking Budget Exhausted**
+
+
+      The model used all its output tokens on reasoning and had none left for the actual response.
+
+
+      To fix this:
+
+      → Lower reasoning effort: `/thinkon low` or `/thinkon minimal`
+
+      → Or switch to a larger/non-reasoning model with `/model`'
+    repetition: '⚠️ **Response Stopped — Repetition Detected**
+
+
+      The model fell into a repetition loop while writing this response, so continuing would only produce more repeated text. The partial response was discarded.
+
+
+      → Switch to a different model with `/model`
+
+      → Or resend your message (your conversation history is preserved)'
+    error_processing: 'I apologize, but I encountered an error while processing the model response: {error}'
+    error_repeated: 'I apologize, but I encountered repeated errors: {error}'

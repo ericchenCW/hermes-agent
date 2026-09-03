@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from agent.i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -4740,7 +4741,7 @@ class BasePlatformAdapter(ABC):
             "[%s] send_voice fallback: native audio send unavailable for %s",
             self.name, audio_path,
         )
-        text = "⚠️ Couldn't deliver the audio attachment."
+        text = t("gateway_runtime.media.audio")
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -4884,7 +4885,7 @@ class BasePlatformAdapter(ABC):
             "[%s] send_video fallback: native video send unavailable for %s",
             self.name, video_path,
         )
-        text = "⚠️ Couldn't deliver the video attachment."
+        text = t("gateway_runtime.media.video")
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -4916,9 +4917,9 @@ class BasePlatformAdapter(ABC):
         # filename (already non-sensitive — it is what the agent named the
         # output). Only show it when the caller passed one explicitly.
         if file_name:
-            text = f"⚠️ Couldn't deliver the file attachment ({file_name})."
+            text = t("gateway_runtime.media.file_named", file_name=file_name)
         else:
-            text = "⚠️ Couldn't deliver the file attachment."
+            text = t("gateway_runtime.media.file")
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -4941,12 +4942,12 @@ class BasePlatformAdapter(ABC):
         ext = Path(media_path).suffix.lower()
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-            text = "⚠️ Couldn't deliver the audio attachment."
+            text = t("gateway_runtime.media.audio")
         elif ext in _VIDEO_EXTS:
-            text = "⚠️ Couldn't deliver the video attachment."
+            text = t("gateway_runtime.media.video")
         else:
             file_name = os.path.basename(media_path)
-            text = f"⚠️ Couldn't deliver the file attachment ({file_name})."
+            text = t("gateway_runtime.media.file_named", file_name=file_name)
         try:
             notice = await self.send(chat_id=chat_id, content=text, metadata=metadata)
             if not notice.success:
@@ -4985,7 +4986,7 @@ class BasePlatformAdapter(ABC):
             "[%s] send_image_file fallback: native image send unavailable for %s",
             self.name, image_path,
         )
-        text = "⚠️ Couldn't deliver the image attachment."
+        text = t("gateway_runtime.media.image")
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -5768,10 +5769,7 @@ class BasePlatformAdapter(ABC):
             else:
                 # All retries exhausted (loop completed without break) — notify user
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
-                notice = (
-                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
-                    "Please try again \u2014 your request was processed but the response could not be sent."
-                )
+                notice = t("gateway_runtime.media.delivery_failed")
                 try:
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
@@ -5782,7 +5780,7 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            content=t("gateway_runtime.media.formatting_failed", content=content[:3500]),
             reply_to=reply_to,
             metadata=metadata,
         )
