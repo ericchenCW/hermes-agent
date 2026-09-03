@@ -37,7 +37,7 @@ from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.buttons import (
     WeComButtonsMixin, APP_CMD_RESPONSE_UPDATE, BUTTON_DEFAULT_TITLE, BUTTON_MAX,
     BUTTON_LABEL_MAX, BUTTON_TITLE_MAX, BUTTON_CARDS_MAX, BUTTON_CARD_TTL_SECONDS,
-    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES, BUTTON_CARD_ACTION_URL,
+    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES, BUTTON_CARD_ACTION_URL, BUTTON_STYLE,
 )
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
