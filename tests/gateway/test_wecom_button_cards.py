@@ -117,9 +117,9 @@ def test_click_updates_card_and_routes_label():
         assert upd[-1][3]["response_type"] == "update_template_card" and upd[-1][3]["userids"] == ["user1"]
         assert upd[-1][3]["template_card"]["sub_title_text"] == "已选择：上海" and upd[-1][3]["template_card"]["card_action"]["type"] == 1
         assert routed and routed[-1].text == "上海" and routed[-1].source.chat_id == "user1"
-        # the click turn replies on the event req_id (multiple passive responses per req_id are fine)
-        assert ad._last_chat_req_ids["user1"] == "evt-9" and "user1" in ad._button_click_chats
-        assert "user1" not in ad._stream_expired_chats
+        # the event req_id must NOT become the chat's reply req_id (846605); stale one dropped
+        assert "user1" not in ad._last_chat_req_ids
+        assert "user1" in ad._stream_expired_chats and "user1" in ad._button_click_chats
         assert ad._pending_button_cards[tid]["consumed"] is True
         # repeat click (other option) → update frame echoing the FIRST choice, nothing routed
         n_upd, n_routed = len(upd), len(routed)
@@ -176,7 +176,7 @@ def test_click_updates_card_and_routes_label():
         assert routed[-1].text == "X" and ad._pending_button_cards[tid3]["consumed"] is True
         # a real inbound message clears the click marker
         ad._remember_chat_req_id("user1", "req-new")
-        assert "user1" not in ad._button_click_chats
+        assert "user1" not in ad._button_click_chats and "user1" not in ad._stream_expired_chats
         # blank content never goes out
         sent.clear()
         assert (await ad.send("user1", "\n\u200b ")).success and not sent
