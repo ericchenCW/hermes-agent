@@ -14,6 +14,14 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 
 
+@pytest.fixture(autouse=True)
+def _legacy_immediate_frames(monkeypatch):
+    """These tests pin the pre-typewriter frame flow (every cumulative delta
+    pushed immediately).  The pacer has its own suite in
+    test_wecom_typewriter.py."""
+    monkeypatch.setattr("plugins.platforms.wecom.adapter.TYPEWRITER_ENABLED", False)
+
+
 class TestWeComRequirements:
     def test_returns_false_without_aiohttp(self, monkeypatch):
         monkeypatch.setattr("plugins.platforms.wecom.adapter.AIOHTTP_AVAILABLE", False)

@@ -36,6 +36,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import time
 import uuid
@@ -204,14 +205,20 @@ INLINE_TOTAL_MAX_BYTES = max(64 * 1024, env_int("WECOM_INLINE_MEDIA_MAX_BYTES", 
 # progress phrase at each threshold (seconds since the turn started).  Frames
 # carry full content, so the first real text simply overwrites the hint.
 # Override with WECOM_TTFT_HINTS="2:正在思考…|4:…" (empty string disables).
+# Each threshold carries a pool of phrases separated by "/"; one is picked at
+# random per fire, never repeating the previous hint of the same turn.
 TTFT_HINTS_DEFAULT = (
-    "2:正在思考…|4:正在梳理问题…|6:正在检索知识库…|8:正在核对细节…|"
-    "16:正在组织答案…|32:还在处理，请稍候…"
+    "2:正在思考…/正在理解问题…/正在读题…/让我想想…|"
+    "4:正在梳理问题…/正在创建逻辑…/正在拆解问题…/正在整理思路…|"
+    "6:正在检索知识库…/正在挖掘数据…/正在翻找资料…/正在查阅文档…|"
+    "8:正在核对细节…/正在发明术语…/正在比对版本…/正在确认步骤…|"
+    "16:正在组织答案…/正在斟酌措辞…/正在排版…/正在润色答案…|"
+    "32:还在处理，请稍候…/快好了，再等一下…/这个问题有点长，还在写…"
 )
 
 
-def _parse_ttft_hints(raw: Optional[str]) -> List[Tuple[float, str]]:
-    out: List[Tuple[float, str]] = []
+def _parse_ttft_hints(raw: Optional[str]) -> List[Tuple[float, List[str]]]:
+    out: List[Tuple[float, List[str]]] = []
     for item in (raw or "").split("|"):
         item = item.strip()
         if not item or ":" not in item:
@@ -221,11 +228,23 @@ def _parse_ttft_hints(raw: Optional[str]) -> List[Tuple[float, str]]:
             delay = float(delay_s.strip())
         except ValueError:
             continue
-        text = text.strip()
-        if delay > 0 and text:
-            out.append((delay, text))
+        pool = [t.strip() for t in text.split("/") if t.strip()]
+        if delay > 0 and pool:
+            out.append((delay, pool))
     out.sort(key=lambda x: x[0])
     return out
+
+
+# Typewriter pacing for intermediate frames.  Without it every accumulated
+# delta is pushed as soon as the previous ack lands (~4 frames/s, ~20 CJK
+# chars per jump) and the 85-frame per-turn budget is gone after ~20 s, after
+# which the bubble freezes until the finalize frame.  The pacer instead reveals
+# the accumulated text in small steps on a cadence that slows as the frame
+# budget is consumed, so the bubble grows steadily for the whole answer.
+TYPEWRITER_ENABLED = env_int("WECOM_TYPEWRITER", 1) != 0
+TYPEWRITER_TICK_SECONDS = max(0.15, env_float("WECOM_TYPEWRITER_TICK", 0.3))
+TYPEWRITER_MIN_STEP = max(1, env_int("WECOM_TYPEWRITER_MIN_STEP", 6))
+TYPEWRITER_MAX_STEP = max(TYPEWRITER_MIN_STEP, env_int("WECOM_TYPEWRITER_MAX_STEP", 60))
 INLINE_STAGE_TTL_SECONDS = 120.0
 INLINE_EMBED_WAIT_SECONDS = 20.0
 INLINE_EMPTY_TEXT_PLACEHOLDER = "✅"
@@ -372,6 +391,10 @@ class StreamTurn:
         self.idle_flush_handle: Optional[asyncio.TimerHandle] = None
         self.hint_task: Optional["asyncio.Task[None]"] = None  # TTFT progress hints
         self.real_content_sent = False  # first non-empty text frame pushed
+        self.last_hint: str = ""
+        self.pacer_task: Optional["asyncio.Task[None]"] = None  # typewriter pacer
+        self.target_text: str = ""  # latest cumulative text from the consumer
+        self.shown_text: str = ""  # what the pacer has revealed so far
         # Keep-alive handle (Layer 1) — set when the stream-level keep-alive
         # timer is armed.  Structurally identical to idle_flush_handle: a
         # per-turn asyncio TimerHandle that MUST be cancelled on every turn
@@ -2106,12 +2129,15 @@ class WeComAdapter(BasePlatformAdapter):
     async def _ttft_hint_loop(self, turn: StreamTurn) -> None:
         """Push a progress phrase at each threshold until real content lands."""
         try:
-            for delay, hint in self._ttft_hints:
+            for delay, pool in self._ttft_hints:
                 remaining = turn.start_time + delay - time.monotonic()
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 if turn.finalized or turn.expired or turn.real_content_sent:
                     return
+                choices = [h for h in pool if h != turn.last_hint] or list(pool)
+                hint = random.choice(choices)
+                turn.last_hint = hint
                 try:
                     await self._send_stream_reply(
                         turn.req_id, turn.stream_id, hint, finish=False,
@@ -2128,6 +2154,78 @@ class WeComAdapter(BasePlatformAdapter):
             if turn.hint_task is asyncio.current_task():
                 turn.hint_task = None
 
+    def _arm_typewriter(self, turn: StreamTurn) -> None:
+        if turn.pacer_task is not None or turn.finalized or turn.expired:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        turn.pacer_task = loop.create_task(self._typewriter_loop(turn))
+
+    def _cancel_typewriter(self, turn: StreamTurn) -> None:
+        task = turn.pacer_task
+        turn.pacer_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    @staticmethod
+    def _typewriter_tick(frames_used: int) -> float:
+        """Cadence slows as the per-turn frame budget is consumed."""
+        share = frames_used / float(MAX_INTERMEDIATE_FRAMES)
+        if share < 0.4:
+            return TYPEWRITER_TICK_SECONDS
+        if share < 0.7:
+            return TYPEWRITER_TICK_SECONDS * 2
+        return TYPEWRITER_TICK_SECONDS * 4
+
+    @staticmethod
+    def _typewriter_next(shown: str, target: str) -> str:
+        """Reveal the next slice of ``target`` beyond ``shown``.
+
+        Step size grows with the backlog so the bubble catches up on bursts
+        without ever jumping the whole gap at once.
+        """
+        if not target.startswith(shown):
+            shown = ""  # consumer rewrote earlier text (rare) — restart reveal
+        backlog = len(target) - len(shown)
+        if backlog <= 0:
+            return target
+        step = max(TYPEWRITER_MIN_STEP, min(TYPEWRITER_MAX_STEP, (backlog + 2) // 3))
+        return target[: len(shown) + step]
+
+    async def _typewriter_loop(self, turn: StreamTurn) -> None:
+        """Push progressively longer prefixes of ``turn.target_text``."""
+        try:
+            while not (turn.finalized or turn.expired):
+                if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES:
+                    return  # budget gone — finalize will deliver the rest
+                if turn.shown_text != turn.target_text:
+                    nxt = self._typewriter_next(turn.shown_text, turn.target_text)
+                    frame_text = self._drop_empty_image_tags(self._strip_partial_button_line(nxt))
+                    if frame_text and frame_text != turn.last_sent_content:
+                        resp = await self._send_stream_reply(
+                            turn.req_id, turn.stream_id, frame_text, finish=False,
+                        )
+                        if isinstance(resp, dict) and resp.get("skipped"):
+                            self._flow_log(turn, "pacer skipped(ack pending) len=%d" % len(frame_text))
+                            await asyncio.sleep(0.1)
+                            continue  # retry the same slice on the next tick
+                        turn._last_frame_sent_at = time.monotonic()
+                        turn._intermediate_frames_sent += 1
+                        turn.last_sent_content = frame_text
+                    turn.shown_text = nxt
+                await asyncio.sleep(self._typewriter_tick(turn._intermediate_frames_sent))
+        except asyncio.CancelledError:
+            pass
+        except WeComStreamExpiredError:
+            turn.expired = True
+        except Exception as exc:
+            logger.debug("[%s] typewriter loop stopped: %s", self.name, exc)
+        finally:
+            if turn.pacer_task is asyncio.current_task():
+                turn.pacer_task = None
+
     def _retire_turn(self, turn: StreamTurn, turn_id: Optional[str]) -> None:
         """Remove a turn from the registry and cancel BOTH of its timers.
 
@@ -2138,6 +2236,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._cancel_idle_flush(turn)
         self._cancel_keepalive(turn)
         self._cancel_ttft_hints(turn)
+        self._cancel_typewriter(turn)
         self._staged_inline_media.pop(self._inline_stage_key(turn.chat_id, turn_id), None)
         if turn_id:
             self._stream_turns.pop(f"{turn.chat_id}:{turn_id}", None)
@@ -3716,6 +3815,7 @@ class WeComAdapter(BasePlatformAdapter):
                 self._cancel_keepalive(turn)
                 turn.real_content_sent = True
                 self._cancel_ttft_hints(turn)
+                self._cancel_typewriter(turn)
 
                 # WeCom may silently drop (no ack) a final frame whose content
                 # is identical to the preceding intermediate frame — it treats
@@ -3838,6 +3938,13 @@ class WeComAdapter(BasePlatformAdapter):
                 if text.strip():
                     turn.real_content_sent = True
                     self._cancel_ttft_hints(turn)
+
+                if TYPEWRITER_ENABLED and text.strip():
+                    # Hand the cumulative text to the pacer; it reveals it in
+                    # small steps on its own cadence (see _typewriter_loop).
+                    turn.target_text = text
+                    self._arm_typewriter(turn)
+                    return True
 
                 _flow_resp = await self._send_stream_reply(
                     turn.req_id,
