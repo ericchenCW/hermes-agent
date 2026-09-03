@@ -130,7 +130,14 @@ class WeComMediaMixin:
             return None
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
-        return await self._store_media(kind, raw, ext, content_type, self._guess_filename(url, headers.get("content-disposition"), content_type), content_type, f" from {url}")
+        image_mime = content_type
+        if kind == "image" and not content_type.lower().startswith("image/"):
+            # idcsre patch: WeCom serves (encrypted) media as application/octet-stream, which
+            # mimetypes maps to ".bin" — the gateway then presents the picture as a "document" and
+            # the model never sees it.  Trust the image magic bytes unless the header says image/*.
+            ext = self._detect_image_ext(raw)
+            image_mime = self._mime_for_ext(ext, fallback="image/jpeg")
+        return await self._store_media(kind, raw, ext, image_mime, self._guess_filename(url, headers.get("content-disposition"), content_type), content_type, f" from {url}")
 
     async def _store_media(self, kind, raw, ext, image_mime, filename, doc_mime, origin) -> Optional[Tuple[str, str]]:
         """Cache bytes as an image (``kind == "image"``) or a document; returns (path, mime)."""
