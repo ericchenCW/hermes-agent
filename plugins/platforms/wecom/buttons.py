@@ -34,6 +34,7 @@ BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
 BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
+BUTTON_TRAILING_LINES = 4      # directive accepted within the last N lines
 BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 
 
@@ -49,15 +50,24 @@ class WeComButtonsMixin:
         Returns (clean_text, spec) where spec = {"title", "options"} or None."""
         if not text or "BUTTONS" not in text.upper():
             return text, None
-        stripped = text.rstrip()
-        head, sep, last = stripped.rpartition("\n")
-        if not sep:
-            head, last = "", stripped
-        if last.startswith("    ") or last.startswith("\t"):
-            return text, None  # indented code block
-        m = BUTTON_DIRECTIVE_RE.fullmatch(last.strip())
-        if not m or head.count("```") % 2 == 1:
+        # The directive is meant to be the last line, but the model often appends a "来源：..."
+        # footer after it — accept it anywhere within the trailing few lines (outside code
+        # fences / indented code).
+        lines = text.rstrip().split("\n")
+        m = found = None
+        for idx in range(len(lines) - 1, max(-1, len(lines) - 1 - BUTTON_TRAILING_LINES), -1):
+            line = lines[idx]
+            if line.startswith("    ") or line.startswith("\t"):
+                continue  # indented code block
+            cand = BUTTON_DIRECTIVE_RE.fullmatch(line.strip())
+            if not cand or "\n".join(lines[:idx]).count("```") % 2 == 1:
+                continue  # no match, or inside an open code fence
+            m, found = cand, idx
+            break
+        if m is None:
             return text, None
+        del lines[found]
+        head = "\n".join(lines)
         parts = [p.strip(" \t*`\"'“”") for p in re.split(r"\s*[|｜]\s*", m.group("opts"))]
         options: List[str] = []
         for part in parts:
@@ -75,8 +85,10 @@ class WeComButtonsMixin:
         if not text or "BUTTONS" not in text.upper():
             return text
         stripped = text.rstrip()
-        m = BUTTON_PARTIAL_LINE_RE.search(stripped)
-        return stripped[: m.start()].rstrip() if m else text
+        if m := BUTTON_PARTIAL_LINE_RE.search(stripped):
+            return stripped[: m.start()].rstrip()
+        clean, spec = WeComButtonsMixin._extract_button_directive(stripped)
+        return clean if spec else text
 
     def _sweep_button_cards(self) -> None:
         cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS

@@ -325,6 +325,7 @@ class WeComStreamMixin:
         self._cancel_keepalive(turn)
         # idcsre patch: a trailing BUTTONS[...] line becomes a card riding on the finish frame.
         text, button_spec = self._extract_button_directive(text)
+        text = self._drop_empty_image_tags(text)
         if button_spec and not (text or "").strip():
             text = button_spec["title"]
         button_card: Optional[Dict[str, Any]] = None
@@ -403,7 +404,7 @@ class WeComStreamMixin:
             if finalize:
                 return await self._finalize_turn(turn, text, chat, turn_id)
             # Fire-and-forget: the gateway decides when to push (identity dedup in stream_consumer.py).
-            text = self._strip_partial_button_line(text)  # idcsre patch: hide a half-written directive
+            text = self._drop_empty_image_tags(self._strip_partial_button_line(text))  # idcsre patch
             turn.accumulated_text = text
             if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES or text == turn.last_sent_content:
                 return True  # cap reached (finalize drains the rest) or nothing new

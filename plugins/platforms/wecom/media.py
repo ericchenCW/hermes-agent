@@ -345,6 +345,16 @@ class WeComMediaMixin:
             raw[f"{key}_error"] = followup.error if followup and not followup.success else None
         return SendResult(success=True, message_id=self._payload_req_id(media_response) or uuid.uuid4().hex[:12], raw_response=raw)
 
+    @staticmethod
+    def _drop_empty_image_tags(text: str) -> str:
+        """idcsre patch: ``![alt]()`` left behind after the gateway strips a MEDIA path renders as
+        a bare "[图片]" placeholder in WeCom — drop it (keep the text if that was all there is, so
+        the frame is never emptied)."""
+        if not text or "![" not in text:
+            return text
+        cleaned = re.sub(r"\n{3,}", "\n\n", _EMPTY_MD_IMAGE_RE.sub("", text)).strip()
+        return cleaned or text
+
     # ── Inline images in the finalize frame (idcsre patch) ─────────────────
     @staticmethod
     def _inline_stage_key(chat_id: str, turn_id: Optional[str]) -> str:

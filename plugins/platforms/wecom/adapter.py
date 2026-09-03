@@ -37,7 +37,7 @@ from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.buttons import (
     WeComButtonsMixin, APP_CMD_RESPONSE_UPDATE, BUTTON_DEFAULT_TITLE, BUTTON_MAX,
     BUTTON_LABEL_MAX, BUTTON_TITLE_MAX, BUTTON_CARDS_MAX, BUTTON_CARD_TTL_SECONDS,
-    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE,
+    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES,
 )
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
@@ -675,6 +675,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
         # idcsre patch: a trailing BUTTONS[...] line becomes a template card, not visible text.
         content, button_spec = self._extract_button_directive(content)
+        content = self._drop_empty_image_tags(content)
         card_embedded = False
         if not (content or "").strip() and button_spec:
             content = button_spec["title"]
