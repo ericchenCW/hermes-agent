@@ -553,3 +553,4 @@ gateway_runtime:
       模型在生成时陷入了重复循环，已丢弃这段回复。请重新发送你的消息（对话记录仍保留），或换个问法再试。'
     error_processing: 抱歉，处理模型回复时出错：{error}
     error_repeated: 抱歉，连续多次出错：{error}
+  command_disabled: ⛔ 这里未开放 /{command} 命令。
