@@ -60,9 +60,18 @@ def test_directive_parsing_and_card_shape():
     _, spec2 = ad._extract_button_directive("**BUTTONS**: Windows | Mac")
     assert spec2 == {"title": m.BUTTON_DEFAULT_TITLE, "options": ["Windows", "Mac"]}
     assert ad._extract_button_directive("正文里提到 buttons 但没有指令") == ("正文里提到 buttons 但没有指令", None)
-    # only the last line counts; a directive quoted mid-text stays put
-    mid = "用法：\nBUTTONS[x]: a | b\n以上就是用法。"
+    # directive followed by a short footer (the model puts 来源 last) still counts
+    clean_f, spec_f = ad._extract_button_directive("先确认城市：\nBUTTONS[请选择你所在的城市]: 广州 | 深圳 | 上海 | 北京\n来源：`guides/printers/index.md`\n")
+    assert clean_f == "先确认城市：\n来源：`guides/printers/index.md`" and spec_f["options"] == ["广州", "深圳", "上海", "北京"]
+    # a directive quoted far from the end stays put
+    mid = "用法：\nBUTTONS[x]: a | b\n" + "\n".join(f"第{i}行说明。" for i in range(6))
     assert ad._extract_button_directive(mid) == (mid, None)
+    # empty image tags (MEDIA path stripped by the gateway) never reach the bubble
+    assert ad._drop_empty_image_tags("步骤一\n\n![]()\n\n步骤二 ![alt]() 完") == "步骤一\n\n步骤二  完"
+    assert ad._drop_empty_image_tags("![]()") == "![]()"
+    assert ad._drop_empty_image_tags("有真实图片 ![x](http://a/b.png)") == "有真实图片 ![x](http://a/b.png)"
+    # intermediate frames: a finished directive with a footer is hidden too
+    assert ad._strip_partial_button_line("正文\nBUTTONS[t]: a | b\n来源：x") == "正文\n来源：x"
     # inside an open code fence → not a directive
     fenced = "文档里写：\n```\nBUTTONS[请选择所在城市]: 广州 | 深圳\n```"
     assert ad._extract_button_directive(fenced) == (fenced, None)

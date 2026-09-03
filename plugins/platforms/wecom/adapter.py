@@ -220,6 +220,7 @@ BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
 BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
+BUTTON_TRAILING_LINES = 4      # directive accepted within the last N lines
 BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 _INLINE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
 _EMPTY_MD_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*\)")
@@ -2161,15 +2162,26 @@ class WeComAdapter(BasePlatformAdapter):
         Returns (clean_text, spec) where spec = {"title", "options"} or None."""
         if not text or "BUTTONS" not in text.upper():
             return text, None
-        stripped = text.rstrip()
-        head, sep, last = stripped.rpartition("\n")
-        if not sep:
-            head, last = "", stripped
-        if last.startswith("    ") or last.startswith("\t"):
-            return text, None  # indented code block
-        m = BUTTON_DIRECTIVE_RE.fullmatch(last.strip())
-        if not m or head.count("```") % 2 == 1:
+        # The directive is meant to be the last line, but the model often
+        # appends a "来源：..." footer after it — accept it anywhere within the
+        # trailing few lines (outside code fences / indented code).
+        lines = text.rstrip().split("\n")
+        m = None
+        for idx in range(len(lines) - 1, max(-1, len(lines) - 1 - BUTTON_TRAILING_LINES), -1):
+            line = lines[idx]
+            if line.startswith("    ") or line.startswith("\t"):
+                continue  # indented code block
+            cand = BUTTON_DIRECTIVE_RE.fullmatch(line.strip())
+            if not cand:
+                continue
+            if "\n".join(lines[:idx]).count("```") % 2 == 1:
+                continue  # inside an open code fence
+            m = cand
+            break
+        if not m:
             return text, None
+        del lines[idx]
+        head = "\n".join(lines)
         raw = m.group("opts")
         parts = [p.strip(" \t*`\"'“”") for p in re.split(r"\s*[|｜]\s*", raw)]
         options: List[str] = []
@@ -2183,6 +2195,17 @@ class WeComAdapter(BasePlatformAdapter):
         return head.rstrip(), {"title": title, "options": options}
 
     @staticmethod
+    def _drop_empty_image_tags(text: str) -> str:
+        """``![alt]()`` left behind after the gateway strips a MEDIA path renders
+        as a bare "[图片]" placeholder in WeCom — drop it (keep text if that
+        was all there is, so the frame is never emptied)."""
+        if not text or "![" not in text:
+            return text
+        cleaned = _EMPTY_MD_IMAGE_RE.sub("", text)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned or text
+
+    @staticmethod
     def _strip_partial_button_line(text: str) -> str:
         """Intermediate stream frames: hide a trailing (possibly half-written)
         ``BUTTONS...`` line so the directive never shows up in the bubble."""
@@ -2190,7 +2213,10 @@ class WeComAdapter(BasePlatformAdapter):
             return text
         stripped = text.rstrip()
         m = BUTTON_PARTIAL_LINE_RE.search(stripped)
-        return stripped[: m.start()].rstrip() if m else text
+        if m:
+            return stripped[: m.start()].rstrip()
+        clean, spec = WeComAdapter._extract_button_directive(stripped)
+        return clean if spec else text
 
     def _sweep_button_cards(self) -> None:
         cutoff = time.monotonic() - BUTTON_CARD_TTL_SECONDS
@@ -3101,6 +3127,7 @@ class WeComAdapter(BasePlatformAdapter):
             # send_stream_frame() with turn_id, so send() shouldn't interfere.
 
             content, button_spec = self._extract_button_directive(content)
+            content = self._drop_empty_image_tags(content)
             card_embedded = False
             if not (content or "").strip() and button_spec:
                 content = button_spec["title"]
@@ -3548,6 +3575,7 @@ class WeComAdapter(BasePlatformAdapter):
                 # Append a zero-width space to ensure the content differs when
                 # the text matches the last ACTUALLY SENT intermediate content.
                 text, button_spec = self._extract_button_directive(text)
+                text = self._drop_empty_image_tags(text)
                 if button_spec and not (text or "").strip():
                     text = button_spec["title"]
                 button_card: Optional[Dict[str, Any]] = None
@@ -3665,7 +3693,7 @@ class WeComAdapter(BasePlatformAdapter):
                     return True
 
                 # Pure dedup: skip if content is identical to last sent frame.
-                text = self._strip_partial_button_line(text)
+                text = self._drop_empty_image_tags(self._strip_partial_button_line(text))
                 if text == turn.last_sent_content:
                     return True
 
