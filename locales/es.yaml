@@ -566,4 +566,4 @@ gateway_runtime:
       → Or resend your message (your conversation history is preserved)'
     error_processing: 'I apologize, but I encountered an error while processing the model response: {error}'
     error_repeated: 'I apologize, but I encountered repeated errors: {error}'
-  command_disabled: ⛔ /{command} is not available here
+  command_disabled: "⛔ /{command} is not available here."
