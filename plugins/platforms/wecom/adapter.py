@@ -2386,13 +2386,13 @@ class WeComAdapter(BasePlatformAdapter):
         msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")
         if self._dedup.is_duplicate(msg_id):
             return
-        # 2) Reply on the event's req_id: WeCom accepts several passive
-        #    responses per req_id (finish frame + template_card verified), so
-        #    the click turn streams like a normal turn. _button_click_chats
-        #    keeps the proactive fallback open in groups if that ever fails.
-        if req_id:
-            self._remember_reply_req_id(msg_id, req_id)
-            self._remember_chat_req_id(chat_id, req_id)
+        # 2) The event's req_id only accepts aibot_respond_update_msg — a
+        #    stream/markdown reply on it comes back 846605 "invalid req_id"
+        #    (verified 2026-09-03). Drop the stale message req_id and mark the
+        #    chat so this turn is buffered and delivered by proactive send
+        #    (allowed in groups too via _button_click_chats).
+        self._last_chat_req_ids.pop(chat_id, None)
+        self._stream_expired_chats.add(chat_id)
         self._button_click_chats.add(chat_id)
         source = self.build_source(
             chat_id=chat_id, chat_type="group" if is_group else "dm",
