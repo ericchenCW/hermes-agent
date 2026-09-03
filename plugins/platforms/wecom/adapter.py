@@ -215,7 +215,8 @@ BUTTON_DIRECTIVE_RE = re.compile(
     re.M | re.I,
 )
 BUTTON_MAX = 6
-BUTTON_LABEL_MAX = 10          # WeCom button text limit
+BUTTON_LABEL_MAX = 20          # option text cap (vote list shows it in full)
+BUTTON_SHORT_WIDTH = 8         # display width (CJK=2) up to which a real button is used; longer → radio-list card
 BUTTON_TITLE_MAX = 26          # WeCom main_title.title limit
 BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
@@ -2241,20 +2242,44 @@ class WeComAdapter(BasePlatformAdapter):
             for k in sorted(self._pending_button_cards, key=lambda k: self._pending_button_cards[k]["ts"])[:overflow]:
                 self._pending_button_cards.pop(k, None)
 
+    @staticmethod
+    def _display_width(text: str) -> int:
+        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
     def _build_button_card(self, chat_id: str, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         task_id = f"btn-{uuid.uuid4().hex[:24]}"
         # the label rides inside the key so a click can be decoded even after
         # a gateway restart wiped the registry
         keys = [f"opt{i}|{label}" for i, label in enumerate(spec["options"])]
-        card = {
-            "card_type": "button_interaction",
-            "main_title": {"title": spec["title"][:BUTTON_TITLE_MAX]},
-            "task_id": task_id,
-            "button_list": [
-                {"text": label, "style": BUTTON_STYLE, "key": key}
-                for i, (label, key) in enumerate(zip(spec["options"], keys))
-            ],
-        }
+        title = spec["title"][:BUTTON_TITLE_MAX]
+        if all(self._display_width(l) <= BUTTON_SHORT_WIDTH for l in spec["options"]):
+            card = {
+                "card_type": "button_interaction",
+                "main_title": {"title": title},
+                "task_id": task_id,
+                "button_list": [
+                    {"text": label, "style": BUTTON_STYLE, "key": key}
+                    for i, (label, key) in enumerate(zip(spec["options"], keys))
+                ],
+            }
+        else:
+            # WeCom ellipsizes button text after ~4 CJK chars ("开发…"); long
+            # options go into a single-choice list that renders in full and
+            # comes back as template_card_event.selected_items on submit.
+            card = {
+                "card_type": "vote_interaction",
+                "main_title": {"title": title},
+                "task_id": task_id,
+                "checkbox": {
+                    "question_key": "choice",
+                    "mode": 0,
+                    "option_list": [
+                        {"id": key, "text": label, "is_checked": i == 0}
+                        for i, (label, key) in enumerate(zip(spec["options"], keys))
+                    ],
+                },
+                "submit_button": {"text": "确定", "key": "submit"},
+            }
         self._sweep_button_cards()
         self._pending_button_cards[task_id] = {
             "chat_id": chat_id, "title": spec["title"], "options": list(spec["options"]),
@@ -2338,21 +2363,21 @@ class WeComAdapter(BasePlatformAdapter):
         pending = self._pending_button_cards.get(task_id) or {}
         chat_id = str(pending.get("chat_id") or body.get("chatid") or sender_id).strip()
         is_group = chat_id in self._group_chat_ids or str(body.get("chattype") or "").lower() == "group"
-        if pending and event_key in pending.get("keys", []):
-            label = pending["options"][pending["keys"].index(event_key)]
-        elif "|" in event_key:
-            label = event_key.split("|", 1)[1].strip()
-        else:
-            label = event_key
+        def _decode(key: str) -> str:
+            if pending and key in pending.get("keys", []):
+                return pending["options"][pending["keys"].index(key)]
+            return key.split("|", 1)[1].strip() if "|" in key else key
+        chosen_ids: List[str] = []
         sel = detail.get("selected_items")
         if isinstance(sel, dict):
-            ids = []
             for item in sel.get("selected_item") or []:
                 if isinstance(item, dict):
                     oid = item.get("option_ids") or {}
-                    ids += list(oid.get("option_id") or []) if isinstance(oid, dict) else []
-            if ids:
-                label = (label + " " if label else "") + ",".join(str(x) for x in ids)
+                    chosen_ids += [str(x) for x in (oid.get("option_id") or [])] if isinstance(oid, dict) else []
+        if chosen_ids:                      # vote/list card: submit button + selected option ids
+            label = "、".join(_decode(k) for k in chosen_ids)
+        else:                               # plain button card: the button key itself
+            label = _decode(event_key)
         repeat = bool(pending.get("consumed"))
         logger.info(
             "[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s repeat=%s",
