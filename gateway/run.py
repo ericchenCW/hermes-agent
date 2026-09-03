@@ -5096,14 +5096,20 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active)
-    cron_thread = threading.Thread(
-        target=cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, daemon=True,
-        name="cron-scheduler")
-    cron_thread.start()
+    # idcsre patch: HERMES_GATEWAY_CRON=0 keeps the scheduler off entirely (pure Q&A deployments
+    # have no jobs and no cronjob tools).
+    if os.environ.get("HERMES_GATEWAY_CRON", "1").strip().lower() in ("0", "false", "off", "no"):
+        logger.info("Cron scheduler disabled (HERMES_GATEWAY_CRON=0)")
+        cron_provider = cron_thread = None
+    else:
+        cron_thread = threading.Thread(
+            target=cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, daemon=True,
+            name="cron-scheduler")
+        cron_thread.start()
 
     # External providers fire over loopback HTTP to THIS process's api_server; if it never came up (usually
     # API_SERVER_KEY missing) every fire fails while manual runs work — misread as a job bug. Say it ONCE.
-    if not isinstance(cron_provider, InProcessCronScheduler):
+    if cron_provider is not None and not isinstance(cron_provider, InProcessCronScheduler):
         try:
             _has_api_server = Platform.API_SERVER in (runner.adapters or {})
         except Exception:
@@ -5159,8 +5165,9 @@ async def _start_gateway_shutdown_tail(
     # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
     # finishes before we tear down.
     cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    if cron_provider is not None:
+        _stop_cron_provider(cron_provider)
+    if cron_thread is not None and not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
     await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)

@@ -1278,7 +1278,12 @@ class GatewayStartupMixin:
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        # idcsre patch: HERMES_GATEWAY_KANBAN=0 keeps the kanban loops off for pure Q&A deployments.
+        _kanban_off = os.environ.get("HERMES_GATEWAY_KANBAN", "1").strip().lower() in ("0", "false", "off", "no")
         for method in self._PRE_RECONNECT_WATCHERS:
+            if _kanban_off and "kanban" in method:
+                logger.info("Kanban watcher %s disabled (HERMES_GATEWAY_KANBAN=0)", method[1:])
+                continue
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:
             logger.info(
