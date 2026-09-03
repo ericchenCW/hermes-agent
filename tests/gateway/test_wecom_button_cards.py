@@ -113,9 +113,7 @@ def test_click_updates_card_and_routes_label():
         await _settle()
         upd = [x for x in sent if x[0] == "reply" and x[2] == m.APP_CMD_RESPONSE_UPDATE]
         assert upd and upd[-1][1] == "evt-9"
-        assert upd[-1][3]["response_type"] == "update_template_card"
-        assert upd[-1][3]["template_card"]["task_id"] == tid
-        assert upd[-1][3]["template_card"]["sub_title_text"] == "已选择：上海"
+        assert upd[-1][3] == {"response_type": "update_button", "button": {"replace_name": "已选择：上海"}}
         assert routed and routed[-1].text == "上海" and routed[-1].source.chat_id == "user1"
         # the event req_id must NOT become the chat's reply req_id; stale one dropped
         assert "user1" not in ad._last_chat_req_ids
@@ -126,7 +124,7 @@ def test_click_updates_card_and_routes_label():
         await ad._dispatch_payload(_click(tid, "opt1|深圳", msgid="m-1b", req_id="evt-10"))
         await _settle()
         upd = [x for x in sent if x[0] == "reply" and x[2] == m.APP_CMD_RESPONSE_UPDATE]
-        assert len(upd) == n_upd + 1 and upd[-1][3]["template_card"]["sub_title_text"] == "已选择：上海"
+        assert len(upd) == n_upd + 1 and upd[-1][3]["button"]["replace_name"] == "已选择：上海"
         assert len(routed) == n_routed
         # concurrent double click (two options, back to back) → exactly one routed
         assert await ad._send_button_card("user1", {"title": "t", "options": ["A", "B"]}, None) is True
@@ -181,6 +179,22 @@ def test_click_updates_card_and_routes_label():
     asyncio.run(run())
 
 
+def test_card_update_falls_back_to_text_notice_with_card_action():
+    ad = _adapter()
+    sent = []
+
+    async def fake_reply(req_id, body, cmd="aibot_respond_msg", timeout=10.0):
+        sent.append(body)
+        return {"errcode": 42045, "errmsg": "card_action Missing"} if body.get("response_type") == "update_button" else {"errcode": 0}
+
+    ad._send_reply_request = fake_reply
+    asyncio.run(ad._send_card_update("evt-1", "btn-x", "请选择", "已选择：广州"))
+    assert [b["response_type"] for b in sent] == ["update_button", "update_template_card"]
+    card = sent[1]["template_card"]
+    assert card["card_type"] == "text_notice" and card["task_id"] == "btn-x" and card["card_action"]["type"] == 1 and card["card_action"]["url"]
+    assert card["sub_title_text"] == "已选择：广州"
+
+
 def test_click_handler_runs_off_the_read_loop():
     ad = _adapter()
 
@@ -210,11 +224,9 @@ def test_send_embeds_card_in_finish_frame_or_sends_proactively():
         ad._last_chat_req_ids["user1"] = "req-1"
         r = await ad.send("user1", "先选城市：\nBUTTONS[请选择城市]: 广州 | 深圳")
         assert r.success
-        assert len(sent) == 1 and sent[0][0] == "queued"
-        b = sent[0][2]
-        assert b["msgtype"] == "stream_with_template_card" and b["stream"]["finish"] is True
-        assert b["stream"]["content"] == "先选城市："
-        assert [x["text"] for x in b["template_card"]["button_list"]] == ["广州", "深圳"]
+        assert [(x[0], x[1], x[-1]["msgtype"]) for x in sent] == [("reply", "req-1", "markdown"), ("reply", "req-1", "template_card")]
+        assert sent[0][-1]["markdown"]["content"] == "先选城市："
+        assert [x["text"] for x in sent[1][-1]["template_card"]["button_list"]] == ["广州", "深圳"]
         sent.clear()
         assert (await ad.send("user1", "普通回复")).success
         assert len(sent) == 1 and sent[0][-1]["msgtype"] == "markdown"

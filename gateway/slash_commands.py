@@ -341,12 +341,15 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
-            _tip_line = ""
+        # Append a random tip to the reset message (HERMES_GATEWAY_TIPS=0 to
+        # keep CLI-oriented tips out of chat platforms such as WeCom).
+        _tip_line = ""
+        if os.environ.get("HERMES_GATEWAY_TIPS", "1").strip().lower() not in ("0", "false", "off", "no"):
+            try:
+                from hermes_cli.tips import get_random_tip
+                _tip_line = t("gateway.reset.tip", tip=get_random_tip())
+            except Exception:
+                _tip_line = ""
 
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")

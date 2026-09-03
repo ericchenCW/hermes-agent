@@ -1032,6 +1032,14 @@ class GatewayStreamConsumer:
         """
         if text:
             self._queue.put(text)
+            try:  # [flow]
+                self._flow_total = getattr(self, "_flow_total", 0) + len(text)
+                _fnow = time.monotonic()
+                if _fnow - getattr(self, "_flow_last_put_log", 0.0) >= 2.0:
+                    self._flow_last_put_log = _fnow
+                    logger.debug("[flow] consumer.on_delta total_chars=%d qsize=%d", self._flow_total, self._queue.qsize())
+            except Exception:
+                pass
         elif text is None:
             self.on_segment_break()
 
@@ -1296,6 +1304,13 @@ class GatewayStreamConsumer:
                 while True:
                     try:
                         item = self._queue.get_nowait()
+                        try:  # [flow]
+                            _fnow = time.monotonic()
+                            if _fnow - getattr(self, "_flow_last_drain_log", 0.0) >= 2.0:
+                                self._flow_last_drain_log = _fnow
+                                logger.debug("[flow] consumer drain item=%s accumulated=%d native=%s buffer_only=%s", type(item).__name__ if not isinstance(item, str) else len(item), len(self._accumulated or ""), self._use_native_streaming, self.cfg.buffer_only)
+                        except Exception:
+                            pass
                         if item is _DONE:
                             got_done = True
                             break
@@ -3145,6 +3160,13 @@ class GatewayStreamConsumer:
                 self._final_response_sent = True
                 self._final_content_delivered = True
 
+            try:  # [flow]
+                _fnow = time.monotonic()
+                if finalize or _fnow - getattr(self, "_flow_last_push_log", 0.0) >= 2.0:
+                    self._flow_last_push_log = _fnow
+                    logger.debug("[flow] consumer push len=%d finalize=%s accumulated=%d", len(text or ""), finalize, len(self._accumulated or ""))
+            except Exception:
+                pass
             ok = False
             try:
                 ok = await self.adapter.send_stream_frame(
@@ -3179,6 +3201,7 @@ class GatewayStreamConsumer:
             # subsequent frames take the edit/send fallback path below.
             # The adapter is responsible for marking the chat as expired
             # so it doesn't keep retrying the dead stream session.
+            logger.info("[flow] native streaming disabled after frame failure (finalize=%s len=%d)", finalize, len(text or ""))
             self._use_native_streaming = False
 
             # If the stream bubble was opened (seed frame succeeded), try

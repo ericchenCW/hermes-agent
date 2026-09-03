@@ -6981,6 +6981,14 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_stream_delta")
             return
+        try:  # [flow] instrumentation (hot patch)
+            self._flow_fired_chars = getattr(self, "_flow_fired_chars", 0) + len(text or "")
+            _fnow = time.monotonic()
+            if _fnow - getattr(self, "_flow_last_log", 0.0) >= 2.0:
+                self._flow_last_log = _fnow
+                logger.debug("[flow] agent fired_chars=%d", self._flow_fired_chars)
+        except Exception:
+            pass
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking

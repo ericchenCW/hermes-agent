@@ -221,6 +221,9 @@ BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
 BUTTON_TRAILING_LINES = 4      # directive accepted within the last N lines
+# text_notice cards must carry a card_action (errcode 42045 otherwise); the
+# URL only matters if someone taps the "已选择" notice after a click.
+BUTTON_CARD_ACTION_URL = os.environ.get("WECOM_CARD_ACTION_URL", "https://work.weixin.qq.com/")
 BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 _INLINE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png"}
 _EMPTY_MD_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*\)")
@@ -2194,6 +2197,15 @@ class WeComAdapter(BasePlatformAdapter):
         title = (m.group("title") or BUTTON_DEFAULT_TITLE).strip()[:BUTTON_TITLE_MAX]
         return head.rstrip(), {"title": title, "options": options}
 
+    def _flow_log(self, turn, msg: str) -> None:  # [flow] instrumentation (hot patch)
+        try:
+            _fnow = time.monotonic()
+            if _fnow - getattr(turn, "_flow_last_log", 0.0) >= 2.0:
+                turn._flow_last_log = _fnow
+                logger.debug("[flow] adapter %s stream=%s", msg, getattr(turn, "stream_id", "?"))
+        except Exception:
+            pass
+
     @staticmethod
     def _drop_empty_image_tags(text: str) -> str:
         """``![alt]()`` left behind after the gateway strips a MEDIA path renders
@@ -2271,14 +2283,36 @@ class WeComAdapter(BasePlatformAdapter):
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
-    async def _send_card_update(self, req_id: str, update: Dict[str, Any]) -> None:
-        try:
-            response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
-            errcode = int((response or {}).get("errcode", 0) or 0)
-            if errcode:
-                logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
-        except Exception as exc:
-            logger.warning("[%s] update_template_card failed: %s", self.name, exc)
+    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str) -> None:
+        """Acknowledge a click by rewriting the card (must land within 5 s).
+
+        First choice is WeCom's ``update_button`` (all buttons collapse into
+        one disabled label); if the AI-bot channel rejects it, fall back to
+        replacing the card with a ``text_notice`` — which WeCom requires to
+        carry a ``card_action`` (errcode 42045 otherwise)."""
+        attempts = [
+            {"response_type": "update_button", "button": {"replace_name": chosen_text[:20]}},
+            {
+                "response_type": "update_template_card",
+                "template_card": {
+                    "card_type": "text_notice",
+                    "main_title": {"title": title[:BUTTON_TITLE_MAX]},
+                    "sub_title_text": chosen_text,
+                    "card_action": {"type": 1, "url": BUTTON_CARD_ACTION_URL},
+                    "task_id": task_id,
+                },
+            },
+        ]
+        for update in attempts:
+            try:
+                response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
+                errcode = int((response or {}).get("errcode", 0) or 0)
+                if not errcode:
+                    logger.info("[%s] card update ok via %s task=%s", self.name, update["response_type"], task_id)
+                    return
+                logger.warning("[%s] card update via %s errcode=%s errmsg=%s", self.name, update["response_type"], errcode, str((response or {}).get("errmsg"))[:160])
+            except Exception as exc:
+                logger.warning("[%s] card update via %s failed: %s", self.name, update["response_type"], exc)
 
     async def _on_template_card_event_guarded(self, payload: Dict[str, Any]) -> None:
         try:
@@ -2347,16 +2381,7 @@ class WeComAdapter(BasePlatformAdapter):
         #    (first) choice; sent as its own task so routing never waits on the ack
         if req_id and task_id:
             title = (pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE
-            update = {
-                "response_type": "update_template_card",
-                "template_card": {
-                    "card_type": "text_notice",
-                    "main_title": {"title": title[:BUTTON_TITLE_MAX]},
-                    "sub_title_text": f"已选择：{shown}"[:100],
-                    "task_id": task_id,
-                },
-            }
-            asyncio.ensure_future(self._send_card_update(req_id, update))
+            asyncio.ensure_future(self._send_card_update(req_id, task_id, title, f"已选择：{shown}"[:100]))
             await asyncio.sleep(0)  # let the update frame go out before routing
         if repeat:
             return
@@ -3128,7 +3153,7 @@ class WeComAdapter(BasePlatformAdapter):
 
             content, button_spec = self._extract_button_directive(content)
             content = self._drop_empty_image_tags(content)
-            card_embedded = False
+            card_req_id = None
             if not (content or "").strip() and button_spec:
                 content = button_spec["title"]
 
@@ -3142,23 +3167,10 @@ class WeComAdapter(BasePlatformAdapter):
 
             if reply_req_id:
                 try:
-                    if button_spec and self._find_active_turn_for_chat(chat_id) is None:
-                        # one-shot finish frame carrying the card; never while a
-                        # stream owns this req_id (shared reply queue → 6000)
-                        _, _card = self._build_button_card(chat_id, button_spec)
-                        response = await self._send_stream_reply(
-                            reply_req_id, uuid.uuid4().hex, content[:self.MAX_MESSAGE_LENGTH],
-                            finish=True, template_card=_card,
-                        )
-                        card_embedded = (
-                            isinstance(response, dict)
-                            and int(response.get("errcode", 0) or 0) == 0
-                            and not response.get("ack_pending")
-                        )
-                    else:
-                        response = await self._send_reply_markdown(reply_req_id, content)
+                    response = await self._send_reply_markdown(reply_req_id, content)
+                    card_req_id = reply_req_id
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
-                    card_embedded = False
+                    card_req_id = None
                     # Passive reply failed (req_id may be stale after WS reconnect).
                     # Fall back to proactive aibot_send_msg which doesn't depend
                     # on any prior req_id.
@@ -3226,8 +3238,8 @@ class WeComAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=False, error=error)
 
-        if button_spec and not card_embedded:
-            await self._send_button_card(chat_id, button_spec, None)
+        if button_spec:
+            await self._send_button_card(chat_id, button_spec, card_req_id)
         # Mark delivered so _keep_typing cannot open an orphan stream after
         # this turn's reply already landed (regardless of which path was taken).
         return SendResult(
@@ -3578,11 +3590,6 @@ class WeComAdapter(BasePlatformAdapter):
                 text = self._drop_empty_image_tags(text)
                 if button_spec and not (text or "").strip():
                     text = button_spec["title"]
-                button_card: Optional[Dict[str, Any]] = None
-                if button_spec:
-                    _, button_card = self._build_button_card(chat, button_spec)
-                card_kwargs = {"template_card": button_card} if button_card else {}
-                card_embedded = False
                 final_text = text
                 if text and text == turn.last_sent_content:
                     final_text = text + "​"  # zero-width space
@@ -3611,7 +3618,6 @@ class WeComAdapter(BasePlatformAdapter):
                             final_text,
                             finish=True,
                             msg_item=inline_items,
-                            **card_kwargs,
                         )
                     except asyncio.CancelledError:
                         # The frame is already queued on the control worker and
@@ -3630,7 +3636,6 @@ class WeComAdapter(BasePlatformAdapter):
                         and int(response.get("errcode", 0) or 0) == 0
                         and not response.get("ack_pending")
                     )
-                    card_embedded = bool(button_card) and bool(rendered)
                     if not inline_outcome.done():
                         inline_outcome.set_result(bool(rendered))
                     if rendered:
@@ -3650,24 +3655,19 @@ class WeComAdapter(BasePlatformAdapter):
                 else:
                     # Keep the pre-patch call shape so subclass / test doubles
                     # without the msg_item kwarg keep working.
-                    _resp = await self._send_stream_reply(
+                    await self._send_stream_reply(
                         turn.req_id,
                         turn.stream_id,
                         final_text,
                         finish=True,
-                        **card_kwargs,
-                    )
-                    card_embedded = (
-                        bool(button_card)
-                        and isinstance(_resp, dict)
-                        and int(_resp.get("errcode", 0) or 0) == 0
-                        and not _resp.get("ack_pending")
                     )
                 turn.finalized = True
-                if button_spec and not card_embedded:
-                    # finish frame did not carry the card (fallback path) —
-                    # deliver it proactively, like media after a stream.
-                    asyncio.ensure_future(self._send_button_card(chat, button_spec, None))
+                if button_spec:
+                    # Field-tested 2026-09-03: a card embedded in the finish frame
+                    # (stream_with_template_card) is acked but never rendered;
+                    # a separate passive reply on the same req_id right after
+                    # the finish frame renders fine (proactive as fallback).
+                    asyncio.ensure_future(self._send_button_card(chat, button_spec, turn.req_id))
                 # Clean up this turn's state
                 # If turn_id was provided, the key is chat:turn_id, otherwise chat:req_id
                 if turn_id:
@@ -3695,16 +3695,19 @@ class WeComAdapter(BasePlatformAdapter):
                 # Pure dedup: skip if content is identical to last sent frame.
                 text = self._drop_empty_image_tags(self._strip_partial_button_line(text))
                 if text == turn.last_sent_content:
+                    self._flow_log(turn, "same-as-last len=%d" % len(text))
                     return True
 
                 self._cancel_idle_flush(turn)
 
-                await self._send_stream_reply(
+                _flow_resp = await self._send_stream_reply(
                     turn.req_id,
                     turn.stream_id,
                     text,
                     finish=False,
                 )
+                if isinstance(_flow_resp, dict) and _flow_resp.get("skipped"):
+                    self._flow_log(turn, "skipped(ack pending) len=%d" % len(text))
                 turn._last_frame_sent_at = time.monotonic()
                 turn._intermediate_frames_sent += 1
                 turn.last_sent_content = text
