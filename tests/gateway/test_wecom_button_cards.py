@@ -79,6 +79,11 @@ def test_directive_parsing_and_card_shape():
     assert len(spec3["options"]) == m.BUTTON_MAX
     _, spec4 = ad._extract_button_directive("BUTTONS: 广州天河办公室打印机 | 广州天河办公室扫描仪")
     assert len(spec4["options"]) == 2 and all(len(o) <= m.BUTTON_LABEL_MAX for o in spec4["options"])
+    # long labels → single-choice list card (buttons would be ellipsized by WeCom)
+    tid4, card4 = ad._build_button_card("chat1", {"title": "请选择 test 环境类型", "options": ["开发域/PaaS环境", "堡垒机远程连接", "其他"]})
+    assert card4["card_type"] == "vote_interaction" and card4["checkbox"]["mode"] == 0 and card4["submit_button"]["key"] == "submit"
+    assert [o["text"] for o in card4["checkbox"]["option_list"]] == ["开发域/PaaS环境", "堡垒机远程连接", "其他"]
+    assert card4["checkbox"]["option_list"][0]["id"] == "opt0|开发域/PaaS环境"
     task_id, card = ad._build_button_card("chat1", spec)
     assert card["card_type"] == "button_interaction" and card["task_id"] == task_id
     assert [b["text"] for b in card["button_list"]] == ["广州", "深圳", "上海", "北京"]
@@ -138,6 +143,14 @@ def test_click_updates_card_and_routes_label():
         )
         await _settle()
         assert [e.text for e in routed[n_routed:]] == ["A"]
+        # list card submit: label comes from selected_items, not the submit key
+        _, vcard = ad._build_button_card("user1", {"title": "t", "options": ["开发域/PaaS环境", "堡垒机远程连接"]})
+        vt = vcard["task_id"]
+        p = _click(vt, "submit", msgid="m-v1", req_id="evt-30")
+        p["body"]["event"]["template_card_event"]["selected_items"] = {"selected_item": [{"question_key": "choice", "option_ids": {"option_id": ["opt1|堡垒机远程连接"]}}]}
+        await ad._dispatch_payload(p)
+        await _settle()
+        assert routed[-1].text == "堡垒机远程连接"
         # unknown task id (registry lost) → label decoded from the key; flat event shape
         await ad._dispatch_payload(_click("nope", "opt1|深圳", msgid="m-2", flat=True))
         await _settle()
