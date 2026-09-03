@@ -110,15 +110,18 @@ class WeComButtonsMixin:
     def _display_width(text: str) -> int:
         return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
 
-    def _build_button_card(self, chat_id: str, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    def _build_button_card(self, chat_id: str, spec: Dict[str, Any], owner: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         task_id = f"btn-{uuid.uuid4().hex[:24]}"
         # the label rides inside the key so a click can be decoded even after a restart wiped the registry
         keys = [f"opt{i}|{label}" for i, label in enumerate(spec["options"])]
         title = spec["title"][:BUTTON_TITLE_MAX]
+        main_title = {"title": title}
+        if owner and chat_id in self._group_chat_ids:
+            main_title["desc"] = "请提问者本人选择，其他人点击无效"
         if all(self._display_width(label) <= BUTTON_SHORT_WIDTH for label in spec["options"]):
             card = {
                 "card_type": "button_interaction",
-                "main_title": {"title": title},
+                "main_title": main_title,
                 "task_id": task_id,
                 "button_list": [
                     {"text": label, "style": BUTTON_STYLE, "key": key}
@@ -131,7 +134,7 @@ class WeComButtonsMixin:
             # template_card_event.selected_items on submit.
             card = {
                 "card_type": "vote_interaction",
-                "main_title": {"title": title},
+                "main_title": main_title,
                 "task_id": task_id,
                 "checkbox": {
                     "question_key": "choice",
@@ -146,15 +149,17 @@ class WeComButtonsMixin:
         self._sweep_button_cards()
         self._pending_button_cards[task_id] = {
             "chat_id": chat_id, "title": spec["title"], "options": list(spec["options"]),
-            "keys": keys, "ts": time.monotonic(), "consumed": False,
+            "keys": keys, "ts": time.monotonic(), "consumed": False, "owner": owner or "",
         }
         return task_id, card
 
-    async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str]) -> bool:
+    async def _send_button_card(self, chat_id: str, spec: Dict[str, Any], reply_req_id: Optional[str], owner: Optional[str] = None) -> bool:
         """Deliver a button card after the text: passive reply when a req_id is available
         (required in groups), proactive ``aibot_send_msg`` otherwise."""
         try:
-            task_id, card = self._build_button_card(chat_id, spec)
+            if not owner:
+                owner = self._req_senders.get(reply_req_id or "") or (chat_id if chat_id not in self._group_chat_ids else None)
+            task_id, card = self._build_button_card(chat_id, spec, owner)
             body = {"msgtype": "template_card", "template_card": card}
             if reply_req_id:
                 try:
@@ -238,7 +243,12 @@ class WeComButtonsMixin:
         else:                               # plain button card: the button key itself
             label = _decode(event_key)
         repeat = bool(pending.get("consumed"))
-        logger.info("[%s] Button click: chat=%s sender=%s task=%s key=%r label=%r group=%s repeat=%s", self.name, chat_id, sender_id, task_id, event_key, label, is_group, repeat)
+        owner = str(pending.get("owner") or "")
+        logger.info("[%s] Button click: chat=%s sender=%s owner=%s task=%s key=%r label=%r group=%s repeat=%s", self.name, chat_id, sender_id, owner or "-", task_id, event_key, label, is_group, repeat)
+        if owner and sender_id and sender_id != owner:
+            # the card answers the asker's question: other members' clicks are ignored
+            logger.info("[%s] Button click by %s ignored: card belongs to %s", self.name, sender_id, owner)
+            return
         # 0) policy first — a blocked user gets neither the update nor a routed message
         if is_group:
             self._group_chat_ids.add(chat_id)

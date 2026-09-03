@@ -155,13 +155,24 @@ def test_click_updates_card_and_routes_label():
         await ad._dispatch_payload(_click("nope", "opt1|深圳", msgid="m-2", flat=True))
         await _settle()
         assert routed[-1].text == "深圳"
-        # group click: chat resolved from the card registry even without body.chatid
+        # group click: chat resolved from the card registry even without body.chatid;
+        # the card is locked to the asker (owner) — others' clicks are ignored
         ad._group_chat_ids.add("grp-1")
-        assert await ad._send_button_card("grp-1", {"title": "t", "options": ["A", "B"]}, None) is True
-        gtid = sent[-1][2]["template_card"]["task_id"]
+        assert await ad._send_button_card("grp-1", {"title": "t", "options": ["A", "B"]}, None, owner="user3") is True
+        gcard = sent[-1][2]["template_card"]; gtid = gcard["task_id"]
+        assert "提问者" in gcard["main_title"]["desc"]
+        n_routed = len(routed)
+        await ad._dispatch_payload(_click(gtid, "opt0|A", msgid="m-3x", userid="user4", req_id="evt-40"))
+        await _settle()
+        assert len(routed) == n_routed and not [x for x in sent if x[0] == "reply" and x[1] == "evt-40"]
+        assert ad._pending_button_cards[gtid]["consumed"] is False
         await ad._dispatch_payload(_click(gtid, "opt0|A", msgid="m-3", userid="user3"))
         await _settle()
         assert routed[-1].text == "A" and routed[-1].source.chat_id == "grp-1" and routed[-1].source.chat_type == "group"
+        # owner is learned from the inbound req_id when not given explicitly
+        ad._req_senders["req-g"] = "user5"
+        assert await ad._send_button_card("grp-1", {"title": "t", "options": ["A", "B"]}, "req-g") is True
+        assert ad._pending_button_cards[sent[-1][3]["template_card"]["task_id"]]["owner"] == "user5"
         # feedback events are logged, not routed
         n = len(routed)
         p = _click("x", "y", msgid="m-4")

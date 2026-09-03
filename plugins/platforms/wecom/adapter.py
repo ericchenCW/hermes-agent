@@ -175,6 +175,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         # chats whose latest inbound was a button click: no usable req_id → replies go proactive
         # (also in groups) until the next real message
         self._button_click_chats: set[str] = set()
+        # inbound req_id -> sender userid (bounded), so a card sent in reply to a message can be
+        # locked to the person who asked
+        self._req_senders: Dict[str, str] = {}
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -473,6 +476,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
             logger.info("[%s] Missing chat id, skipping message; body_keys=%s", self.name, list(body.keys()))
             return
         is_group = str(body.get("chattype") or "").lower() == "group"
+        if req_id and sender_id:  # idcsre patch: remember who asked, to lock button cards to them
+            _bounded_put(self._req_senders, req_id, sender_id)
         if not self._admit_inbound(is_group, chat_id, sender_id):
             return
         # Post-policy: cache req_id so sends can fall back to passive reply (required in groups).
