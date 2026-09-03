@@ -198,6 +198,34 @@ VIDEO_MAX_BYTES = 10 * 1024 * 1024
 INLINE_MSG_ITEM_MAX = max(0, min(10, env_int("WECOM_INLINE_MEDIA_MAX_ITEMS", 0)))
 INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 INLINE_TOTAL_MAX_BYTES = max(64 * 1024, env_int("WECOM_INLINE_MEDIA_MAX_BYTES", 300 * 1024))
+
+# Time-to-first-token hints: while a turn's native stream is open but no
+# visible content has been pushed yet, replace the empty bubble with a short
+# progress phrase at each threshold (seconds since the turn started).  Frames
+# carry full content, so the first real text simply overwrites the hint.
+# Override with WECOM_TTFT_HINTS="2:正在思考…|4:…" (empty string disables).
+TTFT_HINTS_DEFAULT = (
+    "2:正在思考…|4:正在梳理问题…|6:正在检索知识库…|8:正在核对细节…|"
+    "16:正在组织答案…|32:还在处理，请稍候…"
+)
+
+
+def _parse_ttft_hints(raw: Optional[str]) -> List[Tuple[float, str]]:
+    out: List[Tuple[float, str]] = []
+    for item in (raw or "").split("|"):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        delay_s, _, text = item.partition(":")
+        try:
+            delay = float(delay_s.strip())
+        except ValueError:
+            continue
+        text = text.strip()
+        if delay > 0 and text:
+            out.append((delay, text))
+    out.sort(key=lambda x: x[0])
+    return out
 INLINE_STAGE_TTL_SECONDS = 120.0
 INLINE_EMBED_WAIT_SECONDS = 20.0
 INLINE_EMPTY_TEXT_PLACEHOLDER = "✅"
@@ -342,6 +370,8 @@ class StreamTurn:
         # Idle flush handle — retained for _cancel_idle_flush() compatibility
         # (called in finalize/boundary paths; always None in fire-and-forget).
         self.idle_flush_handle: Optional[asyncio.TimerHandle] = None
+        self.hint_task: Optional["asyncio.Task[None]"] = None  # TTFT progress hints
+        self.real_content_sent = False  # first non-empty text frame pushed
         # Keep-alive handle (Layer 1) — set when the stream-level keep-alive
         # timer is armed.  Structurally identical to idle_flush_handle: a
         # per-turn asyncio TimerHandle that MUST be cancelled on every turn
@@ -461,6 +491,9 @@ class WeComAdapter(BasePlatformAdapter):
         # arrives — a new inbound message gives us a new req_id and the
         # stream channel becomes usable again.
         self._stream_expired_chats: set[str] = set()
+        self._ttft_hints: List[Tuple[float, str]] = _parse_ttft_hints(
+            os.environ.get("WECOM_TTFT_HINTS", TTFT_HINTS_DEFAULT)
+        )
 
         # Track which chat_ids are group chats. Populated in _on_message
         # when chattype=="group". Used by _send_inner to avoid APP_CMD_SEND
@@ -2052,6 +2085,49 @@ class WeComAdapter(BasePlatformAdapter):
         # finalized/expired).
         self._arm_keepalive(turn, turn_id=turn_id)
 
+    def _arm_ttft_hints(self, turn: StreamTurn) -> None:
+        """Start the time-to-first-token hint loop for a freshly seeded turn."""
+        if not self._ttft_hints or turn.hint_task is not None:
+            return
+        if turn.finalized or turn.expired or turn.real_content_sent:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        turn.hint_task = loop.create_task(self._ttft_hint_loop(turn))
+
+    def _cancel_ttft_hints(self, turn: StreamTurn) -> None:
+        task = turn.hint_task
+        turn.hint_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _ttft_hint_loop(self, turn: StreamTurn) -> None:
+        """Push a progress phrase at each threshold until real content lands."""
+        try:
+            for delay, hint in self._ttft_hints:
+                remaining = turn.start_time + delay - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                if turn.finalized or turn.expired or turn.real_content_sent:
+                    return
+                try:
+                    await self._send_stream_reply(
+                        turn.req_id, turn.stream_id, hint, finish=False,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("[%s] ttft hint send failed: %s", self.name, exc)
+                    return
+                self._flow_log(turn, "ttft hint t=%gs" % delay)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if turn.hint_task is asyncio.current_task():
+                turn.hint_task = None
+
     def _retire_turn(self, turn: StreamTurn, turn_id: Optional[str]) -> None:
         """Remove a turn from the registry and cancel BOTH of its timers.
 
@@ -2061,6 +2137,7 @@ class WeComAdapter(BasePlatformAdapter):
         """
         self._cancel_idle_flush(turn)
         self._cancel_keepalive(turn)
+        self._cancel_ttft_hints(turn)
         self._staged_inline_media.pop(self._inline_stage_key(turn.chat_id, turn_id), None)
         if turn_id:
             self._stream_turns.pop(f"{turn.chat_id}:{turn_id}", None)
@@ -3589,6 +3666,7 @@ class WeComAdapter(BasePlatformAdapter):
                 # (Layer 1) so long, content-sparse turns refresh the 6-min
                 # window.  No-op when keep-alive is disabled by config.
                 self._arm_keepalive(turn, turn_id=turn_id)
+                self._arm_ttft_hints(turn)
                 # If caller sent empty text (consumer's explicit seed call),
                 # we're done — don't send another empty frame below.
                 if not text and not finalize:
@@ -3636,6 +3714,8 @@ class WeComAdapter(BasePlatformAdapter):
 
                 self._cancel_idle_flush(turn)
                 self._cancel_keepalive(turn)
+                turn.real_content_sent = True
+                self._cancel_ttft_hints(turn)
 
                 # WeCom may silently drop (no ack) a final frame whose content
                 # is identical to the preceding intermediate frame — it treats
@@ -3755,6 +3835,9 @@ class WeComAdapter(BasePlatformAdapter):
                     return True
 
                 self._cancel_idle_flush(turn)
+                if text.strip():
+                    turn.real_content_sent = True
+                    self._cancel_ttft_hints(turn)
 
                 _flow_resp = await self._send_stream_reply(
                     turn.req_id,
