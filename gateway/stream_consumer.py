@@ -1267,6 +1267,11 @@ class GatewayStreamConsumer:
                 seed_ok = False
             if not seed_ok:
                 self._use_native_streaming = False
+                if not getattr(self.adapter, "SUPPORTS_MESSAGE_EDITING", True):
+                    # No stream and no edits (WeCom): never push a tiny first
+                    # preview via send() — it lands as an empty/garbled bubble
+                    # that can't be fixed up later. Deliver once on completion.
+                    self.cfg.buffer_only = True
 
         # Resolve native draft streaming (Telegram drafts) only when native
         # streaming is not in use — they target the same first-frame slot.
@@ -3203,6 +3208,8 @@ class GatewayStreamConsumer:
             # so it doesn't keep retrying the dead stream session.
             logger.info("[flow] native streaming disabled after frame failure (finalize=%s len=%d)", finalize, len(text or ""))
             self._use_native_streaming = False
+            if not finalize and not getattr(self.adapter, "SUPPORTS_MESSAGE_EDITING", True):
+                self.cfg.buffer_only = True
 
             # If the stream bubble was opened (seed frame succeeded), try
             # best-effort finalize to close it before falling back to send().
