@@ -2091,11 +2091,37 @@ class GatewayTurnMixin:
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
+        # Per-user override (idcsre patch): ``user_toolsets.<platform>.<user_id>`` in config, or
+        # ``<PLATFORM>_ADMIN_USERS`` (comma-separated ids) + ``<PLATFORM>_ADMIN_TOOLSETS``
+        # (default "sre") in the environment.  Lets a few operators keep the writing tools while
+        # everyone else on the platform runs the read-only posture set in platform_toolsets.
+        override = self._user_toolsets_override(user_config, source, platform_key) or override
         if override and isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
             user_config = {**user_config, "platform_toolsets": pts}
         return sorted(_get_platform_tools(user_config, platform_key))
+
+    @staticmethod
+    def _user_toolsets_override(user_config: dict, source: "SessionSource", platform_key: str) -> Optional[list]:
+        """idcsre patch: toolset list for this sender, or None when no per-user rule applies."""
+        uid = str(getattr(source, "user_id", "") or "").strip()
+        if not uid:
+            return None
+        try:
+            per_platform = ((user_config or {}).get("user_toolsets") or {}).get(platform_key) or {}
+            if isinstance(per_platform, dict):
+                for key, value in per_platform.items():
+                    if str(key).strip() == uid:
+                        names = [value] if isinstance(value, str) else list(value or [])
+                        return [str(t).strip() for t in names if str(t).strip()] or None
+        except Exception:
+            pass
+        env_key = platform_key.upper().replace("-", "_")
+        if admins := os.environ.get(f"{env_key}_ADMIN_USERS", ""):
+            if uid in {a.strip() for a in admins.split(",") if a.strip()}:
+                return [t.strip() for t in os.environ.get(f"{env_key}_ADMIN_TOOLSETS", "sre").split(",") if t.strip()] or None
+        return None
 
     def _resolve_turn_toolsets(self, user_config: dict, source: "SessionSource", platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""

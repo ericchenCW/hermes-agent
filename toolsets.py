@@ -180,16 +180,42 @@ TOOLSETS = {
     # put `sre` in disabled_toolsets and that end-of-pipeline subtraction stripped the whole
     # minimal file/terminal/vision/skills surface (#57315-class breakage).
     "sre": _ts(
-        "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, clarify, vision",
-        # `memory` deliberately absent: one runtime serves several Haro users, so
-        # instance-level MEMORY.md / USER.md would mix their notes (idcsre 090 G24).
+        "SRE admin posture: local retrieval (terminal/file), skills incl. editing, memory, todo, "
+        "clarify, vision, sheet composing",
+        # Full set — meant for the few operators allowed to rewrite skills / memory. Everyone else
+        # on a chat platform gets `sre-readonly` (see gateway user_toolsets / <PLATFORM>_ADMIN_USERS).
+        # `memory` is instance-level (MEMORY.md / USER.md), so keep the admin list short.
         ["terminal", "process_manage",
          "read_file", "write_file", "patch", "search_files",
          "vision_analyze",
          "skills_list", "skill_view", "skill_manage",
+         "memory",
          "todo",
-         "clarify"],
+         "clarify",
+         "compose_sheet"],
         posture=True,
+    ),
+
+    # Read-only Q&A posture for chat-platform users: nothing that can write under HERMES_HOME
+    # (no terminal/write_file/patch/skill_manage/memory).  Screenshot sheets come from the
+    # dedicated `compose_sheet` tool, which only runs the vetted composing script on a KB document.
+    "sre-readonly": _ts(
+        "Offline SRE Q&A, read-only: file/skill reading, search, vision, todo, clarify, "
+        "sheet composing",
+        ["read_file", "search_files",
+         "vision_analyze",
+         "skills_list", "skill_view",
+         "todo",
+         "clarify",
+         "compose_sheet"],
+        # posture=True for the same reason as `sre` above: an explicitly-assigned session posture
+        # that re-lists core tools, so it must never be enumerated as a user-facing/disable-able toolset.
+        posture=True,
+    ),
+
+    "compose_sheet": _ts(
+        "Compose a numbered screenshot sheet from a knowledge-base document (idcsre canway-it-support)",
+        ["compose_sheet"],
     ),
 
     # Coding posture, auto-selected in a code workspace (agent/coding_context.py).
