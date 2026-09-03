@@ -2825,11 +2825,17 @@ class _StreamingCall(StreamingWaitMonitor):
                 content_parts.append(delta_content)
                 if tool_calls_acc:
                     self._route_suppressed_text(delta_content)
-                elif pending_text_parts or _provider_stream_text_may_be_sse(delta_content):
+                # idcsre patch: the SSE-leak heuristic only makes sense at a line start — a delta
+                # such as ":/opt/..." right after "MEDIA" or "https" is ordinary text, not a leaked
+                # SSE comment line (a reply ending in MEDIA:/path was read as a mid-stream drop and
+                # retried).  finish_reason/usage are already captured above, so no `continue` here.
+                elif pending_text_parts or (
+                    (content_parts[-2][-1:] if len(content_parts) > 1 else "") in ("", "\n", "\r")
+                    and _provider_stream_text_may_be_sse(delta_content)
+                ):
                     pending_text_parts.append(delta_content)
                     if not _provider_stream_text_may_be_sse("".join(pending_text_parts)):
                         _flush_pending_stream_text()
-                    continue
                 else:
                     self._emit_text(delta_content)
 
@@ -2928,6 +2934,9 @@ class _StreamingCall(StreamingWaitMonitor):
             # lost. A usage object proves the provider finished (include_usage's final chunk).
             logger.warning(
                 "Stream ended with no finish_reason after delivering text with no tool calls; treating as a mid-stream drop.")
+            with contextlib.suppress(Exception):  # idcsre patch: keep [diag] context on drops
+                logger.warning("[diag] chunks=%s pending_text=%r interrupt=%s", _diag.get("chunks"),
+                               "".join(pending_text_parts)[:200], self.agent._interrupt_requested)
             return _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj)
         effective_finish_reason = "length" if has_truncated_tool_args else (finish_reason or "stop")
         provider_stream_error = _provider_stream_error_from_text(
