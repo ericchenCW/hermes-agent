@@ -1723,9 +1723,18 @@ class WeComAdapter(BasePlatformAdapter):
 
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         if kind == "image":
-            ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
+            # WeCom serves (encrypted) media as application/octet-stream, which
+            # mimetypes maps to ".bin" — the gateway then presents the picture
+            # as a "document" and the model never sees it. Trust the image
+            # magic bytes unless the header itself says image/*.
+            if content_type.lower().startswith("image/"):
+                ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
+                mime = content_type
+            else:
+                ext = self._detect_image_ext(raw)
+                mime = self._mime_for_ext(ext, fallback="image/jpeg")
             try:
-                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+                return cache_image_from_bytes(raw, ext), mime
             except ValueError as exc:
                 logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
                 return None
