@@ -328,24 +328,20 @@ class WeComStreamMixin:
         text = self._drop_empty_image_tags(text)
         if button_spec and not (text or "").strip():
             text = button_spec["title"]
-        button_card: Optional[Dict[str, Any]] = None
-        if button_spec:
-            _, button_card = self._build_button_card(chat, button_spec)
         # A final frame identical to the last intermediate is silently dropped — differ via ZWSP.
         final_text = text + "\u200b" if text and text == turn.last_sent_content else text
         inline_items, inline_paths = await self._build_inline_msg_items(chat, turn_id)
-        card_kwargs = {"template_card": button_card} if button_card else {}
-        card_embedded = False
         if inline_items:
-            card_embedded = bool(button_card) and await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths, card_kwargs)
+            await self._finalize_with_inline_media(turn, final_text, chat, inline_items, inline_paths)
         else:
             # Keep the pre-patch call shape so subclass / test doubles without msg_item keep working.
-            _resp = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True, **card_kwargs)
-            card_embedded = bool(button_card) and isinstance(_resp, dict) and int(_resp.get("errcode", 0) or 0) == 0 and not _resp.get("ack_pending")
+            await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
         turn.finalized = True
-        if button_spec and not card_embedded:
-            # The finish frame did not carry the card (fallback path) — deliver it proactively.
-            asyncio.ensure_future(self._send_button_card(chat, button_spec, None))
+        if button_spec:
+            # Field-tested 2026-09-03: a card embedded in the finish frame (stream_with_template_card)
+            # is acked but never rendered; a separate passive reply on the same req_id right after
+            # the finish frame renders fine (proactive as fallback).
+            asyncio.ensure_future(self._send_button_card(chat, button_spec, turn.req_id))
         self._stream_turns.pop(f"{chat}:{turn_id or turn.req_id}", None)
         return True
 
@@ -406,9 +402,14 @@ class WeComStreamMixin:
             # Fire-and-forget: the gateway decides when to push (identity dedup in stream_consumer.py).
             text = self._drop_empty_image_tags(self._strip_partial_button_line(text))  # idcsre patch
             turn.accumulated_text = text
-            if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES or text == turn.last_sent_content:
-                return True  # cap reached (finalize drains the rest) or nothing new
-            await self._send_stream_reply(turn.req_id, turn.stream_id, text, finish=False)
+            if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES:
+                return True  # cap reached — finalize drains the rest
+            if text == turn.last_sent_content:
+                self._flow_log(turn, "same-as-last len=%d" % len(text))
+                return True
+            _flow_resp = await self._send_stream_reply(turn.req_id, turn.stream_id, text, finish=False)
+            if isinstance(_flow_resp, dict) and _flow_resp.get("skipped"):
+                self._flow_log(turn, "skipped(ack pending) len=%d" % len(text))
             turn._intermediate_frames_sent += 1
             turn.last_sent_content = text
             return True

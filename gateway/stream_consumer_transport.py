@@ -371,6 +371,13 @@ class StreamTransportMixin:
         finalize = finalize and is_turn_final
         if not finalize and text == self._last_sent_text:
             return True  # unchanged — skip
+        try:  # [flow] instrumentation (idcsre patch)
+            _fnow = time.monotonic()
+            if finalize or _fnow - getattr(self, "_flow_last_push_log", 0.0) >= 2.0:
+                self._flow_last_push_log = _fnow
+                logger.debug("[flow] consumer push len=%d finalize=%s accumulated=%d", len(text or ""), finalize, len(self._accumulated or ""))
+        except Exception:
+            pass
 
         # Mark a finalize frame delivered OPTIMISTICALLY, before the ack wait: WeCom
         # renders the bytes before the ack, so a gateway join-cancel mid-wait must not
@@ -395,6 +402,7 @@ class StreamTransportMixin:
             self._delivered_final_text = None
         # Subsequent frames take the edit/send fallback; the adapter marks the chat
         # expired so it doesn't retry the dead stream.
+        logger.info("[flow] native streaming disabled after frame failure (finalize=%s len=%d)", finalize, len(text or ""))
         self._use_native_streaming = False
         # Best-effort close of an opened bubble (the seed frame has zero length but
         # still opens it).  DO NOT mark delivered: the frame closes the bubble but

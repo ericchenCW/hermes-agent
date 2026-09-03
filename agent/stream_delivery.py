@@ -6,6 +6,7 @@ Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO
 import logging
 import re
 import threading
+import time
 from typing import Any, Dict, List
 
 from agent.memory_manager import sanitize_context
@@ -289,6 +290,14 @@ class StreamDeliveryMixin:
             # See #65991.
             self._note_dropped_stream_writer("_fire_stream_delta")
             return
+        try:  # [flow] instrumentation (idcsre patch)
+            self._flow_fired_chars = getattr(self, "_flow_fired_chars", 0) + len(text or "")
+            _fnow = time.monotonic()
+            if _fnow - getattr(self, "_flow_last_log", 0.0) >= 2.0:
+                self._flow_last_log = _fnow
+                logger.debug("[flow] agent fired_chars=%d", self._flow_fired_chars)
+        except Exception:
+            pass
         # One paragraph break before the first text delta after a tool iteration, without
         # stacking blank lines across back-to-back tool iterations.
         prepended_break = bool(getattr(self, "_stream_needs_break", False) and text and text.strip())

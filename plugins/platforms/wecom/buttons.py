@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 import uuid
@@ -35,6 +36,9 @@ BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
 BUTTON_TRAILING_LINES = 4      # directive accepted within the last N lines
+# text_notice cards must carry a card_action (errcode 42045 otherwise); the URL only matters if
+# someone taps the "已选择" notice after a click.
+BUTTON_CARD_ACTION_URL = os.environ.get("WECOM_CARD_ACTION_URL", "https://work.weixin.qq.com/")
 BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 
 
@@ -140,13 +144,34 @@ class WeComButtonsMixin:
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
-    async def _send_card_update(self, req_id: str, update: Dict[str, Any]) -> None:
-        try:
-            response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
-            if errcode := int((response or {}).get("errcode", 0) or 0):
-                logger.warning("[%s] update_template_card errcode=%s errmsg=%s", self.name, errcode, (response or {}).get("errmsg"))
-        except Exception as exc:
-            logger.warning("[%s] update_template_card failed: %s", self.name, exc)
+    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str) -> None:
+        """Acknowledge a click by rewriting the card (must land within 5 s).
+
+        First choice is WeCom's ``update_button`` (all buttons collapse into one disabled label);
+        if the AI-bot channel rejects it, fall back to replacing the card with a ``text_notice`` —
+        which WeCom requires to carry a ``card_action`` (errcode 42045 otherwise)."""
+        attempts = [
+            {"response_type": "update_button", "button": {"replace_name": chosen_text[:20]}},
+            {
+                "response_type": "update_template_card",
+                "template_card": {
+                    "card_type": "text_notice",
+                    "main_title": {"title": title[:BUTTON_TITLE_MAX]},
+                    "sub_title_text": chosen_text,
+                    "card_action": {"type": 1, "url": BUTTON_CARD_ACTION_URL},
+                    "task_id": task_id,
+                },
+            },
+        ]
+        for update in attempts:
+            try:
+                response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
+                if not (errcode := int((response or {}).get("errcode", 0) or 0)):
+                    logger.info("[%s] card update ok via %s task=%s", self.name, update["response_type"], task_id)
+                    return
+                logger.warning("[%s] card update via %s errcode=%s errmsg=%s", self.name, update["response_type"], errcode, str((response or {}).get("errmsg"))[:160])
+            except Exception as exc:
+                logger.warning("[%s] card update via %s failed: %s", self.name, update["response_type"], exc)
 
     async def _on_template_card_event_guarded(self, payload: Dict[str, Any]) -> None:
         try:
@@ -211,16 +236,8 @@ class WeComButtonsMixin:
         # 1) acknowledge within 5 s — card becomes a text notice showing the (first) choice; sent as
         #    its own task so routing never waits on the ack
         if req_id and task_id:
-            update = {
-                "response_type": "update_template_card",
-                "template_card": {
-                    "card_type": "text_notice",
-                    "main_title": {"title": ((pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE)[:BUTTON_TITLE_MAX]},
-                    "sub_title_text": f"已选择：{shown}"[:100],
-                    "task_id": task_id,
-                },
-            }
-            asyncio.ensure_future(self._send_card_update(req_id, update))
+            title = (pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE
+            asyncio.ensure_future(self._send_card_update(req_id, task_id, title, f"已选择：{shown}"[:100]))
             await asyncio.sleep(0)  # let the update frame go out before routing
         if repeat:
             return
@@ -249,3 +266,12 @@ class WeComButtonsMixin:
             if callable(discard):
                 discard(msg_id)
             raise
+
+    def _flow_log(self, turn, msg: str) -> None:  # [flow] instrumentation (hot patch)
+        try:
+            now = time.monotonic()
+            if now - getattr(turn, "_flow_last_log", 0.0) >= 2.0:
+                turn._flow_last_log = now
+                logger.debug("[flow] adapter %s stream=%s", msg, getattr(turn, "stream_id", "?"))
+        except Exception:
+            pass

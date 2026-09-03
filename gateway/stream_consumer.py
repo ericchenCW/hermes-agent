@@ -513,6 +513,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         message below any tool-progress messages."""
         if text:
             self._queue.put(text)
+            try:  # [flow] instrumentation (idcsre patch)
+                self._flow_total = getattr(self, "_flow_total", 0) + len(text)
+                _fnow = time.monotonic()
+                if _fnow - getattr(self, "_flow_last_put_log", 0.0) >= 2.0:
+                    self._flow_last_put_log = _fnow
+                    logger.debug("[flow] consumer.on_delta total_chars=%d qsize=%d", self._flow_total, self._queue.qsize())
+            except Exception:
+                pass
         elif text is None:
             self.on_segment_break()
 
@@ -631,6 +639,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 item = self._queue.get_nowait()
             except queue.Empty:
                 return tick
+            try:  # [flow] instrumentation (idcsre patch)
+                _fnow = time.monotonic()
+                if _fnow - getattr(self, "_flow_last_drain_log", 0.0) >= 2.0:
+                    self._flow_last_drain_log = _fnow
+                    logger.debug("[flow] consumer drain item=%s accumulated=%d native=%s buffer_only=%s", len(item) if isinstance(item, str) else type(item).__name__, len(self._accumulated or ""), self._use_native_streaming, self.cfg.buffer_only)
+            except Exception:
+                pass
             if item is _DONE:
                 tick.got_done = True
                 return tick

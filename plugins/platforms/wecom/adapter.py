@@ -37,7 +37,7 @@ from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.buttons import (
     WeComButtonsMixin, APP_CMD_RESPONSE_UPDATE, BUTTON_DEFAULT_TITLE, BUTTON_MAX,
     BUTTON_LABEL_MAX, BUTTON_TITLE_MAX, BUTTON_CARDS_MAX, BUTTON_CARD_TTL_SECONDS,
-    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES,
+    BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES, BUTTON_CARD_ACTION_URL,
 )
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
@@ -676,23 +676,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         # idcsre patch: a trailing BUTTONS[...] line becomes a template card, not visible text.
         content, button_spec = self._extract_button_directive(content)
         content = self._drop_empty_image_tags(content)
-        card_embedded = False
+        card_req_id = None
         if not (content or "").strip() and button_spec:
             content = button_spec["title"]
         try:
             reply_req_id = None if force_proactive and chat_id not in self._group_chat_ids else self._cached_reply_req_id(chat_id, reply_to)
             if reply_req_id:
                 try:
-                    if button_spec and self._find_active_turn_for_chat(chat_id) is None:
-                        # one-shot finish frame carrying the card; never while a stream owns this
-                        # req_id (shared reply queue → 6000)
-                        _, _card = self._build_button_card(chat_id, button_spec)
-                        response = await self._send_stream_reply(reply_req_id, uuid.uuid4().hex, content[:MAX_MESSAGE_LENGTH], finish=True, template_card=_card)
-                        card_embedded = isinstance(response, dict) and int(response.get("errcode", 0) or 0) == 0 and not response.get("ack_pending")
-                    else:
-                        response = await self._send_reply_markdown(reply_req_id, content)
+                    response = await self._send_reply_markdown(reply_req_id, content)
+                    card_req_id = reply_req_id
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
-                    card_embedded = False
+                    card_req_id = None
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
@@ -711,8 +705,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
             return self._send_failure(str(exc), str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(exc))
         if error := self._response_error(response):
             return self._send_failure(error, response.get("errcode", 0) == STREAM_NOT_SUBSCRIBED_ERRCODE)
-        if button_spec and not card_embedded:
-            await self._send_button_card(chat_id, button_spec, None)
+        if button_spec:
+            await self._send_button_card(chat_id, button_spec, card_req_id)
         return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
 
     def _send_failure(self, error: str, subscription_lost: bool) -> SendResult:
