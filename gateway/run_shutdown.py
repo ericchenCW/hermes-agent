@@ -26,6 +26,7 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+from agent.i18n import t
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -929,12 +930,8 @@ class GatewayShutdownMixin:
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
         restart_source = self._restart_command_source if self._restart_requested else None
-        msg = "⚠️ Gateway shutting down — Your current task will be interrupted."
-        if self._restart_requested:
-            msg = (
-                "⚠️ Gateway restarting — Your current task will be interrupted. "
-                "Send any message after restart and I'll try to resume where you left off."
-            )
+        msg = (t("gateway_runtime.restart_notice.restarting") if self._restart_requested
+               else t("gateway_runtime.restart_notice.shutting_down"))
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):

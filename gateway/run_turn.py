@@ -1749,11 +1749,8 @@ class GatewayTurnMixin:
 
         return response
 
-    _STATUS_HINTS = {
-        401: " Check your API key or run `claude /login` to refresh OAuth credentials.",
-        402: " Your API balance or quota is exhausted. Check your provider dashboard.",
-        529: " The API is temporarily overloaded. Please try again shortly.",
-    }
+    # idcsre patch: hint text resolved through i18n (gateway_runtime.error.hint_*).
+    _STATUS_HINT_KEYS = {401: "hint_401", 402: "hint_402", 529: "hint_529"}
 
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
@@ -1775,7 +1772,8 @@ class GatewayTurnMixin:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
         # Never expose raw exception types/messages to end users (info-leakage risk).
         status_code = getattr(e, "status_code", None)
-        status_hint = self._STATUS_HINTS.get(status_code, "")
+        _hint_key = self._STATUS_HINT_KEYS.get(status_code)
+        status_hint = t(f"gateway_runtime.error.{_hint_key}") if _hint_key else ""
         if status_code == 429:
             # Plan usage limit (resets on a schedule) vs a transient rate limit
             _err_json = {}
@@ -1785,25 +1783,19 @@ class GatewayTurnMixin:
                 _err_json = {}
             _resets_in = _err_json.get("resets_in_seconds")
             if _err_json.get("type") != "usage_limit_reached":
-                status_hint = " You are being rate-limited. Please wait a moment and try again."
+                status_hint = t("gateway_runtime.error.hint_429_rate")
             elif _resets_in and _resets_in > 0:
                 import math
-                status_hint = f" Your plan's usage limit has been reached. It resets in ~{math.ceil(_resets_in / 3600)}h."
+                status_hint = t("gateway_runtime.error.hint_429_hours", hours=math.ceil(_resets_in / 3600))
             else:
-                status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
+                status_hint = t("gateway_runtime.error.hint_429_wait")
         elif status_code in {400, 500}:
             # 400/500 on a large session: context overflow / payload too large.
             if len(prepared.history) > 50:
-                return (
-                    "⚠️ Session too large for the model's context window.\nUse /compact to "
-                    "compress the conversation, or /reset to start fresh."
-                )
+                return t("gateway_runtime.turn.context_too_large")
             elif status_code == 400:
-                status_hint = " The request was rejected by the API."
-        return (
-            f"Sorry, I encountered an unexpected error.{status_hint}\n"
-            "Try again or use /reset to start a fresh session."
-        )
+                status_hint = t("gateway_runtime.error.hint_400")
+        return t("gateway_runtime.error.unexpected", hint=status_hint)
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
@@ -2047,6 +2039,9 @@ class GatewayTurnMixin:
 
     def _format_session_info(self) -> str:
         """Model / provider / context-length / endpoint block so users can spot bad context detection."""
+        # idcsre patch: HERMES_GATEWAY_SESSION_INFO=0 blanks the block for end-user deployments.
+        if os.environ.get("HERMES_GATEWAY_SESSION_INFO", "1").strip().lower() in ("0", "false", "off", "no"):
+            return ""
         from gateway.run import _resolve_gateway_model_context
         resolved = _resolve_gateway_model_context()
         context_length = resolved.context_length
@@ -3185,10 +3180,9 @@ class GatewayTurnMixin:
             return
         try:
             await _warn_adapter.send(
-                source.chat_id, f"⚠️ No activity for {int(worker.agent_warning // 60) or 1} min. "
-                "If the agent does not respond soon, it will be timed out in "
-                f"{int((worker.agent_timeout - worker.agent_warning) // 60) or 1} min. "
-                "You can continue waiting or use /reset.",
+                source.chat_id, t("gateway_runtime.progress.no_activity",
+                                  elapsed=int(worker.agent_warning // 60) or 1,
+                                  remaining=int((worker.agent_timeout - worker.agent_warning) // 60) or 1),
                 metadata=_interim_metadata(_status_thread_metadata),
             )
         except Exception as _warn_err:
@@ -3809,7 +3803,7 @@ class GatewayTurnMixin:
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
-                else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                else t("gateway_runtime.progress.working", minutes=_elapsed_mins, detail=_status_detail)
             )
             try:
                 _notify_res = None

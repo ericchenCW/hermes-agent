@@ -41,6 +41,7 @@ from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from agent.i18n import t
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -601,24 +602,20 @@ def _format_exec_approval_fallback(
         + ", ".join(choices[:-1]) + f", or {choices[-1]}.")
 
 # Ordered: auth beats policy beats rate-limit beats connection; first match wins.
+# idcsre patch: the reply text is resolved through i18n (gateway_runtime.provider_error.*).
 _PROVIDER_ERROR_REPLIES = (
-    (_GATEWAY_AUTH_ERROR_RE, "⚠️ Provider authentication failed. Check the configured credentials; "
-                             "raw provider details are in the gateway logs."),
-    (_GATEWAY_PROVIDER_POLICY_RE, "⚠️ The model provider rejected the request. I kept the raw provider "
-                                  "error out of chat; check gateway logs for details or try rephrasing."),
-    (_GATEWAY_RATE_LIMIT_RE, "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."),
-    (_GATEWAY_CONNECTION_ERROR_RE, "⚠️ The model server is not responding — it looks like the configured "
-                                   "model endpoint is not running or is unreachable."))
+    (_GATEWAY_AUTH_ERROR_RE, "auth"),
+    (_GATEWAY_PROVIDER_POLICY_RE, "policy"),
+    (_GATEWAY_RATE_LIMIT_RE, "rate_limit"),
+    (_GATEWAY_CONNECTION_ERROR_RE, "connection"))
 
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
-    for pattern, reply in _PROVIDER_ERROR_REPLIES:
+    for pattern, key in _PROVIDER_ERROR_REPLIES:
         if pattern.search(text):
-            return reply
-    return (
-        "⚠️ The model provider failed after retries. I kept raw provider details "
-        "out of chat; check gateway logs for diagnostics.")
+            return t(f"gateway_runtime.provider_error.{key}")
+    return t("gateway_runtime.provider_error.generic")
 
 
 # Provider/API failure envelope preambles (not ordinary assistant prose), anchored at line start.
@@ -3035,23 +3032,13 @@ def _normalize_empty_agent_response(
         failure_reason = str(agent_result.get("failure_reason") or "")
         if failure_reason.startswith("session_persistence_failed") or "session storage" in error_str:
             if failure_reason.endswith(":disk") or "disk" in error_str:
-                return (
-                    "⚠️ Session storage was temporarily unavailable, so this "
-                    "turn was stopped to protect your conversation history. "
-                    "Please check available disk space, then send your message again.")
-            return (
-                "⚠️ Session storage was temporarily unavailable, so this "
-                "turn was stopped to protect your conversation history. "
-                "Your message should already be saved — please send it again in a moment.")
+                return t("gateway_runtime.turn.storage_disk")
+            return t("gateway_runtime.turn.storage_other")
         if any(p in error_str for p in (
                 "context", "token", "too large", "too long", "exceed", "payload")) or (
                 "400" in error_str and history_len > 50):
-            return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or /reset to start fresh.")
-        return (
-            f"The request failed: {str(error_detail)[:300]}\n"
-            "Try again or use /reset to start a fresh session.")
+            return t("gateway_runtime.turn.context_too_large")
+        return t("gateway_runtime.turn.request_failed", error=str(error_detail)[:300])
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
@@ -3068,9 +3055,7 @@ def _normalize_empty_agent_response(
         # (response=0 chars) and the user sees no reply at all. Surface a short retry hint so the message
         # isn't lost in silence. (#31884)
         if api_calls == 0:
-            return (
-                "⚠️ Your message was interrupted before processing started "
-                "(likely by a recent /stop). Please send it again.")
+            return t("gateway_runtime.turn.interrupted_before_start")
         return response
     if api_calls > 0:
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text ("Codex response remained
@@ -3081,16 +3066,12 @@ def _normalize_empty_agent_response(
             return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
-        return (
-            "⚠️ Processing completed but no response was generated. "
-            "This may be a transient error — try sending your message again.")
+            return t("gateway_runtime.turn.processing_stopped", error=str(err)[:200])
+        return t("gateway_runtime.turn.no_response")
 
     # api_calls == 0, not failed/interrupted: agent never ran (post-/stop race); don't drop silently.
     if api_calls == 0 and not agent_result.get("partial"):
-        return (
-            "⚠️ Your message wasn't processed (the previous turn was still "
-            "being cleaned up). Please send it again.")
+        return t("gateway_runtime.turn.not_processed")
 
     return response
 
@@ -3874,7 +3855,7 @@ class GatewayRunner(
         return "restart" if self._restart_requested else "shutdown"
 
     def _status_action_gerund(self) -> str:
-        return "restarting" if self._restart_requested else "shutting down"
+        return t("gateway_runtime.drain.gerund_restarting") if self._restart_requested else t("gateway_runtime.drain.gerund_shutting_down")
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         _write_runtime_status_quiet(

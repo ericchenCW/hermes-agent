@@ -407,9 +407,9 @@ class GatewayBusySessionMixin:
             return
         if self._queue_during_drain_enabled(effective_mode):
             self._queue_or_replace_pending_event(session_key, event)
-            message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+            message = t("gateway_runtime.drain.queued", action=self._status_action_gerund())
         else:
-            message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            message = t("gateway_runtime.drain.not_accepting", action=self._status_action_gerund())
         await self._send_busy_reply(event, adapter, message)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
@@ -603,7 +603,7 @@ class GatewayBusySessionMixin:
                 if _busy_state and _busy_state.turn.started_ts:
                     elapsed_min = int((now - _busy_state.turn.started_ts) / 60)
                 if elapsed_min > 0:
-                    status_parts.append(f"{elapsed_min} min elapsed")
+                    status_parts.append(t("gateway_runtime.busy.detail_elapsed", minutes=elapsed_min))
                 if summary.get("max_iterations", 0):
                     status_parts.append(
                         format_iteration_progress(
@@ -611,24 +611,25 @@ class GatewayBusySessionMixin:
                         )
                     )
                 if summary.get("current_tool"):
-                    status_parts.append(f"running: {summary.get('current_tool')}")
+                    status_parts.append(t("gateway_runtime.busy.detail_running", tool=summary.get("current_tool")))
             except Exception:
                 pass
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        # idcsre patch: the busy acks are resolved through i18n (gateway_runtime.busy.*).
         if is_steer_mode:
-            head, tail = "⏩ Steered into current run", ". Your message arrives after the next tool call."
+            _busy_key = "steered"
         elif is_redirect_mode:
-            head, tail = "↪ Redirected current run", ". I'll adjust using your correction."
+            _busy_key = "redirected"
         elif is_queue_mode and demoted_for_subagents:
             # Explain the demotion: the follow-up didn't kill the subagent; /stop is the escape hatch.
-            head, tail = "⏳ Subagent working", self._BUSY_DEMOTED_TAIL
+            _busy_key = "queued_subagent"
         elif is_queue_mode and demoted_for_compression:
-            head, tail = "⏳ Compressing context", self._BUSY_DEMOTED_TAIL
+            _busy_key = "queued_compression"
         elif is_queue_mode:
-            head, tail = "⏳ Queued for the next turn", ". I'll respond once the current task finishes."
+            _busy_key = "queued"
         else:
-            head, tail = "⚡ Interrupting current task", ". I'll respond to your message shortly."
-        message = f"{head}{status_detail}{tail}"
+            _busy_key = "interrupting"
+        message = t(f"gateway_runtime.busy.{_busy_key}", detail=status_detail)
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).
         try:
@@ -829,10 +830,7 @@ class GatewayBusySessionMixin:
                 "falling back to busy-reject", policy, name,
             )
 
-        return (
-            f"⏳ Agent is running — `/{name}` can't run "
-            f"mid-turn. Wait for the current response or `/stop` first."
-        )
+        return t("gateway_runtime.drain.agent_running_cmd", name=name)
 
     async def _handle_pause_command(self, event: MessageEvent):
         """`/pause [reason]` engages the global emergency stop; `/pause off` lifts it (the estop gate

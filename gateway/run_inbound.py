@@ -26,6 +26,7 @@ from gateway.session import (
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
+from agent.i18n import t
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -617,7 +618,7 @@ class GatewayInboundMixin:
             if event.get_command() == "stop":  # force-clean the sentinel so the session is unlocked
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
-                return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
+                return EphemeralReply(t("gateway_runtime.drain.force_stopped"))
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return None
         if self._draining:
@@ -625,9 +626,9 @@ class GatewayInboundMixin:
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
             return (
-                f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                t("gateway_runtime.drain.queued", action=self._status_action_gerund())
                 if queue_during_drain
-                else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                else t("gateway_runtime.drain.not_accepting", action=self._status_action_gerund())
             )
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -951,7 +952,7 @@ class GatewayInboundMixin:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining:
-            return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
+            return True, t("gateway_runtime.drain.not_accepting_work", action=self._status_action_gerund()), command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         qcmd = self._hm_quick_commands().get(command) if command else None
@@ -1040,12 +1041,7 @@ class GatewayInboundMixin:
             "Unrecognized slash command /%s from %s — replying with unknown-command notice",
             command, source.platform.value if source.platform else "?",
         )
-        return (
-            f"Unknown command `/{command}`. "
-            f"Type /commands to see what's available, "
-            f"or resend without the leading slash to send "
-            f"as a regular message."
-        )
+        return t("gateway_runtime.unknown_command", command=command)
 
     def _hm_skill_slash_rewrite(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: Optional[str]
@@ -1226,11 +1222,7 @@ class GatewayInboundMixin:
             # only fall to zero. Reversible.
             if self._external_drain_active:
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
-                return (
-                    "⏳ This agent is draining for a maintenance action and isn't "
-                    "accepting new turns right now. It'll be back in a moment — "
-                    "please resend shortly."
-                )
+                return t("gateway_runtime.drain.external_drain")
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
@@ -1262,11 +1254,7 @@ class GatewayInboundMixin:
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
-                return (
-                    "⏳ Another turn is still running on this session. To "
-                    "protect the transcript, this message was not processed. "
-                    "Wait for the active turn to finish, then resend it."
-                )
+                return t("gateway_runtime.drain.another_turn")
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,

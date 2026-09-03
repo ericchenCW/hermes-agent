@@ -162,9 +162,13 @@ def _reply_anchor_for_event(event) -> str | None:
 
 
 def _media_failure_text(kind: str, file_name: "str | None" = None) -> str:
-    """User-facing "couldn't deliver" notice; ``file_name`` is the only name ever shown."""
-    suffix = f" ({file_name})" if file_name else ""
-    return f"⚠️ Couldn't deliver the {kind} attachment{suffix}."
+    """User-facing "couldn't deliver" notice; ``file_name`` is the only name ever shown.
+    idcsre patch: resolved through i18n (gateway_runtime.media.*)."""
+    from agent.i18n import t
+    if kind == "file" and file_name:
+        return t("gateway_runtime.media.file_named", file_name=file_name)
+    text = t(f"gateway_runtime.media.{kind}")
+    return f"{text[:-1]} ({file_name})." if file_name and text.endswith(".") else text
 
 
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
@@ -3224,9 +3228,8 @@ class BasePlatformAdapter(ABC):
                     )
                     return result
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
-                notice = (
-                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
-                    "Please try again \u2014 your request was processed but the response could not be sent.")
+                from agent.i18n import t as _t
+                notice = _t("gateway_runtime.media.delivery_failed")
                 try:
                     await _send(notice)
                 except Exception as notify_err:
@@ -3236,7 +3239,8 @@ class BasePlatformAdapter(ABC):
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await _send(f"(Response formatting failed, plain text:)\n\n{content[:3500]}")
+        from agent.i18n import t as _t
+        fallback_result = await _send(_t("gateway_runtime.media.formatting_failed", content=content[:3500]))
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result

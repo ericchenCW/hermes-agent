@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from agent.message_metadata import append_message
+from agent.i18n import t
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -149,13 +150,13 @@ def handle_outer_loop_error(
     ):
         if _is_local_processing_error:
             _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
-            final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+            final_response = t("gateway_runtime.agent.error_processing", error=error_msg)
         elif _outer_error_count >= _outer_error_cap:
             failed = True
             _turn_exit_reason = f"repeated_outer_errors({error_msg[:80]})"
-            final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+            final_response = t("gateway_runtime.agent.error_repeated", error=error_msg)
         else:
             _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-            final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+            final_response = t("gateway_runtime.agent.error_repeated", error=error_msg)
         return _verdict("break")
     return _verdict("fallthrough")

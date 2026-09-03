@@ -67,7 +67,9 @@ _BUSY_INPUT_HINT_CLI_DEFAULT = (
 
 def busy_input_hint_gateway(mode: str) -> str:
     """Hint shown the first time a user messages while the agent is busy (markdown)."""
-    return _BUSY_INPUT_HINTS_GATEWAY.get(mode, _BUSY_INPUT_HINT_GATEWAY_DEFAULT)
+    from agent.i18n import t  # idcsre patch: gateway_runtime.onboarding.*
+    return t("gateway_runtime.onboarding." + ({"queue": "busy_queue", "steer": "busy_steer",
+                                               "redirect": "busy_redirect"}.get(mode, "busy_interrupt")))
 
 
 def busy_input_hint_cli(mode: str) -> str:
@@ -76,8 +78,8 @@ def busy_input_hint_cli(mode: str) -> str:
 
 
 def tool_progress_hint_gateway() -> str:
-    return ("💡 First-time tip — that tool took a while and I'm streaming every step. If the progress messages "
-            "feel noisy, send `/verbose` to cycle modes (all → new → off). This notice won't appear again.")
+    from agent.i18n import t  # idcsre patch: gateway_runtime.onboarding.*
+    return t("gateway_runtime.onboarding.tool_progress")
 
 
 def tool_progress_hint_cli() -> str:
