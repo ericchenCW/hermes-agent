@@ -38,14 +38,14 @@ def _adapter(hints):
 
 
 def test_parse_hints():
-    assert m._parse_ttft_hints("4:乙|2:甲|bad|:x|0:none") == [(2.0, "甲"), (4.0, "乙")]
+    assert m._parse_ttft_hints("4:乙|2:甲|bad|:x|0:none") == [(2.0, ["甲"]), (4.0, ["乙"])]
     assert m._parse_ttft_hints("") == []
-    assert m._parse_ttft_hints(m.TTFT_HINTS_DEFAULT)[0] == (2.0, "正在思考…")
+    assert m._parse_ttft_hints(m.TTFT_HINTS_DEFAULT)[0][0] == 2.0
 
 
 def test_hints_fire_until_real_content():
     async def main():
-        ad, sent = _adapter([(0.05, "甲"), (0.12, "乙"), (5.0, "丙")])
+        ad, sent = _adapter([(0.05, ["甲"]), (0.12, ["乙"]), (5.0, ["丙"])])
         assert await ad.send_stream_frame("", chat_id="c1", turn_id="t1")
         await asyncio.sleep(0.2)
         assert sent == ["<think></think>", "甲", "乙"], sent
@@ -60,7 +60,7 @@ def test_hints_fire_until_real_content():
 
 def test_no_hint_when_content_arrives_first():
     async def main():
-        ad, sent = _adapter([(0.05, "甲")])
+        ad, sent = _adapter([(0.05, ["甲"])])
         await ad.send_stream_frame("", chat_id="c1", turn_id="t1")
         await ad.send_stream_frame("快", chat_id="c1", turn_id="t1")
         await asyncio.sleep(0.1)
@@ -70,7 +70,7 @@ def test_no_hint_when_content_arrives_first():
 
 def test_finalize_cancels_hints():
     async def main():
-        ad, sent = _adapter([(0.05, "甲"), (0.1, "乙")])
+        ad, sent = _adapter([(0.05, ["甲"]), (0.1, ["乙"])])
         await ad.send_stream_frame("", chat_id="c1", turn_id="t1")
         await asyncio.sleep(0.07)
         assert "甲" in sent
