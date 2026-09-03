@@ -677,6 +677,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         content, button_spec = self._extract_button_directive(content)
         content = self._drop_empty_image_tags(content)
         card_req_id = None
+        if not (content or "").replace("\u200b", "").strip() and not button_spec:
+            logger.debug("[%s] Skipping blank send to %s", self.name, chat_id)
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         if not (content or "").strip() and button_spec:
             content = button_spec["title"]
         try:

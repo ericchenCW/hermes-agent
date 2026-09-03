@@ -404,6 +404,8 @@ class StreamTransportMixin:
         # expired so it doesn't retry the dead stream.
         logger.info("[flow] native streaming disabled after frame failure (finalize=%s len=%d)", finalize, len(text or ""))
         self._use_native_streaming = False
+        if not finalize and not getattr(self.adapter, "SUPPORTS_MESSAGE_EDITING", True):
+            self.cfg.buffer_only = True  # idcsre patch: WeCom has no edits — buffer to one send()
         # Best-effort close of an opened bubble (the seed frame has zero length but
         # still opens it).  DO NOT mark delivered: the frame closes the bubble but
         # WeCom may not render the content (errcode 6000 race).

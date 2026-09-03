@@ -242,11 +242,12 @@ class WeComButtonsMixin:
         msg_id = str(body.get("msgid") or f"btn-{task_id}-{event_key}")
         if self._dedup.is_duplicate(msg_id):
             return
-        # 2) This turn has no usable inbound req_id: the event's req_id is spent on the update
-        #    frame and the previous message's already served its reply.  Drop the stale one so the
-        #    reply goes proactive (aibot_send_msg) instead of streaming on a dead req_id.
-        self._last_chat_req_ids.pop(chat_id, None)
-        self._stream_expired_chats.add(chat_id)
+        # 2) Reply on the event's req_id: WeCom accepts several passive responses per req_id
+        #    (finish frame + template_card verified), so the click turn streams like a normal turn.
+        #    _button_click_chats keeps the proactive fallback open in groups if that ever fails.
+        if req_id:
+            self._remember_reply_req_id(msg_id, req_id)
+            self._remember_chat_req_id(chat_id, req_id)
         self._button_click_chats.add(chat_id)
         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None)
         event_obj = MessageEvent(

@@ -618,6 +618,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 self._use_draft_streaming = False
                 return
             self._use_native_streaming = False
+            if not getattr(self.adapter, "SUPPORTS_MESSAGE_EDITING", True):
+                # idcsre patch: no stream and no edits (WeCom) — never push a tiny first preview
+                # via send(); it lands as an empty/garbled bubble that can't be fixed up later.
+                self.cfg.buffer_only = True
         self._use_draft_streaming = self._resolve_draft_streaming()
         # Native draft streaming: bump the draft_id so the next text segment animates as a fresh preview
         # below the tool-progress bubbles, not over the prior segment's already-finalized draft. This is how
