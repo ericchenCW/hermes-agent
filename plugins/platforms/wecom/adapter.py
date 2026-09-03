@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -44,6 +45,7 @@ from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
     STREAM_NOT_SUBSCRIBED_ERRCODE, MAX_STREAM_CONTENT_LENGTH,
     STREAM_SAFE_DURATION_SECONDS, STREAM_KEEPALIVE_INTERVAL_SECONDS, STREAM_KEEPALIVE_ENABLED_DEFAULT,
+    TTFT_HINTS_DEFAULT, _parse_ttft_hints,
 )
 
 
@@ -164,6 +166,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         self._last_chat_req_ids: Dict[str, str] = {}
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: Dict[str, StreamTurn] = {}
+        # idcsre patch: time-to-first-token progress hints on the native stream bubble.
+        self._ttft_hints: List[Tuple[float, str]] = _parse_ttft_hints(os.environ.get("WECOM_TTFT_HINTS", TTFT_HINTS_DEFAULT))
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups can't receive proactive APP_CMD_SEND
         # Inline-media staging (idcsre patch, see media.INLINE_MSG_ITEM_MAX): "chat[:turn_id]" ->
         # (paths, ts) staged by the gateway before finalize; chat_id -> (paths carried by the
@@ -952,7 +956,6 @@ from dataclasses import dataclass  # noqa: F401,E402
 from collections import deque  # noqa: F401,E402
 import hashlib  # noqa: F401,E402
 import mimetypes  # noqa: F401,E402
-import os  # noqa: F401,E402
 from urllib.parse import unquote  # noqa: F401,E402
 from urllib.parse import urlparse  # noqa: F401,E402
 

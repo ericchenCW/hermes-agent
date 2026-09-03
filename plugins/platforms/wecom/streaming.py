@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
 
@@ -36,6 +36,34 @@ STREAM_KEEPALIVE_ENABLED_DEFAULT = False
 from plugins.platforms.wecom.media import (  # noqa: E402  (idcsre patch: inline finalize-frame images)
     INLINE_MSG_ITEM_MAX, INLINE_EMPTY_TEXT_PLACEHOLDER, _EMPTY_MD_IMAGE_RE,
 )
+
+
+# ── Time-to-first-token hints (idcsre patch) ─────────────────────────────────
+# While a turn's native stream is open but no visible content has been pushed yet, replace the empty
+# bubble with a short progress phrase at each threshold (seconds since the turn started).  Frames
+# carry full content, so the first real text simply overwrites the hint.  Override with
+# WECOM_TTFT_HINTS="2:正在思考…|4:…" (empty string disables).
+TTFT_HINTS_DEFAULT = (
+    "2:正在思考…|4:正在梳理问题…|6:正在检索知识库…|8:正在核对细节…|"
+    "16:正在组织答案…|32:还在处理，请稍候…"
+)
+
+
+def _parse_ttft_hints(raw: Optional[str]) -> List[Tuple[float, str]]:
+    out: List[Tuple[float, str]] = []
+    for item in (raw or "").split("|"):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        delay_s, _, text = item.partition(":")
+        try:
+            delay = float(delay_s.strip())
+        except ValueError:
+            continue
+        if delay > 0 and (text := text.strip()):
+            out.append((delay, text))
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 class WeComStreamExpiredError(RuntimeError):
@@ -70,6 +98,8 @@ class StreamTurn:
         self.start_time = time.monotonic()
         self.last_sent_content: str = ""  # content ACTUALLY sent; final frame must differ or WeCom drops it
         self._intermediate_frames_sent: int = 0
+        self.hint_task: Optional["asyncio.Task[None]"] = None  # idcsre patch: TTFT progress hints
+        self.real_content_sent = False  # first non-empty text frame pushed
         self.keepalive_handle: Optional[asyncio.TimerHandle] = None  # cancel on EVERY turn-exit path
 
 
@@ -185,9 +215,52 @@ class WeComStreamMixin:
             except Exception:
                 pass
 
+    # ── Time-to-first-token hints (idcsre patch) ───────────────────────────
+    def _arm_ttft_hints(self, turn: StreamTurn) -> None:
+        """Start the time-to-first-token hint loop for a freshly seeded turn."""
+        if not self._ttft_hints or turn.hint_task is not None:
+            return
+        if turn.finalized or turn.expired or turn.real_content_sent:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        turn.hint_task = loop.create_task(self._ttft_hint_loop(turn))
+
+    @staticmethod
+    def _cancel_ttft_hints(turn: StreamTurn) -> None:
+        task, turn.hint_task = turn.hint_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _ttft_hint_loop(self, turn: StreamTurn) -> None:
+        """Push a progress phrase at each threshold until real content lands."""
+        try:
+            for delay, hint in self._ttft_hints:
+                remaining = turn.start_time + delay - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                if turn.finalized or turn.expired or turn.real_content_sent:
+                    return
+                try:
+                    await self._send_stream_reply(turn.req_id, turn.stream_id, hint, finish=False)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("[%s] ttft hint send failed: %s", self.name, exc)
+                    return
+                self._flow_log(turn, "ttft hint t=%gs" % delay)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if turn.hint_task is asyncio.current_task():
+                turn.hint_task = None
+
     def _retire_turn(self, turn: StreamTurn, turn_id: Optional[str]) -> None:
         """Single choke point for "turn is dead": cancel the timer, then drop it from the registry."""
         self._cancel_keepalive(turn)
+        self._cancel_ttft_hints(turn)
         self._staged_inline_media.pop(self._inline_stage_key(turn.chat_id, turn_id), None)
         self._stream_turns.pop(f"{turn.chat_id}:{turn_id or turn.req_id}", None)
 
@@ -323,6 +396,8 @@ class WeComStreamMixin:
                 self._expire_turn(turn, turn_id)
                 return False
         self._cancel_keepalive(turn)
+        turn.real_content_sent = True
+        self._cancel_ttft_hints(turn)
         # idcsre patch: a trailing BUTTONS[...] line becomes a card riding on the finish frame.
         text, button_spec = self._extract_button_directive(text)
         text = self._drop_empty_image_tags(text)
@@ -395,12 +470,16 @@ class WeComStreamMixin:
                 await self._send_stream_reply(turn.req_id, turn.stream_id, "<think></think>", finish=False)
                 turn.seeded = True
                 self._arm_keepalive(turn, turn_id=turn_id)
+                self._arm_ttft_hints(turn)
                 if not text and not finalize:
                     return True  # consumer's explicit seed call — nothing more to send
             if finalize:
                 return await self._finalize_turn(turn, text, chat, turn_id)
             # Fire-and-forget: the gateway decides when to push (identity dedup in stream_consumer.py).
             text = self._drop_empty_image_tags(self._strip_partial_button_line(text))  # idcsre patch
+            if text.strip():
+                turn.real_content_sent = True
+                self._cancel_ttft_hints(turn)
             turn.accumulated_text = text
             if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES:
                 return True  # cap reached — finalize drains the rest
