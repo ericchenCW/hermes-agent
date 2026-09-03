@@ -539,3 +539,4 @@ gateway_runtime:
   agent:
     error_processing: 抱歉，处理模型回复时出错：{error}
     error_repeated: 抱歉，连续多次出错：{error}
+  command_disabled: ⛔ 这里未开放 /{command} 命令。

@@ -963,6 +963,13 @@ class GatewayBusySessionMixin:
         from gateway.slash_access import policy_for_source as _policy_for_source
         if not canonical_cmd:
             return None
+        # idcsre patch: operator-disabled commands (HERMES_GATEWAY_DISABLED_COMMANDS=help,commands)
+        # are hidden from every user, admin or not, on every platform — before the admin policy runs.
+        _disabled = {c.strip().lstrip("/").lower()
+                     for c in os.environ.get("HERMES_GATEWAY_DISABLED_COMMANDS", "").split(",") if c.strip()}
+        if canonical_cmd.lower() in _disabled:
+            logger.info("Slash command /%s disabled by HERMES_GATEWAY_DISABLED_COMMANDS", canonical_cmd)
+            return t("gateway_runtime.command_disabled", command=canonical_cmd)
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
