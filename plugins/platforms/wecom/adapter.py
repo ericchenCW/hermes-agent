@@ -221,6 +221,7 @@ BUTTON_CARDS_MAX = 500         # registry hard cap
 BUTTON_CARD_TTL_SECONDS = 24 * 3600
 BUTTON_DEFAULT_TITLE = "请选择"
 BUTTON_TRAILING_LINES = 4      # directive accepted within the last N lines
+BUTTON_STYLE = 4               # same style for every option (1 = primary blue reads as "selected")
 # text_notice cards must carry a card_action (errcode 42045 otherwise); the
 # URL only matters if someone taps the "已选择" notice after a click.
 BUTTON_CARD_ACTION_URL = os.environ.get("WECOM_CARD_ACTION_URL", "https://work.weixin.qq.com/")
@@ -2250,7 +2251,7 @@ class WeComAdapter(BasePlatformAdapter):
             "main_title": {"title": spec["title"][:BUTTON_TITLE_MAX]},
             "task_id": task_id,
             "button_list": [
-                {"text": label, "style": 1 if i == 0 else 4, "key": key}
+                {"text": label, "style": BUTTON_STYLE, "key": key}
                 for i, (label, key) in enumerate(zip(spec["options"], keys))
             ],
         }
@@ -2283,26 +2284,23 @@ class WeComAdapter(BasePlatformAdapter):
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
-    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str) -> None:
+    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str, user_id: str = "") -> None:
         """Acknowledge a click by rewriting the card (must land within 5 s).
 
-        First choice is WeCom's ``update_button`` (all buttons collapse into
-        one disabled label); if the AI-bot channel rejects it, fall back to
-        replacing the card with a ``text_notice`` — which WeCom requires to
-        carry a ``card_action`` (errcode 42045 otherwise)."""
-        attempts = [
-            {"response_type": "update_button", "button": {"replace_name": chosen_text[:20]}},
-            {
-                "response_type": "update_template_card",
-                "template_card": {
-                    "card_type": "text_notice",
-                    "main_title": {"title": title[:BUTTON_TITLE_MAX]},
-                    "sub_title_text": chosen_text,
-                    "card_action": {"type": 1, "url": BUTTON_CARD_ACTION_URL},
-                    "task_id": task_id,
-                },
-            },
-        ]
+        Field notes (2026-09-03): ``update_button`` is rejected by the AI-bot
+        channel (40058); ``update_template_card`` with a ``text_notice`` needs
+        a ``card_action`` (42045 otherwise).  ``userids`` scopes the rewrite to
+        the clicking user, as in the official SDK's ``update_template_card``."""
+        card = {
+            "card_type": "text_notice",
+            "main_title": {"title": title[:BUTTON_TITLE_MAX]},
+            "sub_title_text": chosen_text,
+            "card_action": {"type": 1, "url": BUTTON_CARD_ACTION_URL},
+            "task_id": task_id,
+        }
+        attempts = [{"response_type": "update_template_card", "template_card": card}]
+        if user_id:
+            attempts.insert(0, {"response_type": "update_template_card", "template_card": card, "userids": [user_id]})
         for update in attempts:
             try:
                 response = await self._send_reply_request(req_id, update, cmd=APP_CMD_RESPONSE_UPDATE, timeout=5.0)
@@ -2381,7 +2379,7 @@ class WeComAdapter(BasePlatformAdapter):
         #    (first) choice; sent as its own task so routing never waits on the ack
         if req_id and task_id:
             title = (pending.get("title") if pending else None) or BUTTON_DEFAULT_TITLE
-            asyncio.ensure_future(self._send_card_update(req_id, task_id, title, f"已选择：{shown}"[:100]))
+            asyncio.ensure_future(self._send_card_update(req_id, task_id, title, f"已选择：{shown}"[:100], sender_id))
             await asyncio.sleep(0)  # let the update frame go out before routing
         if repeat:
             return
