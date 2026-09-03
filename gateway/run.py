@@ -23651,6 +23651,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             override = None
 
+        # Per-user override (idcsre): ``user_toolsets.<platform>.<user_id>``
+        # in config, or ``<PLATFORM>_ADMIN_USERS`` (comma-separated ids) +
+        # ``<PLATFORM>_ADMIN_TOOLSETS`` (default "sre") in the environment.
+        # Lets a few operators keep the writing tools while everyone else on
+        # the platform runs the read-only posture set in platform_toolsets.
+        user_override = self._user_toolsets_override(user_config, source, platform_key)
+        if user_override:
+            override = user_override
         if override and isinstance(override, list):
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
@@ -23659,6 +23667,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return sorted(_get_platform_tools(cfg, platform_key))
 
         return sorted(_get_platform_tools(user_config, platform_key))
+
+    @staticmethod
+    def _user_toolsets_override(user_config: dict, source: "SessionSource", platform_key: str) -> Optional[list]:
+        """Toolset list for this sender, or None when no per-user rule applies."""
+        uid = str(getattr(source, "user_id", "") or "").strip()
+        if not uid:
+            return None
+        try:
+            per_platform = ((user_config or {}).get("user_toolsets") or {}).get(platform_key) or {}
+            if isinstance(per_platform, dict):
+                for key, value in per_platform.items():
+                    if str(key).strip() == uid:
+                        names = [value] if isinstance(value, str) else list(value or [])
+                        names = [str(t).strip() for t in names if str(t).strip()]
+                        return names or None
+        except Exception:
+            pass
+        env_key = platform_key.upper().replace("-", "_")
+        admins = os.environ.get(f"{env_key}_ADMIN_USERS", "")
+        if admins:
+            ids = {a.strip() for a in admins.split(",") if a.strip()}
+            if uid in ids:
+                names = [t.strip() for t in os.environ.get(f"{env_key}_ADMIN_TOOLSETS", "sre").split(",") if t.strip()]
+                return names or None
+        return None
 
     async def _run_background_task_inner(
         self,

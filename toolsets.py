@@ -379,17 +379,44 @@ TOOLSETS = {
     # cron, or code-execution tools. Activated explicitly via
     # `platform_toolsets: {cli: [sre]}`; not a posture (no auto-selection).
     "sre": {
-        "description": "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, clarify, vision",
-        # `memory` deliberately absent: one runtime serves several Haro users, so
-        # instance-level MEMORY.md / USER.md would mix their notes (idcsre 090 G24).
+        "description": "SRE admin posture: local retrieval (terminal/file), skills incl. editing, memory, todo, clarify, vision, sheet composing",
+        # Full set — meant for the few operators allowed to rewrite skills /
+        # memory. Everyone else on a chat platform gets `sre-readonly`
+        # (see gateway user_toolsets / <PLATFORM>_ADMIN_USERS). `memory` is
+        # instance-level (MEMORY.md / USER.md), so keep the admin list short.
         "tools": [
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
+            "memory",
             "todo",
             "clarify",
+            "compose_sheet",
         ],
+        "includes": [],
+    },
+
+    # Read-only Q&A posture for chat-platform users: nothing that can write
+    # under HERMES_HOME (no terminal/write_file/patch/skill_manage/memory).
+    # Screenshot sheets come from the dedicated `compose_sheet` tool, which
+    # only runs the vetted composing script on a knowledge-base document.
+    "sre-readonly": {
+        "description": "Offline SRE Q&A, read-only: file/skill reading, search, vision, todo, clarify, sheet composing",
+        "tools": [
+            "read_file", "search_files",
+            "vision_analyze",
+            "skills_list", "skill_view",
+            "todo",
+            "clarify",
+            "compose_sheet",
+        ],
+        "includes": [],
+    },
+
+    "compose_sheet": {
+        "description": "Compose a numbered screenshot sheet from a knowledge-base document (idcsre canway-it-support)",
+        "tools": ["compose_sheet"],
         "includes": [],
     },
 
