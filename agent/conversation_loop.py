@@ -831,6 +831,36 @@ _LENGTH_CONTINUATION_OUTPUT_LIMIT = (
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
 
+def _length_continuation_output_cap(default: int = 32768) -> int:
+    """idcsre patch: ceiling for the doubled output budget used by length continuations.
+
+    Each continuation retry doubles the model's max output tokens (4096 -> 8192 -> 16384 -> 32768).
+    ``HERMES_LENGTH_CONTINUATION_MAX_TOKENS`` lowers that ceiling for deployments running
+    pure-thinking models, where a reasoning-only truncation would otherwise be retried at ever
+    larger budgets for many minutes."""
+    raw = os.environ.get("HERMES_LENGTH_CONTINUATION_MAX_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1024, value)
+
+
+def _length_continuation_worthwhile(assistant_message, truncated_response_parts) -> bool:
+    """idcsre patch: only continue a length-truncated turn that produced visible text.
+
+    A truncation with no visible content means the whole budget went to hidden reasoning; asking the
+    model to "continue" just repeats that at a larger budget (upstream already turns reasoning off
+    for the retry — this skips the retry entirely).  ``HERMES_LENGTH_CONTINUATION_REASONING_ONLY=1``
+    restores the old always-continue behaviour."""
+    if os.environ.get("HERMES_LENGTH_CONTINUATION_REASONING_ONLY", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if truncated_response_parts:
+        return True
+    content = getattr(assistant_message, "content", None) if assistant_message is not None else None
+    return bool(content and str(content).strip())
+
+
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])

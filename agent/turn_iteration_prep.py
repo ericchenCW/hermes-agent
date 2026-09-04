@@ -462,7 +462,9 @@ def apply_retry_restarts(
         _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _requested_cap is not None:
             _boost = max(_boost, _requested_cap)
-        _boost_cap = max(32768, _requested_cap or 0)
+        # idcsre patch: HERMES_LENGTH_CONTINUATION_MAX_TOKENS lowers the 32768 ceiling.
+        from agent.conversation_loop import _length_continuation_output_cap
+        _boost_cap = max(_length_continuation_output_cap(), _requested_cap or 0)
         agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
         return _verdict("continue")
 

@@ -214,7 +214,9 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     4), then the ceiling exit that drops the fragment trail and keeps the stitched partial.
     Never appends an interim assistant row with NO visible content — strict providers
     reject it with 400 — only the nudge."""
-    from agent.conversation_loop import _get_continuation_prompt, _join_truncated_parts
+    from agent.conversation_loop import (
+        _get_continuation_prompt, _join_truncated_parts, _length_continuation_worthwhile,
+    )
 
     agent = st.agent
     messages = st.messages
@@ -230,7 +232,9 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         append_message(messages, interim_msg)
         st.truncated_response_parts.append(_interim_content)
 
-    if n < 4:
+    # idcsre patch: a reasoning-only truncation is not continued at all (see
+    # _length_continuation_worthwhile); the ceiling exit below keeps whatever is stitched so far.
+    if n < 4 and _length_continuation_worthwhile(assistant_message, st.truncated_response_parts):
         _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
