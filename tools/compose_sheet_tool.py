@@ -22,7 +22,7 @@ from tools.registry import registry
 
 DEFAULT_KB_ROOT = "/opt/data/kb/canway-it-support"
 DEFAULT_SCRIPT = "/opt/data/skills/canway-it-support-kb/scripts/compose_from_doc.py"
-MAX_STEPS = 8
+MAX_STEPS = 40
 TIMEOUT_SECONDS = 180
 
 
@@ -87,7 +87,7 @@ COMPOSE_SHEET_SCHEMA = {
             "doc": {"type": "string", "description": "Document path relative to the knowledge base root (must end with .md)"},
             "os": {"type": "string", "enum": ["windows", "mac"], "description": "Keep only this OS's chapter plus common sections"},
             "section": {"type": "string", "description": "Keep only chapters whose heading contains this keyword"},
-            "max": {"type": "integer", "minimum": 1, "maximum": MAX_STEPS, "description": f"Maximum steps on the sheet (default {MAX_STEPS})"},
+            "max": {"type": "integer", "minimum": 1, "maximum": MAX_STEPS, "description": f"Maximum images per sheet (default {MAX_STEPS}; a document's screenshots normally all fit on one sheet)"},
         },
         "required": ["doc"],
     },
