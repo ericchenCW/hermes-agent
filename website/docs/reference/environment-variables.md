@@ -453,6 +453,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `WECOM_WEBSOCKET_URL` | Custom WebSocket URL (default: `wss://openws.work.weixin.qq.com`) |
 | `WECOM_ALLOWED_USERS` | Comma-separated WeCom user IDs allowed to message the bot |
 | `WECOM_HOME_CHANNEL` | WeCom chat ID for cron delivery and notifications |
+| `WECOM_BUTTONS` | Enable the `BUTTONS[title]: a \| b` option-card feature (`1`/`true`/`on`; default off — the directive line is stripped and no card is sent) |
 | `WECOM_CALLBACK_CORP_ID` | WeCom enterprise Corp ID for callback self-built app |
 | `WECOM_CALLBACK_CORP_SECRET` | Corp secret for the self-built app |
 | `WECOM_CALLBACK_AGENT_ID` | Agent ID of the self-built app |

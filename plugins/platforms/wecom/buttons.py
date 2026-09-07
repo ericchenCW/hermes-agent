@@ -19,12 +19,18 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.platforms.event import MessageEvent, MessageType
+from utils import env_bool
 from plugins.platforms.wecom.media import APP_CMD_SEND
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
 
 APP_CMD_RESPONSE_UPDATE = "aibot_respond_update_msg"   # update_template_card (event req_id, <5s)
 
+# ``WECOM_BUTTONS`` gates the whole feature (default OFF: model instruction following is not
+# reliable enough yet).  When off nothing is parsed into a card and none is sent; a directive line
+# the model still emitted is stripped from the visible text so it never reaches the user.
+BUTTONS_ENABLED = env_bool("WECOM_BUTTONS", False)
+_BUTTONS_DISABLED_LOGGED = False
 BUTTON_DIRECTIVE_RE = re.compile(
     r"^[ \t]*(?:\*\*)?BUTTONS(?:\[(?P<title>[^\]\n]{1,60})\])?(?:\*\*)?[：:][ \t]*(?P<opts>[^\n]+?)[ \t]*$",
     re.M | re.I,
@@ -53,7 +59,24 @@ class WeComButtonsMixin:
 
         Only the *last* non-blank line counts, and not when it sits inside an open triple-backtick
         fence (the skill docs quote the syntax verbatim).
-        Returns (clean_text, spec) where spec = {"title", "options"} or None."""
+        Returns (clean_text, spec) where spec = {"title", "options"} or None.
+
+        With ``WECOM_BUTTONS`` off (the default) the directive is still parsed out of the text — so
+        the raw line never shows up in the bubble — but no spec is returned, so no card is built or
+        sent.  A directive-only reply degrades to its title as plain text."""
+        clean, spec = WeComButtonsMixin._parse_button_directive(text)
+        if spec and not BUTTONS_ENABLED:
+            global _BUTTONS_DISABLED_LOGGED
+            if not _BUTTONS_DISABLED_LOGGED:
+                _BUTTONS_DISABLED_LOGGED = True
+                logger.info("[wecom] buttons disabled, stripped BUTTONS directive from reply (WECOM_BUTTONS=0)")
+            return (clean or spec["title"]), None
+        return clean, spec
+
+    @staticmethod
+    def _parse_button_directive(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Parsing half of :meth:`_extract_button_directive`, always active so intermediate stream
+        frames hide the directive even when the feature is off."""
         if not text or "BUTTONS" not in text.upper():
             return text, None
         # The directive is meant to be the last line, but the model often appends a "来源：..."
@@ -93,7 +116,7 @@ class WeComButtonsMixin:
         stripped = text.rstrip()
         if m := BUTTON_PARTIAL_LINE_RE.search(stripped):
             return stripped[: m.start()].rstrip()
-        clean, spec = WeComButtonsMixin._extract_button_directive(stripped)
+        clean, spec = WeComButtonsMixin._parse_button_directive(stripped)
         return clean if spec else text
 
     def _sweep_button_cards(self) -> None:
