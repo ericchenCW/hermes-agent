@@ -285,6 +285,7 @@ Inbound messages are deduplicated using message IDs with a 5-minute window and a
 | `WECOM_WEBSOCKET_URL` | — | `wss://openws.work.weixin.qq.com` | WebSocket gateway URL |
 | `WECOM_DM_POLICY` | — | `open` | DM access policy |
 | `WECOM_GROUP_POLICY` | — | `open` | Group access policy |
+| `WECOM_BUTTONS` | — | `0` (off) | Enable the `BUTTONS[title]: a \| b` option-card feature (`1`/`true`/`on`). When off the directive line is stripped from the reply and no card is sent |
 
 ## Troubleshooting
 

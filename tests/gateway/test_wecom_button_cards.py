@@ -6,6 +6,8 @@ import tempfile
 
 os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp())
 os.environ["WECOM_ALLOW_ALL_USERS"] = "true"
+# the feature ships OFF (WECOM_BUTTONS); the rest of this file is the enabled-mode regression
+os.environ["WECOM_BUTTONS"] = "1"
 
 from gateway.config import PlatformConfig
 import plugins.platforms.wecom.adapter as m
@@ -282,3 +284,42 @@ def test_send_embeds_card_in_finish_frame_or_sends_proactively():
         assert sent[-1][2]["msgtype"] == "stream" and "template_card" not in sent[-1][2]
 
     asyncio.run(run())
+
+
+def test_buttons_disabled_strips_directive_and_sends_no_card():
+    """``WECOM_BUTTONS`` off (the default): nothing is parsed into a card and the
+    directive line is removed from whatever we do send."""
+    ad = _adapter()
+    sent = _wire(ad)
+    assert m.BUTTONS_ENABLED is True  # enabled by the env set at import time
+    m.BUTTONS_ENABLED = False
+    try:
+        # parse returns no spec, and the line is gone from the text
+        assert ad._extract_button_directive("先选一下城市：\nBUTTONS[请选择所在城市]: 广州 | 深圳") == ("先选一下城市：", None)
+        # footer after the directive is kept, directive dropped
+        assert ad._extract_button_directive("先确认：\nBUTTONS[x]: a | b\n来源：y") == ("先确认：\n来源：y", None)
+        # directive-only reply degrades to its title as plain text
+        assert ad._extract_button_directive("BUTTONS[要继续吗]: 是 | 否") == ("要继续吗", None)
+        # non-directive text untouched
+        assert ad._extract_button_directive("正文里提到 buttons 但没有指令") == ("正文里提到 buttons 但没有指令", None)
+        # intermediate stream frames still hide the (possibly partial) line
+        assert ad._strip_partial_button_line("正文\nBUTTONS[请选") == "正文"
+        assert ad._strip_partial_button_line("正文\nBUTTONS[t]: a | b\n来源：x") == "正文\n来源：x"
+
+        async def run():
+            ad._last_chat_req_ids["user1"] = "req-1"
+            r = await ad.send("user1", "先选城市：\nBUTTONS[请选择城市]: 广州 | 深圳")
+            assert r.success
+            # exactly one frame, markdown only — no template_card at all
+            assert [(x[0], x[-1]["msgtype"]) for x in sent] == [("reply", "markdown")]
+            assert sent[0][-1]["markdown"]["content"] == "先选城市："
+            assert not ad._pending_button_cards
+            # directive-only DM: the title goes out as plain text, still no card
+            sent.clear()
+            assert (await ad.send("user2", "BUTTONS[要继续吗]: 是 | 否")).success
+            assert [x[0] for x in sent] == ["send"]
+            assert sent[0][2]["msgtype"] == "markdown" and sent[0][2]["markdown"]["content"] == "要继续吗"
+
+        asyncio.run(run())
+    finally:
+        m.BUTTONS_ENABLED = True
