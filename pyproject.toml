@@ -235,6 +235,13 @@ wake = [
   "ai-edge-litert==2.1.6; platform_system == 'Darwin'",
 ]
 honcho = ["honcho-ai==2.2.0"]
+# Holographic memory provider (plugins/memory/holographic) — the HRR encoder
+# in holographic.py needs numpy for the vector path; without it MemoryStore
+# falls back to FTS5 + Jaccard only (`_hrr_available` stays False). numpy is
+# a wheel-only install on every target we ship (incl. linux/arm64), so it is
+# safe to eager-install in the Docker image. Pin kept in lockstep with the
+# [voice]/[wake] extras so uv resolves a single numpy.
+memory-holographic = ["numpy==2.4.3"]
 # Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
 # (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
 # LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
