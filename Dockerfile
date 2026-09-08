@@ -261,10 +261,17 @@ RUN cd plugins/platforms/photon/sidecar && \
 # avoids the cross-platform failures that kept [matrix] out of [all]
 # while still making Matrix work in the published container. Fixes #30399.
 #
+# The holographic memory provider ([memory-holographic] = numpy) is baked in
+# because it is the default memory provider for hosted bots. Without numpy the
+# HRR encoder in plugins/memory/holographic/holographic.py is unavailable
+# (`MemoryStore._hrr_available` stays False) and recall silently degrades to
+# FTS5 + Jaccard only. numpy ships manylinux/musllinux wheels for both amd64
+# and arm64, so this adds no source build to the image.
+#
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra memory-holographic
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
