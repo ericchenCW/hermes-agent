@@ -6142,7 +6142,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        # Set by the transport-level fast-fail paths inside ``_call``
+        # that *return* an error payload instead of raising.  The
+        # result-JSON sniff that used to notice them is gone (business-
+        # level "error" payloads must not count), so they now flag
+        # themselves explicitly.
+        transport_failed = {"hit": False}
+
         async def _call():
+            transport_failed["hit"] = False
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
                 server, server_name, f"tools/call {tool_name}"
@@ -6168,9 +6176,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # Dead children but stale server.session, so the
                         # transport-down path above never fired — signal the
                         # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
+                        # reconnecting error.  This is a transport-level
+                        # failure that returns rather than raises, so it
+                        # flags itself for the breaker bookkeeping below.
+                        transport_failed["hit"] = True
                         if _signal_reconnect(server):
                             return tool_error(
                                 f"MCP server '{server_name}' stdio subprocess is "
@@ -6372,15 +6381,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # The RPC round-trip completed, so the *transport* is healthy —
+            # that is the only thing this breaker is allowed to judge.
+            #
+            # It used to bump the breaker whenever the result JSON carried
+            # an "error" key, which conflated tool-level rejections with
+            # transport failure: three business-level refusals in a row
+            # (e.g. "draft find is not unique") tripped the breaker and
+            # locked out every *other* tool on the same server for the
+            # 60 s cooldown.  Tool-level ``isError`` results (rendered by
+            # ``tool_error`` above, hence the "error" key) and any "error"
+            # field a server chooses to put in its payload are application
+            # data, not connectivity signals, so they never count.  Only
+            # the exception paths below — HTTP non-2xx, connection
+            # failures, timeouts, JSON-RPC protocol errors — do.
+            if transport_failed["hit"]:
+                _bump_server_error(server_name)
+            else:
+                _reset_server_error(server_name)  # successful round-trip
             return result
         except InterruptedError:
             return _interrupted_call_result()

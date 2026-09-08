@@ -56,9 +56,44 @@ intentional, bounded construct.
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 __all__ = ["StreamingThinkScrubber"]
+
+# Safety bound for an *unterminated* block (qwen3.6 gateway regression).
+#
+# When a provider emits a stray ``<think>`` marker on the content channel
+# whose ``</think>`` never arrives (qwen3.6 streams its reasoning on the
+# separate ``reasoning_content`` channel and only leaks the opening tag
+# into ``content``), the scrubber used to stay ``_in_block`` for the rest
+# of the stream and swallow the entire visible answer: the gateway saw
+# thinking.delta frames and message.complete, but not a single
+# message.delta.
+#
+# Two guards now bound that failure:
+#   * ``flush()`` surfaces the swallowed text when nothing else was ever
+#     emitted (see ``flush``), and
+#   * once more than this many characters have accumulated inside a
+#     single unterminated block, the open tag is retroactively treated as
+#     a misdetection: the block is closed and subsequent deltas flow again.
+#
+# The default is deliberately generous.  A genuine reasoning block longer
+# than 64k characters (~16k tokens in one uninterrupted block) is not
+# something the models routed through this code path produce, whereas an
+# answer swallowed for 64k characters is a total loss.  Tune with
+# ``HERMES_THINK_BLOCK_MAX_CHARS`` (<= 0 disables the guard).
+_DEFAULT_MAX_BLOCK_CHARS = 64000
+
+
+def _env_max_block_chars() -> int:
+    raw = os.environ.get("HERMES_THINK_BLOCK_MAX_CHARS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_BLOCK_CHARS
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_BLOCK_CHARS
 
 
 class StreamingThinkScrubber:
@@ -92,16 +127,27 @@ class StreamingThinkScrubber:
     # Pre-compute the longest tag (for partial-tag hold-back bound).
     _MAX_TAG_LEN: int = max(len(tag) for tag in _OPEN_TAGS + _CLOSE_TAGS)
 
-    def __init__(self) -> None:
+    def __init__(self, max_block_chars: "int | None" = None) -> None:
         self._in_block: bool = False
         self._buf: str = ""
         self._last_emitted_ended_newline: bool = True
+        # Text discarded inside the *current* unterminated block.  Kept so
+        # flush() can surface it when it turns out to have been the answer.
+        self._block_text: str = ""
+        # True once any visible character has been emitted in this stream.
+        self._emitted_any_visible: bool = False
+        self._max_block_chars: int = (
+            _env_max_block_chars() if max_block_chars is None
+            else int(max_block_chars)
+        )
 
     def reset(self) -> None:
         """Reset all state.  Call at the top of every new turn."""
         self._in_block = False
         self._buf = ""
         self._last_emitted_ended_newline = True
+        self._block_text = ""
+        self._emitted_any_visible = False
 
     def feed(self, text: str) -> str:
         """Feed one delta; return the scrubbed visible portion.
@@ -124,11 +170,20 @@ class StreamingThinkScrubber:
                 )
                 if close_idx == -1:
                     # No close yet — hold back a potential partial
-                    # close-tag prefix; discard everything else.
+                    # close-tag prefix; stash everything else (it is
+                    # discarded for now, but flush() may need it).
                     held = self._max_partial_suffix(buf, self._CLOSE_TAGS)
+                    swallowed = buf[:len(buf) - held] if held else buf
+                    self._block_text += swallowed
                     self._buf = buf[-held:] if held else ""
-                    return "".join(out)
+                    if self._block_overflowed():
+                        # Retroactive misdetection: the "block" has eaten
+                        # more than a plausible reasoning trace.  Close it
+                        # so subsequent deltas reach the consumer again.
+                        self._exit_block_on_overflow()
+                    return self._emit(out)
                 # Found close: discard block content + tag, continue.
+                self._block_text = ""
                 buf = buf[close_idx + close_len:]
                 self._in_block = False
             else:
@@ -173,6 +228,7 @@ class StreamingThinkScrubber:
                                 preceding.endswith("\n")
                             )
                     self._in_block = True
+                    self._block_text = ""
                     buf = buf[open_idx + open_len:]
                     continue
 
@@ -197,17 +253,35 @@ class StreamingThinkScrubber:
                         self._last_emitted_ended_newline = (
                             emit_text.endswith("\n")
                         )
-                return "".join(out)
+                return self._emit(out)
 
-        return "".join(out)
+        return self._emit(out)
 
     def flush(self) -> str:
         """End-of-stream flush.
 
-        If still inside an unterminated block, held-back content is
-        discarded — leaking partial reasoning is worse than a
-        truncated answer.  Otherwise the held-back partial-tag tail is
-        emitted verbatim (it turned out not to be a real tag prefix).
+        If still inside an unterminated block the decision depends on
+        whether the consumer already received anything visible:
+
+        * **Something was emitted** — the user already has an answer, so
+          the trailing unterminated block is almost certainly real
+          reasoning that the stream cut short.  Drop it: leaking partial
+          reasoning is worse than a truncated tail.
+        * **Nothing was emitted at all** — the alternative to surfacing
+          the swallowed text is an empty reply, which is always broken.
+          A whole stream that produced zero visible characters is the
+          signature of a stray, never-closed ``<think>`` marker on the
+          content channel (qwen3.6 through the gateway: thinking.delta
+          frames arrive, message.delta never does), so the stashed text
+          is emitted rather than lost.
+
+        The scrubber cannot tell reasoning from prose *inside* an
+        unterminated block — once the close tag never arrives there is
+        no in-band signal left — so "did this stream produce any visible
+        output at all" is the discriminator used instead.
+
+        Otherwise the held-back partial-tag tail is emitted verbatim (it
+        turned out not to be a real tag prefix).
 
         Always treats the next ``feed()`` as a fresh stream boundary.
         Intra-turn retries (thinking-only prefill, empty-response
@@ -217,22 +291,55 @@ class StreamingThinkScrubber:
         visible reply.
         """
         if self._in_block:
+            rescued = "" if self._emitted_any_visible else self._block_text
             self._buf = ""
+            self._block_text = ""
             self._in_block = False
             # Next feed() is a new stream — start-of-stream is a boundary.
             self._last_emitted_ended_newline = True
-            return ""
+            self._emitted_any_visible = False
+            if not rescued:
+                return ""
+            return self._strip_orphan_close_tags(rescued).lstrip("\n")
         tail = self._buf
         self._buf = ""
         # Same for the non-block path: do NOT derive the boundary flag
         # from the flushed tail (e.g. a held-back '<').  End-of-stream
         # means the next feed() starts a new model response.
         self._last_emitted_ended_newline = True
+        self._emitted_any_visible = False
         if not tail:
             return ""
         return self._strip_orphan_close_tags(tail)
 
     # ── internal helpers ───────────────────────────────────────────────
+
+    def _emit(self, out: list) -> str:
+        """Join *out*, recording whether anything visible was emitted."""
+        text = "".join(out)
+        if text:
+            self._emitted_any_visible = True
+        return text
+
+    def _block_overflowed(self) -> bool:
+        return (
+            self._max_block_chars > 0
+            and len(self._block_text) > self._max_block_chars
+        )
+
+    def _exit_block_on_overflow(self) -> None:
+        """Treat the current unterminated block as a misdetection.
+
+        The stashed block text stays discarded (emitting a 64k tail of
+        possible reasoning is the worse failure); only *subsequent*
+        deltas are released.
+        """
+        self._in_block = False
+        self._block_text = ""
+        # Whatever follows starts a fresh line as far as boundary gating
+        # is concerned — a leading '<think>' right after the release must
+        # still be recognised as an opener.
+        self._last_emitted_ended_newline = True
 
     @staticmethod
     def _find_first_tag(

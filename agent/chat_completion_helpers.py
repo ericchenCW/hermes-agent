@@ -4158,13 +4158,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
                 return
-            if agent.stream_delta_callback:
-                for text in pending_parts:
-                    try:
-                        agent.stream_delta_callback(text)
-                        agent._record_streamed_assistant_text(text)
-                    except Exception:
-                        pass
+            # Tool calls suppress *display* of preamble text, but the text
+            # must still travel the normal delta path so every registered
+            # consumer sees it (see the tool-call branch below for the
+            # full rationale).
+            for text in pending_parts:
+                _fire_first_delta()
+                agent._fire_stream_delta(text)
 
         _diag_last_chunks = []
         for chunk in _iter_provider_stream_chunks(
@@ -4311,16 +4311,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning box only appears as a post-response fallback,
                 # rendering it confusingly after the already-streamed
                 # response.  Route suppressed content through the stream
-                # delta callback so its tag extraction can fire the
-                # reasoning display.  Non-reasoning text is harmlessly
-                # suppressed by the CLI's _stream_delta when the stream
-                # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
-                    except Exception:
-                        pass
+                # delta path so its tag extraction can fire the reasoning
+                # display.  Non-reasoning text is harmlessly suppressed by
+                # the CLI's _stream_delta when the stream box is already
+                # closed (tool boundary flush).
+                #
+                # This must go through ``_fire_stream_delta``, not
+                # ``stream_delta_callback`` directly: the direct call only
+                # reached the CLI callback and skipped ``_stream_callback``
+                # (the gateway's message.delta source), the think/context
+                # scrubbers and the plugin stream hooks.  Once a response
+                # had emitted any tool_calls delta, the gateway therefore
+                # saw no message.delta at all for the rest of that
+                # response.  ``_fire_stream_delta`` fires each registered
+                # callback exactly once and records the text itself, so
+                # there is no double-send.
+                else:
+                    _fire_first_delta()
+                    agent._fire_stream_delta(delta_content)
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)
