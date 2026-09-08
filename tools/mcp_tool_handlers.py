@@ -99,8 +99,18 @@ def _result_is_error(result) -> bool:
 
 
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike."""
-    (_core._bump_server_error if _result_is_error(result) else _core._reset_server_error)(server_name)
+    """Breaker bookkeeping for a completed RPC round-trip: always a reset.
+
+    idcsre patch: this used to strike the breaker whenever the result JSON carried an ``error``
+    key, conflating tool-level rejections with transport failure — three business-level refusals
+    in a row (e.g. "draft find is not unique") tripped the breaker and locked out every *other*
+    tool on the same server for the cooldown.  Tool-level ``isError`` results (rendered through
+    ``tool_error``, hence the "error" key) and any ``error`` field a server puts in its payload
+    are application data, not connectivity signals.  Only the exception paths — HTTP non-2xx,
+    connection failures, timeouts, JSON-RPC protocol errors, a dead stdio child — count, and they
+    strike explicitly via ``_strike`` / ``_acquire_call_server``.
+    """
+    _core._reset_server_error(server_name)
     return result
 
 

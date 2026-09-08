@@ -2614,12 +2614,21 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._fire_tool_gen_started(name)
 
     def _route_suppressed_text(self, text: str) -> None:
-        """Tool-call turns suppress content streaming (no chatty preamble), but
-        reasoning tags inside it must still reach the display: route through
-        the delta callback for tag extraction (the CLI drops non-reasoning text
-        once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+        """Tool-call turns suppress content *display* (no chatty preamble), but the text must still
+        travel the normal delta path so every registered consumer sees it — reasoning tags inside it
+        have to reach the display (the CLI drops non-reasoning text once the stream box is closed).
+
+        idcsre patch: this goes through ``_fire_stream_delta``, not ``stream_delta_callback``
+        directly.  The direct call reached only the CLI callback and skipped ``_stream_callback``
+        (the gateway's ``message.delta`` source), the think/context scrubbers and the plugin stream
+        hooks, so once a response had emitted any tool_calls delta the gateway saw no message.delta
+        at all for the rest of it (qwen3.6 through the gateway: thinking.delta frames plus
+        message.complete, zero message.delta).  ``_fire_stream_delta`` fires each registered
+        callback exactly once and records the text itself, so there is no double-send.
+        ``deltas_were_sent`` stays untouched: this is suppressed preamble, not a displayed answer.
+        """
+        self._fire_first_delta()
+        self.agent._fire_stream_delta(text)
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
