@@ -41,6 +41,7 @@ from plugins.platforms.wecom.buttons import (
     BUTTON_DIRECTIVE_RE, BUTTON_PARTIAL_LINE_RE, BUTTON_TRAILING_LINES, BUTTON_CARD_ACTION_URL,
     BUTTON_STYLE, BUTTON_SHORT_WIDTH, BUTTONS_ENABLED,
 )
+from plugins.platforms.wecom.iac_approval import WeComIaCApprovalMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
@@ -118,7 +119,7 @@ def _bounded_put(store: Dict[str, str], key: str, value: str) -> bool:
     return True
 
 
-class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSendQueueMixin, BasePlatformAdapter):
+class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, WeComIaCApprovalMixin, ChatSendQueueMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -256,6 +257,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+        await self._close_iac_client()
 
     async def _open_connection(self) -> None:
         await self._cleanup_ws()

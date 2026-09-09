@@ -1,6 +1,6 @@
 ---
 title: "Gateway Control Verbs"
-description: "The gateway control socket's action verbs — platform_send for outbound text and interactive cards."
+description: "The gateway control socket's action verbs — platform_send (text and interactive cards) and the WeCom IaC approval callback."
 ---
 
 # Gateway Control Verbs
@@ -87,3 +87,48 @@ sending `text` as an ordinary message.
 Exactly one INFO line per call, carrying platform, chat id, text **length**,
 chat type, button **count**, request id and outcome. Never the message body and
 never a button key — keys are one-time approval capabilities.
+
+## WeCom IaC approval callback
+
+A click on a card button arrives as a `template_card_event`. Keys prefixed
+`iac:` are routed to the IaC approval path instead of the ordinary button-card
+registry; every other key keeps its existing behaviour.
+
+Key shape: `iac:<approvalId>:<nonce>:<approve|reject>` — four segments, with
+`approvalId`/`nonce` restricted to `[A-Za-z0-9_-]`.
+
+The adapter then:
+
+1. **Refuses group clicks locally.** If the event says `chattype == "group"` (or
+   the chat is a known group), the card is rewritten to “请在私聊处理” and the
+   Haro API is never called.
+2. **Asks Haro to decide.**
+   `POST $HARO_API_URL/api/assistant/runtime-api/iac/approvals/<approvalId>/decide`
+   with `Authorization: Bearer $HARO_RUNTIME_TOKEN` and
+
+   ```json
+   {"decision": "approve", "wecomUserId": "ericyu", "nonce": "<nonce>",
+    "key": "iac:ap-42:<nonce>:approve", "msgid": "…", "taskId": "…",
+    "chatType": "single"}
+   ```
+
+   Haro validates the nonce and cross-checks `key` against the URL and
+   `decision`. The HTTP budget is 4 s of the 5 s WeCom allows for the
+   acknowledgement.
+3. **Rewrites the card within 5 s.** Both `200` and `4xx` answers carry a
+   `cardText`, which becomes a `text_notice` card (with the mandatory
+   `card_action`). A Haro timeout, `5xx` or unreachable host rewrites the card to
+   “处理超时，请稍后在 Haro 查看” and logs a WARN.
+
+### Environment
+
+| Variable | Purpose |
+| --- | --- |
+| `HARO_API_URL` | Base URL of the Haro runtime API. Without it the click is answered with “审批服务未配置，请在 Haro 处理”. |
+| `HARO_RUNTIME_TOKEN` | Bearer token for the runtime API. |
+| `WECOM_CARD_ACTION_URL` | Fallback `card_action` URL when the card carried no `url`. |
+
+### Logging
+
+Keys are redacted to `iac:<approvalId>:***:<decision>` wherever they appear; the
+nonce is never logged and never shown to the user.

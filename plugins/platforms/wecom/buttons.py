@@ -318,6 +318,16 @@ class WeComButtonsMixin:
         task_id = str(detail.get("task_id") or "").strip()
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
+        # idcsre patch: IaC approval keys are decided by Haro, not by this
+        # adapter's in-process registry — route them out before anything here
+        # touches _pending_button_cards.
+        from plugins.platforms.wecom.iac_approval import IAC_KEY_PREFIX
+        if event_key.startswith(IAC_KEY_PREFIX):
+            await self._on_iac_approval_click(
+                payload, event_key=event_key, req_id=req_id, task_id=task_id,
+                sender_id=sender_id, body=body,
+            )
+            return
         self._sweep_button_cards()
         pending = self._pending_button_cards.get(task_id) or {}
         chat_id = str(pending.get("chat_id") or body.get("chatid") or sender_id).strip()
