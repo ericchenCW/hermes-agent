@@ -4413,8 +4413,9 @@ class TestRunConversation:
         assert "output tokens" in result["error"].lower()
         # Should have a user-friendly response (not None)
         assert result["final_response"] is not None
-        assert "Thinking Budget Exhausted" in result["final_response"]
-        assert "/thinkon" in result["final_response"]
+        # Fork: operator-facing text is Chinese (English detail stays in "error").
+        assert "全部被模型的思考过程用完" in result["final_response"]
+        assert "调低思考预算" in result["final_response"]
 
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
@@ -4437,7 +4438,8 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert "输出长度上限" in result["error"]
+        assert "truncated due to output length limit" in result["error_detail"]
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_call_retries_once_before_refusing(self, agent):

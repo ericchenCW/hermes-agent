@@ -1304,6 +1304,202 @@ def _length_continuation_output_cap(default: int = 32768) -> int:
     return max(1024, value)
 
 
+# Ceiling on continuation REQUESTS issued for one length-truncated turn.
+# Was a bare literal 4 in three places (bound check, progress text, and the
+# give-up message), compared against a counter that advanced on every
+# truncation rather than on every continuation — so a turn that issued three
+# continuations, or zero, both reported "after 4 continuation attempts"
+# (spark incident 2026-09-09).  The counter now advances only when a
+# continuation is actually sent, and this constant is the number of such
+# sends, which keeps the per-turn request count identical to before.
+LENGTH_CONTINUATION_MAX_ATTEMPTS = 3
+
+
+# Ceiling on whole-turn replays when the model truncated mid tool-call.
+# Separate from the text-continuation ceiling above: that counter now counts
+# continuation REQUESTS, this one always counted replays, so they are not
+# interchangeable numbers.
+TRUNCATED_TOOL_CALL_MAX_RETRIES = 4
+
+
+def _length_continuation_max_attempts(
+    default: int = LENGTH_CONTINUATION_MAX_ATTEMPTS,
+) -> int:
+    """Continuation attempt ceiling, overridable per deployment."""
+    raw = os.environ.get("HERMES_LENGTH_CONTINUATION_ATTEMPTS", "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(0, value)
+
+
+def _reasoning_tokens_from_usage(response) -> int:
+    """``usage.completion_tokens_details.reasoning_tokens``, or 0.
+
+    vLLM (``--reasoning-parser qwen3``), DeepSeek and OpenAI-compatible
+    relays all report the reasoning share of the output budget here, and it
+    is the only exhaustion signal that survives when the provider returns
+    ``content: null`` with no reasoning text echoed back.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("completion_tokens_details")
+    if details is None:
+        return 0
+    value = (
+        details.get("reasoning_tokens")
+        if isinstance(details, dict)
+        else getattr(details, "reasoning_tokens", None)
+    )
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_reasoning_text(response, assistant_message=None) -> str:
+    """Reasoning text carried by either the raw response or the normalized message.
+
+    Providers that put thinking in a SIDE CHANNEL rather than in ``<think>``
+    tags use one of three field names: ``reasoning_content`` (vLLM, DeepSeek,
+    Moonshot), ``reasoning`` (OpenRouter, bifrost) or ``reasoning_details``
+    (OpenRouter structured form).
+    """
+    candidates = []
+    for holder in (assistant_message, response):
+        if holder is None:
+            continue
+        candidates.append(holder)
+        choices = getattr(holder, "choices", None)
+        if choices:
+            try:
+                message = getattr(choices[0], "message", None)
+            except (IndexError, TypeError):
+                message = None
+            if message is not None:
+                candidates.append(message)
+    for holder in candidates:
+        for attr in ("reasoning_content", "reasoning", "reasoning_details"):
+            value = getattr(holder, attr, None)
+            if value is None and isinstance(holder, dict):
+                value = holder.get(attr)
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, (list, tuple)) and value:
+                return str(value)
+    return ""
+
+
+def _thinking_exhausted_signal(
+    *,
+    has_tool_calls: bool,
+    content,
+    has_think_tags: bool,
+    has_content_after_think,
+    reasoning_text: str,
+    reasoning_tokens: int,
+) -> bool:
+    """True when the whole output budget went to hidden reasoning.
+
+    The original check only recognised inline ``<think>`` tags, so a vLLM
+    server started with ``--reasoning-parser qwen3`` — which strips the tags
+    and returns the thinking in ``reasoning_content`` with ``content: null``
+    — fell through to the continuation path, which then refused to continue
+    (no visible content) and reported a fabricated "after 4 continuation
+    attempts".  Side-channel reasoning fields and the usage counter are now
+    first-class evidence.
+    """
+    if has_tool_calls:
+        return False
+    visible = str(content).strip() if isinstance(content, str) else ""
+    if has_think_tags:
+        if content is not None and has_content_after_think(content):
+            return False
+        return True
+    if visible:
+        return False
+    return bool(reasoning_text) or reasoning_tokens > 0
+
+
+def _thinking_exhausted_message(max_tokens: Optional[int]) -> str:
+    budget = f"{max_tokens} tokens" if max_tokens else "本轮的输出上限"
+    return (
+        f"⚠️ 本轮输出预算（{budget}）全部被模型的思考过程用完，没有生成正文。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试，或由管理员调低思考预算。"
+    )
+
+
+def _length_giveup_message(attempts: int, max_attempts: int) -> str:
+    if attempts <= 0:
+        head = "⚠️ 本轮输出过长且无法续写。"
+    else:
+        head = f"⚠️ 已尝试续写 {attempts} 次仍未完成（上限 {max_attempts} 次）。"
+    return (
+        f"{head}"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试。"
+    )
+
+
+def _repetition_abort_message() -> str:
+    return (
+        "⚠️ 模型输出陷入重复，已中止；请换个问法或把任务拆小。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+    )
+
+
+def _truncated_tool_call_message(stub_stall: bool) -> str:
+    if stub_stall:
+        return (
+            "⚠️ 与模型的连接在生成工具调用时反复中断，工具没有被执行。"
+            "本轮没有写入任何内容，已保存的草稿不受影响，请重试。"
+        )
+    return (
+        "⚠️ 模型生成的工具调用参数超出输出长度上限，参数不完整，已拒绝执行。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试。"
+    )
+
+
+def log_length_truncation(
+    *,
+    session_id,
+    usage,
+    reasoning_tokens,
+    has_content,
+    has_tool_calls,
+    attempt,
+    max_attempts,
+    action,
+) -> None:
+    """One WARNING line per decision on the finish_reason=length path.
+
+    The whole truncation / continuation / give-up chain used to be silent,
+    so a production incident could only be reconstructed from the gateway's
+    own request log.  ``action`` is one of ``truncated``,
+    ``thinking_exhausted``, ``repetition_abort``, ``continue``, ``give_up``
+    or ``give_up_tool_call``.
+    """
+    logger.warning(
+        "session=%s finish_reason=length prompt=%s completion=%s reasoning=%s "
+        "has_content=%s has_tool_calls=%s attempt=%s/%s action=%s",
+        session_id,
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+        reasoning_tokens,
+        has_content,
+        has_tool_calls,
+        attempt,
+        max_attempts,
+        action,
+    )
+
+
 def _length_continuation_worthwhile(assistant_message, truncated_response_parts) -> bool:
     """Only continue a length-truncated turn that produced visible text.
 
@@ -3916,14 +4112,79 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
-                    _thinking_exhausted = (
-                        not _trunc_has_tool_calls
-                        and _has_think_tags
-                        and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
-                        )
+                    # Side-channel reasoning (vLLM --reasoning-parser qwen3,
+                    # DeepSeek, OpenRouter) never produces <think> tags, so
+                    # the tag test alone missed the most common exhaustion
+                    # shape in production.
+                    _trunc_reasoning_text = _response_reasoning_text(response, _trunc_msg)
+                    _trunc_reasoning_tokens = _reasoning_tokens_from_usage(response)
+                    _thinking_exhausted = _thinking_exhausted_signal(
+                        has_tool_calls=_trunc_has_tool_calls,
+                        content=_trunc_content,
+                        has_think_tags=_has_think_tags,
+                        has_content_after_think=agent._has_content_after_think_block,
+                        reasoning_text=_trunc_reasoning_text,
+                        reasoning_tokens=_trunc_reasoning_tokens,
                     )
+
+                    # ── Truncation-path observability ──────────────────
+                    # This whole chain used to log NOTHING: diagnosing the
+                    # spark incident meant reading the gateway's sqlite
+                    # request log because Hermes never said a word about
+                    # finish_reason=length, continuations, or giving up.
+                    _length_max_attempts = _length_continuation_max_attempts()
+                    _length_usage = getattr(response, "usage", None)
+                    _repetition_aborted = bool(
+                        getattr(response, "_repetition_aborted", False)
+                    )
+
+                    def _log_length_event(action, attempt=None):
+                        log_length_truncation(
+                            session_id=getattr(agent, "session_id", None),
+                            usage=_length_usage,
+                            reasoning_tokens=_trunc_reasoning_tokens,
+                            has_content=bool(
+                                _trunc_content and str(_trunc_content).strip()
+                            ),
+                            has_tool_calls=_trunc_has_tool_calls,
+                            attempt=(
+                                length_continue_retries if attempt is None else attempt
+                            ),
+                            max_attempts=_length_max_attempts,
+                            action=action,
+                        )
+
+                    if _repetition_aborted:
+                        _log_length_event("repetition_abort")
+                    elif _thinking_exhausted:
+                        _log_length_event("thinking_exhausted")
+                    else:
+                        _log_length_event("truncated")
+
+                    # ── Streaming repetition abort ─────────────────────
+                    # The stream guard already cut the request short; the
+                    # partial output is a degenerate loop, so neither
+                    # continuing it nor keeping it is useful.
+                    if _repetition_aborted:
+                        agent._vprint(
+                            f"{agent.log_prefix}🔁 Aborted mid-stream — model output "
+                            f"entered a repetition loop.",
+                            force=True,
+                        )
+                        agent._cleanup_task_resources(effective_task_id)
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _repetition_abort_message(),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": (
+                                "Model output entered a repetition loop mid-stream; "
+                                "the request was aborted before the output budget "
+                                "was exhausted."
+                            ),
+                        }
 
                     if _thinking_exhausted:
                         _exhaust_error = (
@@ -3939,7 +4200,10 @@ def run_conversation(
                         # Return a user-friendly message as the response so
                         # CLI (response box) and gateway (chat message) both
                         # display it naturally instead of a suppressed error.
-                        _exhaust_response = t("gateway_runtime.agent.thinking_exhausted")
+                        _exhaust_response = _thinking_exhausted_message(
+                            getattr(_length_usage, "completion_tokens", None)
+                            or getattr(agent, "max_tokens", None)
+                        )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -4054,7 +4318,6 @@ def run_conversation(
                                 force=True,
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
-                            length_continue_retries += 1
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -4079,9 +4342,16 @@ def run_conversation(
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
-                            if length_continue_retries < 4 and _length_continuation_worthwhile(
+                            # The counter must only advance when a continuation
+                            # request is actually issued — it used to be
+                            # incremented unconditionally above, so a turn that
+                            # never continued still reported one attempt (and
+                            # the give-up text claimed four).
+                            if length_continue_retries < _length_max_attempts and _length_continuation_worthwhile(
                                 assistant_message, truncated_response_parts
                             ):
+                                length_continue_retries += 1
+                                _log_length_event("continue", attempt=length_continue_retries)
                                 _is_partial_stream_stub = (
                                     getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                                 )
@@ -4095,18 +4365,18 @@ def run_conversation(
                                         f"{agent.log_prefix}↻ Stream interrupted mid "
                                         f"tool-call ({_tool_list}) — requesting "
                                         f"chunked retry "
-                                        f"({length_continue_retries}/4)..."
+                                        f"({length_continue_retries}/{_length_max_attempts})..."
                                     )
                                 elif _is_partial_stream_stub:
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Stream interrupted — "
                                         f"requesting continuation "
-                                        f"({length_continue_retries}/4)..."
+                                        f"({length_continue_retries}/{_length_max_attempts})..."
                                     )
                                 else:
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Requesting continuation "
-                                        f"({length_continue_retries}/4)..."
+                                        f"({length_continue_retries}/{_length_max_attempts})..."
                                     )
 
                                 _continue_content = _get_continuation_prompt(
@@ -4122,12 +4392,24 @@ def run_conversation(
                                 _retry.restart_with_length_continuation = True
                                 break
 
+                            _log_length_event("give_up")
+                            _giveup_message = _length_giveup_message(
+                                length_continue_retries, _length_max_attempts
+                            )
                             partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
                             if partial_response:
                                 agent._vprint(
                                     f"{agent.log_prefix}⚠️  Response still truncated "
-                                    f"after 4 continuation attempts — keeping the "
-                                    f"partial response received so far.",
+                                    f"after {length_continue_retries} continuation "
+                                    f"attempt(s) — keeping the partial response "
+                                    f"received so far.",
+                                    force=True,
+                                )
+                            else:
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚠️  Response truncated and not "
+                                    f"continued ({length_continue_retries} continuation "
+                                    f"attempt(s) made) — giving up on this turn.",
                                     force=True,
                                 )
                             # Unanswered continue nudges made every later turn re-truncate.
@@ -4157,12 +4439,17 @@ def run_conversation(
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
-                                "final_response": partial_response or None,
+                                "final_response": partial_response or _giveup_message,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
+                                "error": _giveup_message,
+                                "error_detail": (
+                                    "Response remained truncated after "
+                                    f"{length_continue_retries} continuation attempt(s) "
+                                    f"(ceiling {_length_max_attempts})"
+                                ),
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -4171,7 +4458,8 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
-                            if truncated_tool_call_retries < 4:
+                            _tc_max_attempts = TRUNCATED_TOOL_CALL_MAX_RETRIES
+                            if truncated_tool_call_retries < _tc_max_attempts:
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
                                     # The stream broke mid tool-call (network /
@@ -4179,13 +4467,13 @@ def run_conversation(
                                     # cap — say so instead of "max output tokens".
                                     agent._buffer_vprint(
                                         f"⚠️  Stream interrupted mid tool-call — "
-                                        f"retrying ({truncated_tool_call_retries}/4)..."
+                                        f"retrying ({truncated_tool_call_retries}/{_tc_max_attempts})..."
                                     )
                                 else:
                                     agent._buffer_vprint(
                                         f"⚠️  Truncated tool call detected — "
                                         f"retrying API call "
-                                        f"({truncated_tool_call_retries}/4)..."
+                                        f"({truncated_tool_call_retries}/{_tc_max_attempts})..."
                                     )
                                 # Boost max_tokens on each retry so the model has
                                 # more room to complete the tool-call JSON. A
@@ -4215,7 +4503,12 @@ def run_conversation(
                                     force=True,
                                 )
                             agent._cleanup_task_resources(effective_task_id)
-                            _final_response = (
+                            _log_length_event(
+                                "give_up_tool_call",
+                                attempt=truncated_tool_call_retries,
+                            )
+                            _final_response = _truncated_tool_call_message(_is_stub_stall)
+                            _tc_error_detail = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
@@ -4233,6 +4526,7 @@ def run_conversation(
                                 "completed": False,
                                 "partial": True,
                                 "error": _final_response,
+                                "error_detail": _tc_error_detail,
                             }
 
                     # If we have prior messages, roll back to last complete state

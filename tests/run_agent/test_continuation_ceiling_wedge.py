@@ -83,7 +83,10 @@ class TestContinuationCeilingWedge:
         from tests.run_agent.test_run_agent import _mock_response
 
         result1 = self._exhaust_ceiling(loop_agent)
-        assert "truncated after 4 continuation attempts" in (result1.get("error") or "")
+        # Fork: the give-up notice is Chinese and reports the REAL number of
+        # continuation requests; the English wording moved to error_detail.
+        assert "已尝试续写 3 次" in (result1.get("error") or "")
+        assert "continuation attempt" in (result1.get("error_detail") or "")
         calls_after_turn1 = loop_agent.client.chat.completions.create.call_count
         assert calls_after_turn1 == 4
 
@@ -200,7 +203,8 @@ class TestContinuationCeilingWedge:
         ]
         result = _run(loop_agent, "another long report", history=reloaded_history)
 
-        assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+        assert "已尝试续写 3 次" in (result.get("error") or "")
+        assert "continuation attempt" in (result.get("error_detail") or "")
         prior = [
             m for m in result["messages"]
             if m.get("role") == "assistant"

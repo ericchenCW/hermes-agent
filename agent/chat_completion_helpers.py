@@ -44,6 +44,12 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.repetition_guard import (
+    STREAM_CHECK_INTERVAL as _REP_CHECK_INTERVAL,
+    STREAM_TAIL_WINDOW as _REP_TAIL_WINDOW,
+    stream_repetition_guard_enabled,
+    tail_repetition_detected,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -4025,6 +4031,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        # Streaming repetition guard state (SRE fork).  A degenerate
+        # reasoning loop otherwise burns the whole output budget (and
+        # minutes of wall clock) before the truncation handler ever runs.
+        _rep_guard_on = stream_repetition_guard_enabled()
+        _rep_guard_state = {
+            "aborted": False,
+            "kind": "",
+            "reasoning_chars": 0,
+            "content_chars": 0,
+        }
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -4166,6 +4182,57 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _fire_first_delta()
                 agent._fire_stream_delta(text)
 
+        def _rep_guard_tripped(kind: str, parts: list, delta_len: int) -> bool:
+            """True when the accumulated ``kind`` stream is looping verbatim.
+
+            Checked at most once per ``_REP_CHECK_INTERVAL`` accumulated
+            characters so the streaming hot path stays cheap.
+            """
+            if not _rep_guard_on:
+                return False
+            key = f"{kind}_chars"
+            pending = _rep_guard_state[key] + delta_len
+            if pending < _REP_CHECK_INTERVAL:
+                _rep_guard_state[key] = pending
+                return False
+            _rep_guard_state[key] = 0
+            try:
+                # Only the trailing window matters — walk back over the
+                # accumulated deltas instead of re-joining the whole stream
+                # (which would be quadratic over a long reasoning block).
+                tail_chunks: list[str] = []
+                tail_len = 0
+                for part in reversed(parts):
+                    tail_chunks.append(part)
+                    tail_len += len(part)
+                    if tail_len >= _REP_TAIL_WINDOW:
+                        break
+                tail_chunks.reverse()
+                if not tail_repetition_detected("".join(tail_chunks)):
+                    return False
+            except Exception:
+                return False
+            _rep_guard_state["aborted"] = True
+            _rep_guard_state["kind"] = kind
+            logger.warning(
+                "Repetition guard tripped on %s stream (session=%s model=%s); "
+                "aborting the request instead of burning the output budget. "
+                "Set HERMES_REPETITION_GUARD=0 to disable.",
+                kind,
+                getattr(agent, "session_id", None),
+                getattr(agent, "model", None),
+            )
+            try:
+                stream.close()
+            except Exception:
+                request_client = attempt_request_client["value"]
+                if request_client is not None:
+                    agent._abort_request_openai_client(
+                        request_client,
+                        reason="repetition_guard_stream_close_failed",
+                    )
+            return True
+
         _diag_last_chunks = []
         for chunk in _iter_provider_stream_chunks(
             stream,
@@ -4274,6 +4341,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
+                if _rep_guard_tripped("reasoning", reasoning_parts, len(reasoning_text)):
+                    break
 
             # Accumulate text content — fire callback only when no tool calls.
             # Some OpenAI-compatible providers emit a text delta as a list of
@@ -4282,6 +4351,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             delta_content = flatten_message_text(getattr(delta, "content", None), sep="")
             if delta_content:
                 content_parts.append(delta_content)
+                if not tool_calls_acc and _rep_guard_tripped(
+                    "content", content_parts, len(delta_content)
+                ):
+                    _flush_pending_stream_text()
+                    break
                 if not tool_calls_acc:
                     # SSE-leak heuristic only makes sense at a line start: a
                     # delta such as ":/opt/..." right after "MEDIA" or "https"
@@ -4423,6 +4497,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 usage_obj = chunk.usage
 
         _close_managed_stream()
+
+        if _rep_guard_state["aborted"]:
+            # Report it as an output-length truncation so the existing
+            # finish_reason=="length" handling in conversation_loop owns the
+            # turn; the marker below tells that handler this was a repetition
+            # abort (no continuation, dedicated message) rather than a plain
+            # budget overrun.
+            finish_reason = "length"
 
         if _stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(
@@ -4616,12 +4698,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             message=mock_message,
             finish_reason=effective_finish_reason,
         )
-        return SimpleNamespace(
+        _mock_response = SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,
         )
+        if _rep_guard_state["aborted"]:
+            _mock_response._repetition_aborted = _rep_guard_state["kind"] or True
+        return _mock_response
 
     def _call_anthropic(request_client):
         """Stream an Anthropic Messages API response.

@@ -490,6 +490,58 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _apply_reasoning_max_tokens(agent, model_cfg) -> Optional[int]:
+    """Send ``model.reasoning_max_tokens`` to the provider when configured.
+
+    A reasoning model with no thinking budget can spend an ENTIRE output
+    allowance on hidden reasoning and return ``content: null`` (spark
+    incident 2026-09-09: 16384/16384 completion tokens, all reasoning, zero
+    visible text).  Gateways in front of the model silently drop unknown
+    request fields, so the budget has to leave Hermes itself.
+
+    The value rides on the existing ``extra_body.thinking_token_budget`` key
+    — the same one ``custom_providers[].extra_body`` already uses in
+    deployment configs — and, for endpoints that speak the OpenRouter
+    reasoning object, on ``extra_body.reasoning.max_tokens``.  No new wire
+    keys are invented, and an explicit caller-supplied override always wins.
+
+    Returns the resolved budget, or ``None`` when unset/invalid.
+    """
+    if not isinstance(model_cfg, dict):
+        return None
+    raw = model_cfg.get("reasoning_max_tokens")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        budget = int(raw)
+        if budget <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid model.reasoning_max_tokens in config.yaml: %r — must be a "
+            "positive integer (e.g. 2500). Ignoring.",
+            raw,
+        )
+        return None
+
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    extra_body = dict(overrides.get("extra_body") or {})
+    extra_body.setdefault("thinking_token_budget", budget)
+    reasoning = extra_body.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning = dict(reasoning)
+        reasoning.setdefault("max_tokens", budget)
+        extra_body["reasoning"] = reasoning
+    overrides["extra_body"] = extra_body
+    agent.request_overrides = overrides
+    _ra().logger.info(
+        "model.reasoning_max_tokens=%d → extra_body.thinking_token_budget", budget
+    )
+    return budget
+
+
 def _resolve_bot_mode_protocol_scope(raw) -> str:
     """Normalise ``agent.bot_mode_protocol_scope`` from config.
 
@@ -2645,6 +2697,7 @@ def init_agent(
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
     _merge_custom_provider_extra_body(agent, _custom_providers)
+    _apply_reasoning_max_tokens(agent, _model_cfg)
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
