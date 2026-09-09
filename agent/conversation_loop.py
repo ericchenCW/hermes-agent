@@ -927,7 +927,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
       * ``missing`` — no session row yet (legitimate first turn).
       * ``null``   — row exists, ``system_prompt`` column is NULL.
         Legacy session predating system-prompt persistence, or a migration
-        leftover.  Warns when ``conversation_history`` is non-empty.
+        leftover.  Warns when ``conversation_history`` is non-empty AND the
+        row shows a completed earlier turn (``api_call_count > 0``); a first
+        turn that merely arrived with pre-seeded history logs at DEBUG,
+        because no write could have been lost yet.
       * ``empty``  — row exists, ``system_prompt`` column is the empty
         string.  Indicates a previous-turn write that ran but stored
         nothing (silent persistence bug).  Always warns.
@@ -942,6 +945,19 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
+    # Did an earlier turn of THIS session already run?  A gateway session can
+    # reach its very first turn with a non-empty ``conversation_history``:
+    # Haro / knowledge-gateway style callers seed context messages into the
+    # session before the first user prompt, and the compression fork path
+    # hands a child session its carried-over history.  Without this flag the
+    # "null" branch below reads that seeded history as proof that a previous
+    # turn's write was lost and warns once per session about a write path
+    # that never ran.  ``api_call_count`` is the cheapest reliable witness of
+    # a completed turn (bumped by token accounting on every provider call)
+    # and it already rides along on the row we just read — no extra query.
+    # Unknown/absent column (older schema, DB shims in tests) fails CLOSED to
+    # "a previous turn ran" so a genuine persistence loss still warns.
+    stored_prior_turn = True
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -954,6 +970,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 else:
                     stored_prompt = raw_prompt
                     stored_state = "present"
+                if "api_call_count" in session_row:
+                    try:
+                        stored_prior_turn = (
+                            int(session_row.get("api_call_count") or 0) > 0
+                        )
+                    except (TypeError, ValueError):
+                        stored_prior_turn = True
         except Exception as exc:
             logger.warning(
                 "Session DB get_session failed for system-prompt restore "
@@ -1129,17 +1152,30 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         )
 
     if conversation_history and stored_state in ("null", "empty"):
-        # Continuing session whose stored prompt is unusable.  The
-        # previous turn's write either never happened or wrote an empty
-        # string — either way every turn now rebuilds and the prefix
-        # cache misses every time.
-        logger.warning(
-            "Stored system prompt for session %s is %s; rebuilding "
-            "from scratch this turn. Prefix cache will miss until "
-            "the rebuild persists. Investigate the previous turn's "
-            "update_system_prompt write path.",
-            agent.session_id, stored_state,
-        )
+        if stored_state == "null" and not stored_prior_turn:
+            # First turn of a session that was handed pre-seeded history
+            # (gateway context injection, compression fork).  Nothing was
+            # lost: there is no earlier turn whose write could have failed.
+            # The build below persists the prompt, and every later turn of
+            # this session restores those exact bytes.
+            logger.debug(
+                "No stored system prompt for session %s yet; this is its "
+                "first turn (history was pre-seeded by the caller). "
+                "Building and persisting for later turns to restore.",
+                agent.session_id,
+            )
+        else:
+            # Continuing session whose stored prompt is unusable.  The
+            # previous turn's write either never happened or wrote an empty
+            # string — either way every turn now rebuilds and the prefix
+            # cache misses every time.
+            logger.warning(
+                "Stored system prompt for session %s is %s; rebuilding "
+                "from scratch this turn. Prefix cache will miss until "
+                "the rebuild persists. Investigate the previous turn's "
+                "update_system_prompt write path.",
+                agent.session_id, stored_state,
+            )
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.

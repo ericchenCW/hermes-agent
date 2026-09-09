@@ -23,6 +23,19 @@ import pytest
 from agent.conversation_loop import _restore_or_build_system_prompt
 
 
+def _loop_warnings(caplog):
+    """Warnings emitted by the restore helper itself.
+
+    Real-SessionDB tests also capture unrelated ``hermes_state`` warnings
+    (e.g. the SQLite WAL-reset advisory on older linked SQLite builds).
+    """
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "agent.conversation_loop"
+    ]
+
+
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     """Construct the minimal agent fake the helper needs."""
     agent = MagicMock()
@@ -188,6 +201,150 @@ class TestSilentFailureWarnings:
         # No "rebuilding from scratch" warning because history is empty
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert not any("rebuilding" in m for m in warnings)
+
+
+class TestSeededHistoryFirstTurn:
+    """A first turn can legitimately arrive with pre-seeded history.
+
+    Gateway callers (Haro / knowledge-gateway injection, compression forks)
+    push context messages into a session before its first user prompt.  The
+    row then exists with ``system_prompt`` NULL and a non-empty history —
+    which used to be reported as a lost previous-turn write, once per
+    session, telling operators to investigate a write path that never ran.
+    """
+
+    def test_first_turn_with_seeded_history_does_not_warn(self, caplog):
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": None,
+            "api_call_count": 0,
+        }
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.DEBUG, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "seeded context"}]
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert not any("rebuilding from scratch" in m for m in warnings), warnings
+        assert any(
+            "first turn" in r.getMessage() for r in caplog.records
+        )
+        # Still builds and persists so later turns restore these bytes.
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "BUILT_PROMPT"
+        )
+
+    def test_null_row_after_a_completed_turn_still_warns(self, caplog):
+        """Genuine loss (a turn already ran) keeps the loud warning."""
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": None,
+            "api_call_count": 4,
+        }
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("is null; rebuilding from scratch" in m for m in warnings), warnings
+
+    def test_empty_row_always_warns_even_on_first_turn(self, caplog):
+        """An empty-string prompt is a real write bug regardless of turn."""
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "",
+            "api_call_count": 0,
+        }
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("is empty; rebuilding" in m for m in warnings), warnings
+
+    def test_row_without_api_call_count_column_still_warns(self, caplog):
+        """Unknown row shape fails closed to the old (warning) behavior."""
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": None}
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("is null; rebuilding from scratch" in m for m in warnings), warnings
+
+
+class TestSeededHistoryPrefixStabilityAgainstRealDB:
+    """End-to-end over a real SessionDB: turn 2 must reuse turn 1's bytes."""
+
+    def test_second_turn_restores_identical_bytes_and_hash(self, tmp_path, caplog):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            sid = "20260909_102842_1f2a4f"
+            # Gateway creates the row with no prompt, then seeds history.
+            db.create_session(sid, "haro", session_key="k1", chat_id="c1")
+            seeded = [{"role": "user", "content": "<knowledge-gateway>...</...>"}]
+
+            built = "SYSTEM PROMPT v1 — built on turn 1\nSession ID: " + sid
+            agent1 = _make_agent(session_db=db, prebuilt_prompt=built)
+            agent1.session_id = sid
+            with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+                _restore_or_build_system_prompt(agent1, None, seeded)
+            assert not _loop_warnings(caplog)
+
+            hash_after_turn1 = db._conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()[0]
+            assert hash_after_turn1 is not None
+
+            # Turn 2: fresh AIAgent (gateway builds one per turn). It must
+            # restore the stored bytes verbatim, never rebuild.
+            agent2 = _make_agent(
+                session_db=db, prebuilt_prompt="SYSTEM PROMPT v2 — MUST NOT BE USED"
+            )
+            agent2.session_id = sid
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+                _restore_or_build_system_prompt(
+                    agent2, None, seeded + [{"role": "assistant", "content": "ok"}]
+                )
+
+            assert agent2._cached_system_prompt == agent1._cached_system_prompt
+            assert (
+                agent2._cached_system_prompt.encode("utf-8")
+                == built.encode("utf-8")
+            )
+            agent2._build_system_prompt.assert_not_called()
+            assert not _loop_warnings(caplog)
+
+            hash_after_turn2 = db._conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()[0]
+            assert hash_after_turn2 == hash_after_turn1
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +572,15 @@ class TestPerResponseSessionWritePath:
 
             assert db.get_session(session_id)["system_prompt"] == "GROUP_PROMPT"
 
-    def test_warning_is_a_first_turn_artifact_not_a_lost_write(
+    def test_first_turn_is_silent_and_the_second_turn_restores(
         self, tmp_path, caplog
     ):
-        """Second turn of the SAME id restores — so nothing was dropped."""
+        """No warning on turn 1 (nothing was dropped), reuse on turn 2.
+
+        The row's own ``api_call_count`` is still 0 on that genuine first
+        turn, which is how the helper tells this lifecycle apart from a real
+        lost write.
+        """
         from hermes_state import SessionDB
 
         session_id = "gc_run_room42_default_Worker_9a7e3b1c05d24e6fb83a1c7d9e0f2a4b"
@@ -433,7 +595,7 @@ class TestPerResponseSessionWritePath:
                 _restore_or_build_system_prompt(
                     self._agent(db, session_id), None, history
                 )
-            assert "is null" in caplog.text
+            assert "is null" not in caplog.text
 
             caplog.clear()
             second = self._agent(db, session_id)
