@@ -1593,7 +1593,9 @@ def switch_model(
         if not new_model:
             if pdef.base_url:
                 from hermes_cli.runtime_provider import _auto_detect_local_model
-                detected = _auto_detect_local_model(pdef.base_url)
+                detected = _auto_detect_local_model(
+                    pdef.base_url, provider=target_provider,
+                )
                 if detected:
                     new_model = detected
                 else:

@@ -5253,7 +5253,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _base_url = (_model_config.get("base_url") or "") if isinstance(_model_config, dict) else ""
             if base_url_hostname(_base_url) in ("localhost", "127.0.0.1"):
                 from hermes_cli.runtime_provider import _auto_detect_local_model
-                _detected = _auto_detect_local_model(_base_url)
+                _detected = _auto_detect_local_model(
+                    _base_url,
+                    api_key=str(_model_config.get("api_key") or "") or None,
+                    provider=str(_model_config.get("provider") or ""),
+                )
                 if _detected:
                     self.model = _detected
         # Track whether model was explicitly chosen by the user or fell back

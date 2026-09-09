@@ -7314,9 +7314,19 @@ def get_model_info(profile: Optional[str] = None):
         # purely auto-detected value, then separately report the override)
         try:
             from agent.model_metadata import get_model_context_length
+            # The resolution chain probes /models on the endpoint; it must
+            # carry the same bearer as the chat request or a keyed endpoint
+            # 401s and we report the default window as "auto-detected".
+            try:
+                from hermes_cli.runtime_provider import resolve_probe_api_key
+
+                _probe_key = resolve_probe_api_key(base_url, provider=provider)
+            except Exception:
+                _probe_key = ""
             auto_ctx = get_model_context_length(
                 model=model_name,
                 base_url=base_url,
+                api_key=_probe_key,
                 provider=provider,
                 config_context_length=None,  # ignore override — we want auto value
             )
