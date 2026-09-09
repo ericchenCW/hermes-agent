@@ -55,6 +55,10 @@ _DEFAULT_CLIENT_TIMEOUT = 2.0
 #
 #   request  {"verb":"platform_send","id":<any>,"protocol":1,
 #             "platform":"wecom","chat_id":"…","text":"…",
+#             "chat_type":"single",              # optional, default "single"
+#             "card":{"title":"…","desc":"…",    # optional interactive card
+#                     "buttons":[{"key":"…","text":"…","style":1}],
+#                     "url":"…"},
 #             "request_id":"<uuid, echoed only>"}
 #   success  {"ok":true,"protocol":1,"id":…,
 #             "result":{"message_id":"…","request_id":"…",
@@ -73,6 +77,37 @@ PLATFORM_SEND_TIMEOUT_ENV = "HERMES_PLATFORM_SEND_TIMEOUT"
 # Platforms this verb will attempt at all. Anything else is a caller mistake
 # (bad_request), not a transient gateway condition (platform_unavailable).
 PLATFORM_SEND_SUPPORTED_PLATFORMS = frozenset({"wecom"})
+
+# Optional ``card`` payload (IaC approval push, P1). When present the adapter is
+# asked for an explicit structured card (``send_card``) instead of a text send;
+# ``text`` stays mandatory and is the fallback body when the card cannot be
+# delivered. Limits are the verb's own contract — the adapter narrows them
+# further to whatever WeCom accepts.
+PLATFORM_SEND_CARD_TITLE_MAX = 128
+PLATFORM_SEND_CARD_DESC_MAX = 512
+PLATFORM_SEND_CARD_BUTTON_TEXT_MAX = 64
+PLATFORM_SEND_CARD_BUTTON_KEY_MAX = 256
+PLATFORM_SEND_CARD_URL_MAX = 1024
+PLATFORM_SEND_CARD_BUTTONS_MIN = 1
+PLATFORM_SEND_CARD_BUTTONS_MAX = 6
+PLATFORM_SEND_CARD_FIELDS = frozenset({"title", "desc", "buttons", "url"})
+PLATFORM_SEND_CARD_BUTTON_FIELDS = frozenset({"key", "text", "style"})
+
+# ``chat_type`` is optional and defaults to "single". P1 delivers interactive
+# cards to DMs only: a group card cannot be pushed proactively (WeCom refuses
+# it) and a group click cannot be attributed safely, so it is refused here
+# rather than half-served in the adapter.
+PLATFORM_SEND_CHAT_TYPE_SINGLE = "single"
+PLATFORM_SEND_CHAT_TYPE_GROUP = "group"
+PLATFORM_SEND_DEFAULT_CHAT_TYPE = PLATFORM_SEND_CHAT_TYPE_SINGLE
+PLATFORM_SEND_KNOWN_CHAT_TYPES = frozenset({
+    PLATFORM_SEND_CHAT_TYPE_SINGLE, PLATFORM_SEND_CHAT_TYPE_GROUP,
+})
+PLATFORM_SEND_SUPPORTED_CHAT_TYPES = frozenset({PLATFORM_SEND_CHAT_TYPE_SINGLE})
+
+# Adapter opt-out flag: the text delivered through this verb is verbatim, so the
+# adapter must not interpret a trailing ``BUTTONS[...]`` directive in it.
+PLATFORM_SEND_NO_DIRECTIVES_FLAG = "no_button_directive"
 
 PLATFORM_SEND_ERR_BAD_REQUEST = "bad_request"
 PLATFORM_SEND_ERR_PLATFORM_UNAVAILABLE = "platform_unavailable"
@@ -253,6 +288,77 @@ def _is_rate_limited(detail: str) -> bool:
     return PLATFORM_SEND_RATE_LIMIT_ERRCODE in detail
 
 
+class _CardError(ValueError):
+    """Card schema violation — turned into ``bad_request: <detail>`` by the handler."""
+
+
+def _require_text(value: Any, field: str, limit: int, *, required: bool) -> str:
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise _CardError(f"card.{field} is required and must be a non-empty string")
+    if len(value) > limit:
+        raise _CardError(f"card.{field} exceeds {limit} characters (got {len(value)})")
+    return value
+
+
+def validate_platform_send_card(card: Any) -> dict[str, Any]:
+    """Validate the optional ``card`` object and return its normalised form.
+
+    Raises :class:`_CardError` with a caller-facing detail; the handler reports
+    it as ``bad_request``. Nothing from the card is logged — button keys are
+    one-time approval capabilities and the title/desc are message content.
+    """
+    if not isinstance(card, dict):
+        raise _CardError("card must be an object")
+    unknown = sorted(set(card) - PLATFORM_SEND_CARD_FIELDS)
+    if unknown:
+        raise _CardError(f"card has unknown field(s): {', '.join(unknown)}")
+
+    title = _require_text(card.get("title"), "title", PLATFORM_SEND_CARD_TITLE_MAX, required=True)
+    desc = _require_text(card.get("desc"), "desc", PLATFORM_SEND_CARD_DESC_MAX, required=False) if card.get("desc") is not None else ""
+    url = _require_text(card.get("url"), "url", PLATFORM_SEND_CARD_URL_MAX, required=False) if card.get("url") is not None else ""
+
+    raw_buttons = card.get("buttons")
+    if not isinstance(raw_buttons, list):
+        raise _CardError("card.buttons is required and must be a list")
+    if not (PLATFORM_SEND_CARD_BUTTONS_MIN <= len(raw_buttons) <= PLATFORM_SEND_CARD_BUTTONS_MAX):
+        raise _CardError(
+            f"card.buttons must hold {PLATFORM_SEND_CARD_BUTTONS_MIN}-"
+            f"{PLATFORM_SEND_CARD_BUTTONS_MAX} entries (got {len(raw_buttons)})"
+        )
+    buttons: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for index, raw in enumerate(raw_buttons):
+        if not isinstance(raw, dict):
+            raise _CardError(f"card.buttons[{index}] must be an object")
+        unknown = sorted(set(raw) - PLATFORM_SEND_CARD_BUTTON_FIELDS)
+        if unknown:
+            raise _CardError(f"card.buttons[{index}] has unknown field(s): {', '.join(unknown)}")
+        try:
+            key = _require_text(raw.get("key"), f"buttons[{index}].key", PLATFORM_SEND_CARD_BUTTON_KEY_MAX, required=True)
+            text = _require_text(raw.get("text"), f"buttons[{index}].text", PLATFORM_SEND_CARD_BUTTON_TEXT_MAX, required=True)
+        except _CardError:
+            raise
+        if key in seen_keys:
+            raise _CardError(f"card.buttons[{index}].key is duplicated")
+        seen_keys.add(key)
+        button: dict[str, Any] = {"key": key, "text": text}
+        style = raw.get("style")
+        if style is not None:
+            if isinstance(style, bool) or not isinstance(style, (int, str)):
+                raise _CardError(f"card.buttons[{index}].style must be an integer or string")
+            button["style"] = style
+        buttons.append(button)
+
+    normalised: dict[str, Any] = {"title": title, "buttons": buttons}
+    if desc:
+        normalised["desc"] = desc
+    if url:
+        normalised["url"] = url
+    return normalised
+
+
 def build_platform_send_handler(
     get_adapter: Callable[[str], Any],
     *,
@@ -268,10 +374,19 @@ def build_platform_send_handler(
     ``asyncio.run_coroutine_threadsafe`` and awaited synchronously (the same
     thread→loop bridge ``pause-for-update`` uses, but result-carrying).
 
-    The text is delivered verbatim: no templating, no command interpretation.
+    The text is delivered verbatim: no templating, no command interpretation —
+    a trailing ``BUTTONS[...]`` line in the body is NOT turned into a card on
+    this path (the adapter is told to skip directive parsing). An interactive
+    card is requested explicitly with the optional ``card`` object, which is
+    handed to ``adapter.send_card(chat_id, card, fallback_text)``; ``text``
+    stays mandatory and is the fallback body. Optional ``chat_type`` defaults
+    to ``"single"`` and is the only value P1 serves — ``"group"`` is refused as
+    ``bad_request``.
+
     ``request_id`` is opaque — echoed back and logged, never validated.
     Exactly one INFO line is logged per call, carrying the platform, chat id,
-    text LENGTH, request id and outcome — never the message body.
+    text LENGTH, chat type, button COUNT, request id and outcome — never the
+    message body and never a button key.
 
     Success returns the contract's four-field result; every failure raises
     :class:`VerbError`, which the server turns into ``"<code>: <detail>"``.
@@ -281,6 +396,8 @@ def build_platform_send_handler(
         platform = request.get("platform")
         chat_id = request.get("chat_id")
         text = request.get("text")
+        raw_card = request.get("card")
+        raw_chat_type = request.get("chat_type")
         raw_request_id = request.get("request_id")
         # Opaque correlation token: echoed as-is when it is a string, and as
         # the empty string otherwise (absent, null, wrong type). Never a
@@ -316,11 +433,37 @@ def build_platform_send_handler(
                 f"(got {len(text)})"
             )
 
+        chat_type = PLATFORM_SEND_DEFAULT_CHAT_TYPE
+        if raw_chat_type is not None:
+            if not isinstance(raw_chat_type, str) or not raw_chat_type.strip():
+                raise _bad("chat_type must be a non-empty string when present")
+            chat_type = raw_chat_type.strip().lower()
+            if chat_type not in PLATFORM_SEND_KNOWN_CHAT_TYPES:
+                raise _bad(
+                    f"unknown chat_type {chat_type!r} "
+                    f"(known: {', '.join(sorted(PLATFORM_SEND_KNOWN_CHAT_TYPES))})"
+                )
+            if chat_type not in PLATFORM_SEND_SUPPORTED_CHAT_TYPES:
+                raise _bad(
+                    f"chat_type {chat_type!r} is not supported "
+                    f"(supported: {', '.join(sorted(PLATFORM_SEND_SUPPORTED_CHAT_TYPES))})"
+                )
+
+        card: Optional[dict[str, Any]] = None
+        if raw_card is not None:
+            try:
+                card = validate_platform_send_card(raw_card)
+            except _CardError as exc:
+                raise _bad(str(exc)) from exc
+
         def _log(outcome: str) -> None:
+            # Never the body and never a button key: keys are one-time approval
+            # capabilities, so only the button COUNT is observable.
             logger.info(
                 "platform_send platform=%s chat_id=%s text_len=%d "
-                "request_id=%s result=%s",
-                platform, chat_id, len(text), request_id, outcome,
+                "chat_type=%s card_buttons=%s request_id=%s result=%s",
+                platform, chat_id, len(text), chat_type,
+                len(card["buttons"]) if card else 0, request_id, outcome,
             )
 
         def _fail(code: str, detail: str) -> VerbError:
@@ -356,11 +499,30 @@ def build_platform_send_handler(
                 "gateway event loop is not running",
             )
 
+        send_card = getattr(adapter, "send_card", None)
+        if card is not None and not callable(send_card):
+            raise _fail(
+                PLATFORM_SEND_ERR_PLATFORM_UNAVAILABLE,
+                f"adapter for {platform!r} cannot send cards",
+            )
+
+        def _make_coro():
+            if card is not None:
+                return send_card(chat_id, card, text)
+            # Verbatim text: the adapter must not interpret a trailing
+            # BUTTONS[...] directive that happens to be in the body. Adapters
+            # that do not take metadata keep the plain two-argument call.
+            try:
+                return adapter.send(
+                    chat_id, text,
+                    metadata={PLATFORM_SEND_NO_DIRECTIVES_FLAG: True},
+                )
+            except TypeError:
+                return adapter.send(chat_id, text)
+
         budget = _platform_send_timeout(timeout)
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                adapter.send(chat_id, text), target_loop
-            )
+            future = asyncio.run_coroutine_threadsafe(_make_coro(), target_loop)
         except Exception as exc:
             raise _fail_send(f"{type(exc).__name__}: {exc}") from exc
 
@@ -658,6 +820,8 @@ def platform_send(
     chat_id: str,
     text: str,
     *,
+    card: Optional[dict[str, Any]] = None,
+    chat_type: Optional[str] = None,
     request_id: Optional[str] = None,
     timeout: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -684,6 +848,10 @@ def platform_send(
         "chat_id": chat_id,
         "text": text,
     }
+    if card is not None:
+        payload["card"] = card
+    if chat_type is not None:
+        payload["chat_type"] = chat_type
     if request_id is not None:
         payload["request_id"] = request_id
     request = json.dumps(payload).encode("utf-8") + b"\n"
