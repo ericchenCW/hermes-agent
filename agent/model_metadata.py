@@ -416,9 +416,67 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
+_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+# One WARNING per distinct unresolved reference, process-wide: the probes below
+# are also on periodic paths (context re-resolution, health polls) and would
+# otherwise log the same line hundreds of times.
+_warned_unresolved_probe_refs: set = set()
+
+
+def expand_probe_api_key(api_key: str = "") -> str:
+    """Expand ``${VAR}`` / ``${env:VAR}`` config refs in a probe credential.
+
+    ``config.yaml`` values may hold env references (``api_key:
+    ${HARO_MODEL_API_KEY}``). ``hermes_cli.config.load_config()`` expands them
+    for the chat path, but a probe credential can also reach this module from a
+    caller that read raw YAML (``gateway.run._load_gateway_config``) or from a
+    plugin that passed a config value straight through — the probe would then
+    present the literal ``Bearer ${HARO_MODEL_API_KEY}`` while the chat request
+    that follows presents the real key. Expanding here, at the last point
+    before the header is built, keeps every probe on the chat path's
+    credential regardless of which caller resolved it.
+
+    Semantics deliberately match the chat path (``config._expand_env_vars``):
+    ``${VAR}`` and ``${env:VAR}`` only — a bare ``$VAR`` is not an env
+    reference in ``config.yaml`` and is left verbatim here too, so probe and
+    chat never disagree about what a value means.
+
+    Idempotent: a value with no ``${`` is returned unchanged, so callers that
+    already resolved their key (the common case) pay nothing.
+
+    Unlike the chat path, an *unresolved* reference does not survive: sending
+    ``Bearer ${HARO_MODEL_API_KEY}`` can only 401 and leaks the variable name
+    to the endpoint. Returns ``""`` instead — the caller then sends no
+    ``Authorization`` header at all — after one WARNING naming the variable.
+    """
+    token = str(api_key or "").strip()
+    if not token or "${" not in token:
+        return token
+    try:
+        from hermes_cli.config import _expand_env_vars
+
+        expanded = str(_expand_env_vars(token)).strip()
+    except Exception:  # pragma: no cover — config import is always available
+        expanded = token
+    unresolved = _ENV_REF_RE.findall(expanded)
+    if unresolved:
+        for ref in unresolved:
+            if ref in _warned_unresolved_probe_refs:
+                continue
+            _warned_unresolved_probe_refs.add(ref)
+            logger.warning(
+                "Model probe credential references %s which is not set "
+                "(check ~/.hermes/.env); probing without Authorization "
+                "rather than sending the literal placeholder",
+                "${%s}" % ref,
+            )
+        return ""
+    return expanded
+
+
 def _auth_headers(api_key: object = "") -> Dict[str, str]:
     from agent.command_token_source import materialize_probe_api_key
-    token = materialize_probe_api_key(api_key)
+    token = expand_probe_api_key(materialize_probe_api_key(api_key))
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -920,6 +978,9 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
         return {}
     alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
     candidates = [normalized] + ([alternate] if alternate != normalized else [])
+    # Same expansion as every other probe (``_auth_headers``): a caller that read raw YAML
+    # may hand us an unexpanded ``${VAR}`` reference, and api_key travels on below.
+    api_key = expand_probe_api_key(api_key)
     headers = _auth_headers(api_key)
     verify = _resolve_requests_verify(normalized)
     last_error: Optional[Exception] = None
@@ -1417,6 +1478,7 @@ def _normalize_model_version(model: str) -> str:
 
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Anthropic /v1/models max_input_tokens; OAuth tokens (sk-ant-oat*) 401 and are skipped."""
+    api_key = expand_probe_api_key(api_key)
     if not api_key or api_key.startswith("sk-ant-oat"):
         return None
     try:

@@ -359,9 +359,36 @@ def resolve_probe_api_key(base_url: str = "", provider: str = "") -> str:
     the ``providers:`` shape), then the ``model:`` block's own
     ``api_key`` / ``key_env`` when the URL is the configured ``model.base_url``.
 
+    Every source is passed through
+    :func:`agent.model_metadata.expand_probe_api_key`, so a config value that
+    is still an env template (``api_key: ${HARO_MODEL_API_KEY}``, as written by
+    container deployments) resolves to the same secret the chat path uses.
+    ``load_config()`` normally expands it already; the pass is idempotent and
+    covers the sources that bypass it (``key_env`` env reads, raw-YAML
+    callers). An env reference that cannot be resolved yields ``""`` rather
+    than a literal ``Bearer ${VAR}`` — see that function.
+
     Returns ``""`` when nothing is configured — callers then send the probe
     header-less, exactly as before.
     """
+    return _expand_probe_ref(_resolve_probe_api_key_raw(base_url, provider))
+
+
+def _expand_probe_ref(value: str) -> str:
+    """Expand a ``${VAR}`` probe credential; fail-open if the probe layer
+    cannot be imported (then the caller's own ``_auth_headers`` still does it).
+    """
+    try:
+        from agent.model_metadata import expand_probe_api_key
+
+        return expand_probe_api_key(value)
+    except Exception:
+        return str(value or "").strip()
+
+
+def _resolve_probe_api_key_raw(base_url: str = "", provider: str = "") -> str:
+    """Credential-source resolution for :func:`resolve_probe_api_key`, before
+    env-template expansion. Split out only so the expansion has one call site."""
     entry = None
     requested = str(provider or "").strip()
     if requested:
@@ -430,7 +457,10 @@ def _auto_detect_local_model(
         token = api_key
         if token is None:
             token = resolve_probe_api_key(base_url, provider=provider)
-        token = str(token or "").strip()
+        # An explicit ``api_key=`` may still be an unexpanded config template
+        # (callers read it straight off a model block), so expand here too —
+        # idempotent for the already-resolved keys resolve_probe_api_key returns.
+        token = _expand_probe_ref(str(token or ""))
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         resp = requests.get(url + "/models", headers=headers, timeout=(2, 3))
         if resp.ok:
