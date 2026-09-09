@@ -194,15 +194,71 @@ def read_remote_roster(root: Path | str) -> list[dict]:
         return []
 
 
+class AmbiguousTarget(str):
+    """Ambiguous-match sentinel that also carries the candidate rows.
+
+    Subclasses ``str`` with the value ``"ambiguous"`` so the historical
+    ``resolve_remote_target(...) == "ambiguous"`` contract (and every
+    existing caller/test) keeps working unchanged, while callers that want
+    to render a choice can read ``.candidates`` (the matched roster rows).
+    """
+
+    candidates: list[dict]
+
+    def __new__(cls, candidates: list[dict]) -> "AmbiguousTarget":
+        obj = super().__new__(cls, "ambiguous")
+        obj.candidates = list(candidates)
+        return obj
+
+
+#: Roster fields a human/agent may name a teammate by, most specific first.
+_TARGET_FIELDS = ("handle", "profile", "title", "connection_label")
+
+
+def _fold(text: Any) -> str:
+    """Case- and whitespace-normalized comparison form ('IT  小助理' → 'it 小助理')."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _tight(text: Any) -> str:
+    """``_fold`` with ALL whitespace removed, so 'IT小助理' == 'IT 小助理'."""
+    return "".join(str(text or "").split()).casefold()
+
+
+def _target_keys(row: dict) -> list[tuple[str, str]]:
+    """(folded, tightened) comparison keys for a roster row's nameable fields."""
+    keys = []
+    for field in _TARGET_FIELDS:
+        value = row.get(field)
+        if str(value or "").strip():
+            keys.append((_fold(value), _tight(value)))
+    return keys
+
+
+def _row_key(row: dict) -> tuple[str, str]:
+    return (row.get("connection_id", ""), row.get("profile", ""))
+
+
 def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
     """Resolve ``raw_target`` against the remote roster.
 
     Accepted forms:
-    - bare handle/profile (``moxie``) — must be unique across connections;
-    - ``<handle>@<connection-id>`` / ``<profile>@<connection-id>`` — exact.
+    - bare name (``moxie``, ``IT``, ``IT 小助理``) matched against the row's
+      handle / profile / title / connection_label — must be unique;
+    - ``<name>@<connection-id>`` — the same match, pinned to one connection.
 
-    Returns the matched row, the string ``"ambiguous"`` when a bare form
-    matches agents on several connections, or None for no match.
+    Matching runs in two passes. First an EXACT pass on the normalized
+    forms: comparison is ``casefold()``-ed with whitespace collapsed, and
+    retried with all whitespace stripped, so ``it 小助理`` and ``IT小助理``
+    both hit a ``IT 小助理`` title. When nothing matches exactly, a
+    bidirectional SUBSTRING pass runs (the wanted text is contained in a
+    candidate field, or a candidate field is contained in the wanted text)
+    — so ``小助理`` finds ``IT 小助理``. Substring hits count only when
+    exactly one roster row matches.
+
+    Returns the matched row, an ``AmbiguousTarget`` (a str equal to
+    ``"ambiguous"`` carrying ``.candidates``) when several rows match, or
+    None for no match.
     """
     want = str(raw_target or "").strip().lstrip("@")
     if not want:
@@ -214,18 +270,44 @@ def resolve_remote_target(raw_target: str, roster: list[dict]) -> Any:
         conn = conn.strip()
         if not want or not conn:
             return None
-    matches = []
-    for row in roster:
-        if want.lower() not in (row["handle"].lower(), row["profile"].lower()):
-            continue
-        if conn and row["connection_id"].lower() != conn.lower():
-            continue
-        matches.append(row)
+    pool = [
+        row
+        for row in roster
+        if not conn or row["connection_id"].casefold() == conn.casefold()
+    ]
+    want_fold, want_tight = _fold(want), _tight(want)
+    if not want_tight:
+        return None
+
+    def _collect(predicate) -> list[dict]:
+        found: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for row in pool:
+            if not any(predicate(keys) for keys in _target_keys(row)):
+                continue
+            key = _row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(row)
+        return found
+
+    matches = _collect(lambda k: want_fold == k[0] or want_tight == k[1])
+    if not matches:
+        matches = _collect(
+            lambda k: want_tight in k[1] or k[1] in want_tight
+        )
     if not matches:
         return None
     if len(matches) > 1:
-        return "ambiguous"
+        return AmbiguousTarget(matches)
     return matches[0]
+
+
+def describe_remote_target(row: dict) -> str:
+    """Human-facing label for a roster row: display name + exact target form."""
+    name = str(row.get("title") or "").strip() or row.get("handle", "")
+    return f"{name} (target: {row.get('handle', '')}@{row.get('connection_id', '')})"
 
 
 def remote_target_forms(roster: list[dict]) -> list[str]:

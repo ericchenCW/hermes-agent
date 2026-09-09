@@ -220,7 +220,11 @@ def _remote_paragraph(root: Path) -> str:
         "\n\nTeammates on OTHER connected machines (reachable through the "
         "Desktop relay — message them with message_agent exactly like local "
         "teammates; replies arrive as completion notifications the same "
-        "way):\n" + "\n".join(lines)
+        "way):\n"
+        + "\n".join(lines)
+        + "\nFor these, `target` may be the teammate's DISPLAY NAME as shown "
+        "above (e.g. \"IT 小助理\") just as well as `@handle`; matching ignores "
+        "case and spacing, and a distinctive part of the name is enough."
     )
 
 

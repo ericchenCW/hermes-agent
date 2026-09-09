@@ -102,6 +102,81 @@ def test_resolve_ambiguous_handle_across_connections(root):
     assert "hermes" in forms  # unique handle stays bare
 
 
+def _display_name_rows():
+    """Roster whose agents are known to the user by TITLE, not by handle."""
+    return [
+        {
+            "profile": "it",
+            "handle": "IT",
+            "connection_id": "cloud-1",
+            "connection_label": "IT 小助理",
+            "title": "IT 小助理",
+            "description": "IT 支持",
+        },
+        {
+            "profile": "hr",
+            "handle": "HR",
+            "connection_id": "ssh-vps",
+            "connection_label": "HR 助理",
+            "title": "HR 助理",
+            "description": "人事支持",
+        },
+    ]
+
+
+def test_resolve_by_display_name_unique_substring(root):
+    """The reported bug: the user says '小助理', not '@IT'."""
+    bot_relay.write_remote_roster(root, _display_name_rows())
+    roster = bot_relay.read_remote_roster(root)
+    match = bot_relay.resolve_remote_target("小助理", roster)
+    assert match["handle"] == "IT" and match["connection_id"] == "cloud-1"
+    # the full display name resolves exactly
+    assert bot_relay.resolve_remote_target("IT 小助理", roster)["handle"] == "IT"
+
+
+def test_resolve_display_name_ignores_case_and_spacing(root):
+    bot_relay.write_remote_roster(root, _display_name_rows())
+    roster = bot_relay.read_remote_roster(root)
+    for form in ("IT", "it", "it 小助理", "IT小助理", "  IT   小助理 "):
+        match = bot_relay.resolve_remote_target(form, roster)
+        assert match is not None and match["handle"] == "IT", form
+
+
+def test_resolve_display_name_ambiguous_lists_titles(root):
+    bot_relay.write_remote_roster(root, _display_name_rows())
+    roster = bot_relay.read_remote_roster(root)
+    match = bot_relay.resolve_remote_target("助理", roster)
+    assert match == "ambiguous"
+    titles = {r["title"] for r in match.candidates}
+    assert titles == {"IT 小助理", "HR 助理"}
+
+
+def test_resolve_display_name_unknown_is_none(root):
+    bot_relay.write_remote_roster(root, _display_name_rows())
+    roster = bot_relay.read_remote_roster(root)
+    assert bot_relay.resolve_remote_target("不存在", roster) is None
+
+
+def test_resolve_display_name_connection_qualified(root):
+    bot_relay.write_remote_roster(root, _display_name_rows())
+    roster = bot_relay.read_remote_roster(root)
+    assert bot_relay.resolve_remote_target("助理@ssh-vps", roster)["handle"] == "HR"
+
+
+def test_exact_match_wins_over_substring(root):
+    """A handle that is a substring of another row's title still wins exactly."""
+    rows = _display_name_rows() + [
+        {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
+         "title": "小助理调度员"}
+    ]
+    bot_relay.write_remote_roster(root, rows)
+    roster = bot_relay.read_remote_roster(root)
+    # 'IT' matches the IT handle exactly; the substring pass never runs
+    assert bot_relay.resolve_remote_target("IT", roster)["profile"] == "it"
+    # ...but a bare '小助理' now hits two titles → ambiguous, not a silent pick
+    assert bot_relay.resolve_remote_target("小助理", roster) == "ambiguous"
+
+
 # ── outbox / replies ─────────────────────────────────────────────────────────
 
 
@@ -321,6 +396,42 @@ def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
     # connection-qualified form goes through
     out2 = json.loads(message_agent_tool(target="scout@ssh-vps", message="hi", agent=agent))
     assert out2.get("status") == "sent"
+
+
+def test_relay_route_accepts_display_name_target(tmp_path, monkeypatch):
+    """message_agent with a non-ASCII display name reaches the relay."""
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(home, _display_name_rows()[:1])
+    monkeypatch.setattr(
+        "tools.bot_mode_dm._spawn_delivery",
+        lambda command, label, *, task_id, agent: json.dumps(
+            {"status": "sent", "to": label}
+        ),
+    )
+    agent = _FakeAgent(home)
+    out = json.loads(message_agent_tool(target="小助理", message="hi", agent=agent))
+    assert out.get("status") == "sent"
+    pending = bot_relay.claim_pending_envelopes(home)
+    assert len(pending) == 1 and pending[0]["target_profile"] == "it"
+
+
+def test_relay_route_ambiguous_display_name_lists_titles(tmp_path):
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(home, _display_name_rows())
+    agent = _FakeAgent(home)
+    out = json.loads(message_agent_tool(target="助理", message="hi", agent=agent))
+    error = out.get("error", "")
+    assert "IT 小助理" in error and "HR 助理" in error
+    assert "IT@cloud-1" in error and "HR@ssh-vps" in error
+
+
+def test_protocol_section_documents_display_name_targets(tmp_path):
+    from tools import bot_mode_probe
+
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(home, _display_name_rows()[:1])
+    section = bot_mode_probe.get_bot_mode_protocol_section(home, force_refresh=True)
+    assert "DISPLAY NAME" in section
 
 
 def test_unknown_target_error_mentions_connected_machines(tmp_path):

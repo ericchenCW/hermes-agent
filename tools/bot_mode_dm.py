@@ -390,7 +390,15 @@ def message_agent_tool(
         )
 
     # ── local teammate ──
+    # A target that is neither a handle-shaped name nor connection-qualified
+    # may still be a teammate's DISPLAY name ("IT 小助理") — those live only
+    # in the relay roster, so try the relay before calling the target invalid.
     if not _LOCAL_TARGET_RE.match(raw_target) and "@" not in raw_target:
+        relayed = _try_relay_delivery(
+            root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
+        )
+        if relayed is not None:
+            return relayed
         return _err(f"Invalid target: {raw_target!r}.", roster=teammates, peers=peers)
     resolved = _resolve_local_name(raw_target, roster) if _LOCAL_TARGET_RE.match(raw_target) else None
     if resolved is None:
@@ -406,7 +414,8 @@ def message_agent_tool(
         return _err(
             f"No teammate named '{raw_target}' on this install, on a connected "
             "machine, or on a registered peer. Pick a name from the roster "
-            "(roles are listed in your system prompt).",
+            "(roles are listed in your system prompt) — you can pass a "
+            "teammate's display name (e.g. 'IT 小助理') or their @handle.",
             roster=teammates,
             peers=peers,
         )
@@ -463,6 +472,7 @@ def _try_relay_delivery(
     try:
         from tools.bot_relay import (
             EnvelopeRefusedError,
+            describe_remote_target,
             enqueue_envelope,
             read_remote_roster,
             resolve_remote_target,
@@ -476,14 +486,15 @@ def _try_relay_delivery(
         if match is None:
             return None
         if match == "ambiguous":
-            forms = ", ".join(
-                f"{r['handle']}@{r['connection_id']}"
+            candidates = getattr(match, "candidates", None) or [
+                r
                 for r in roster
                 if r["handle"].lower() == raw_target.strip().lstrip("@").lower()
-            )
+            ]
+            forms = "; ".join(describe_remote_target(r) for r in candidates)
             return _err(
-                f"'{raw_target}' exists on several connected machines — "
-                f"disambiguate with one of: {forms}."
+                f"'{raw_target}' matches several teammates — pick the one you "
+                f"mean and pass its exact target: {forms}."
             )
         try:
             envelope = enqueue_envelope(
