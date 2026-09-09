@@ -266,3 +266,46 @@ def test_compact_rows_omit_hash_and_never_read_prompt_blob(db):
     assert "system_prompt_hash" not in rows[0]
     assert "system_prompt" not in rich
     assert "system_prompt_hash" not in rich
+
+
+def test_update_system_prompt_for_missing_session_keeps_the_prompt(db, caplog):
+    """No session row → UPDATE matches nothing.
+
+    The prompt was already INSERTed content-addressed; the unreferenced sweep
+    used to delete it immediately, losing the snapshot silently. Now the call
+    leaves the stored row alone and logs the miss. The return value stays
+    ``None`` (upstream signature) — the WARNING is the only signal.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert db.update_system_prompt("ghost", "orphaned prompt") is None
+
+    assert _prompt_count(db) == 1
+    assert [
+        row["prompt"]
+        for row in db._conn.execute("SELECT prompt FROM system_prompts")
+    ] == ["orphaned prompt"]
+    assert any(
+        "no session row" in r.getMessage() and "ghost" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_update_system_prompt_for_missing_session_spares_other_prompts(db):
+    """The failed call must not sweep away a live session's prompt either."""
+    db.create_session("live", "cli", system_prompt="live prompt")
+    db.update_system_prompt("ghost", "orphaned prompt")
+    assert db.get_session("live")["system_prompt"] == "live prompt"
+    assert _prompt_count(db) == 2
+
+
+def test_update_system_prompt_normal_path_still_sweeps_orphans(db):
+    db.create_session("s1", "cli", system_prompt="first prompt")
+    db.update_system_prompt("s1", "second prompt")
+    assert db.get_session("s1")["system_prompt"] == "second prompt"
+    # "first prompt" lost its last referrer and is collected.
+    assert _prompt_count(db) == 1
+    db.update_system_prompt("s1", None)
+    assert db.get_session("s1")["system_prompt"] is None
+    assert _prompt_count(db) == 0
