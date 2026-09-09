@@ -473,7 +473,12 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
 
         from agent.usage_pricing import get_pricing_entry
 
-        entry = get_pricing_entry(model, provider=provider, base_url=base_url)
+        try:
+            from hermes_cli.runtime_provider import resolve_probe_api_key
+            _probe_key = resolve_probe_api_key(base_url or "", provider=provider or "")
+        except Exception:
+            _probe_key = ""
+        entry = get_pricing_entry(model, provider=provider, base_url=base_url, api_key=_probe_key)
         for key, attr, rate_attr in _USAGE_FIELDS if entry else ():
             rate = getattr(entry, rate_attr, None) if rate_attr else None
             tokens = getattr(canonical, attr)

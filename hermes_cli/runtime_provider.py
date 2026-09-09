@@ -343,14 +343,96 @@ def _finalize_base_url(provider: str, api_mode: str, base_url: str) -> str:
 # ── model config ───────────────────────────────────────────────────────────────────────────
 
 
-def _auto_detect_local_model(base_url: str) -> str:
-    """Query a local server for its model name when only one model is loaded."""
+def resolve_probe_api_key(base_url: str = "", provider: str = "") -> str:
+    """Resolve the API key a non-chat probe against *base_url* should present.
+
+    Model-discovery and health probes (``GET /models``, ``/api/tags``,
+    ``/v1/props`` …) must authenticate exactly like the chat request that
+    follows them: an endpoint behind a bearer answers 401/403 to a header-less
+    probe, so discovery silently returns nothing and the agent falls back to a
+    default model / context window.
+
+    Resolution mirrors the chat path rather than re-implementing it: the
+    ``providers:`` / ``custom_providers:`` entry that owns the endpoint
+    (inline ``api_key`` then ``key_env``, via
+    :func:`_get_named_custom_provider`, which already resolves ``key_env`` for
+    the ``providers:`` shape), then the ``model:`` block's own
+    ``api_key`` / ``key_env`` when the URL is the configured ``model.base_url``.
+
+    Returns ``""`` when nothing is configured — callers then send the probe
+    header-less, exactly as before.
+    """
+    entry = None
+    requested = str(provider or "").strip()
+    if requested:
+        try:
+            entry = _get_named_custom_provider(requested)
+        except Exception:
+            entry = None
+    if entry is None and base_url:
+        try:
+            identity = find_custom_provider_identity(base_url)
+            if identity:
+                entry = _get_named_custom_provider(identity)
+        except Exception:
+            entry = None
+    if isinstance(entry, dict):
+        resolved = str(entry.get("api_key", "") or "").strip()
+        if not resolved:
+            key_env = str(entry.get("key_env", "") or "").strip()
+            if key_env:
+                resolved = _getenv(key_env, "").strip()
+        if resolved:
+            return resolved
+
+    try:
+        model_cfg = load_config().get("model")
+    except Exception:
+        model_cfg = None
+    if not isinstance(model_cfg, dict):
+        return ""
+    # Only the model block that actually owns this endpoint may donate its
+    # key — never leak the main provider's secret to an unrelated host.
+    cfg_base = str(model_cfg.get("base_url", "") or "").strip()
+    if base_url and cfg_base:
+        if _normalize_base_url_for_match(cfg_base) != _normalize_base_url_for_match(base_url):
+            return ""
+    for field in ("api_key", "api"):
+        value = model_cfg.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    key_env = str(
+        model_cfg.get("key_env") or model_cfg.get("api_key_env") or ""
+    ).strip()
+    if key_env:
+        return _getenv(key_env, "").strip()
+    return ""
+
+
+def _auto_detect_local_model(
+    base_url: str,
+    api_key: Optional[str] = None,
+    provider: str = "",
+) -> str:
+    """Query a local server for its model name when only one model is loaded.
+
+    The probe carries the same ``Authorization`` bearer as the chat request
+    that will follow it. ``api_key=None`` resolves the key from config via
+    :func:`resolve_probe_api_key`; an empty key sends no header.
+    """
     if not base_url:
         return ""
     try:
         import requests
         url = base_url.rstrip("/")
-        resp = requests.get((url if url.endswith("/v1") else url + "/v1") + "/models", timeout=(2, 3))
+        if not url.endswith("/v1"):
+            url += "/v1"
+        token = api_key
+        if token is None:
+            token = resolve_probe_api_key(base_url, provider=provider)
+        token = str(token or "").strip()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = requests.get(url + "/models", headers=headers, timeout=(2, 3))
         if resp.ok:
             models = resp.json().get("data", [])
             if len(models) == 1 and models[0].get("id", ""):
@@ -382,7 +464,11 @@ def _get_model_config() -> Dict[str, Any]:
         _default = cfg_model
     base_url = (cfg.get("base_url") or "").strip()
     if not str(_default or "").strip() and base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1"):
-        detected = _auto_detect_local_model(base_url)
+        detected = _auto_detect_local_model(
+            base_url,
+            api_key=str(cfg.get("api_key") or "") or None,
+            provider=str(cfg.get("provider") or ""),
+        )
         if detected:
             cfg["default"] = detected
     return cfg

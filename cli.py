@@ -2675,7 +2675,11 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             _base_url = _model_config.get("base_url") or ""
             if base_url_hostname(_base_url) in ("localhost", "127.0.0.1"):
                 from hermes_cli.runtime_provider import _auto_detect_local_model
-                self.model = _auto_detect_local_model(_base_url) or self.model
+                self.model = _auto_detect_local_model(
+                    _base_url,
+                    api_key=str(_model_config.get("api_key") or "") or None,
+                    provider=str(_model_config.get("provider") or ""),
+                ) or self.model
         # Provider normalisation may silently override the default but must warn for an
         # explicit choice (a config model equal to the global fallback is NOT explicit).
         self._model_is_default = not model and not _config_model
