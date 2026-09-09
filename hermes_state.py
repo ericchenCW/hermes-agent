@@ -8259,17 +8259,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def update_system_prompt(
         self, session_id: str, system_prompt: Optional[str]
-    ) -> None:
-        """Store the full assembled system prompt snapshot."""
+    ) -> bool:
+        """Store the full assembled system prompt snapshot.
+
+        Returns ``True`` when the session row was actually updated.
+
+        When the session row does not exist yet the UPDATE matches nothing,
+        and the ``INSERT OR IGNORE`` above it has already put the prompt in
+        ``system_prompts`` with no referrer — running the unreferenced-prompt
+        sweep at that point deleted the row we had just written, so the
+        snapshot vanished with no error anywhere (the caller gets ``None``
+        either way). Now the sweep only runs when the UPDATE landed, so an
+        early/out-of-order call leaves the stored prompt intact for the
+        session row that arrives later, and the miss is logged.
+
+        We deliberately do NOT create the session row here: every other
+        session-scoped writer in this class skips a missing row rather than
+        fabricating one (see ``_merge_model_config_json``'s
+        ``on_missing="skip"`` contract, used by ``update_session_model``),
+        and ``create_session`` needs a ``source`` and the rest of the session
+        metadata that this call site has no way to supply — inventing a
+        placeholder session would surface a phantom row in the session list.
+        """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE sessions "
                 "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (system_prompt_hash, session_id),
             )
+            if cursor.rowcount <= 0:
+                logger.warning(
+                    "update_system_prompt: no session row %r; prompt stored but "
+                    "left unreferenced (skipping the unreferenced-prompt sweep)",
+                    session_id,
+                )
+                return False
             self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do)
+            return True
+        return self._execute_write(_do)
 
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None
