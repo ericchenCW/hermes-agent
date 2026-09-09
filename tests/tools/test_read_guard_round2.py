@@ -259,6 +259,41 @@ class TestReadguardAudit:
         assert row["subject"] == "unknown"
         assert row["platform"] == "unknown"
 
+    def test_gateway_session_shape_identity_not_unknown(self, deployment):
+        """Mirror ``HermesGateway._set_session_env`` (gateway/run.py), which
+        binds the real inbound-message identity fields for every platform
+        adapter (WeCom included) — it passes ``session_key=`` (never
+        ``session_id=``) and ``user_id=`` from ``MessageSource.user_id``.
+
+        ``get_readguard_identity()`` (agent/file_safety.py) reads
+        ``HERMES_SESSION_ID`` first and falls back to ``HERMES_SESSION_KEY``
+        for the audit "session" field, so a real gateway turn — which never
+        sets ``HERMES_SESSION_ID`` — must still resolve to a non-"unknown"
+        session via that fallback.
+        """
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools import file_tools
+
+        tokens = set_session_vars(
+            platform="wecom",
+            session_key="wecom:corpid-1:chat-42",
+            user_id="wecom-user-7",
+            # session_id intentionally omitted — the real gateway call site
+            # (gateway/run.py::_set_session_env) never passes it either.
+        )
+        try:
+            target = deployment["home"] / "config.yaml"
+            raw = file_tools.read_file_tool(str(target))
+            assert json.loads(raw)["error"] == READ_PATH_DENIED_CODE
+        finally:
+            clear_session_vars(tokens)
+
+        row = _log_lines(deployment["home"])[0]
+        assert row["session"] == "wecom:corpid-1:chat-42"
+        assert row["subject"] == "wecom-user-7"
+        assert row["platform"] == "wecom"
+        assert "unknown" not in (row["session"], row["subject"], row["platform"])
+
     def test_path_not_allowed_reason_recorded(self, deployment, tmp_path):
         from tools import file_tools
 
@@ -268,6 +303,34 @@ class TestReadguardAudit:
         row = _log_lines(deployment["home"])[0]
         assert row["reason"] == READGUARD_REASON_PATH
         assert row["tool"] == "read_file"
+
+    def test_proc_environ_denied_before_device_guard(self, deployment):
+        """/proc/*/environ must be refused by the read guard, not the
+        stat-agnostic device-path guard.
+
+        Regression for the ordering bug where ``read_file_tool`` ran the
+        name-based device/special-file guard (``_is_blocked_device``, which
+        also matches ``/proc/*/environ`` — see ``_is_blocked_device_path``)
+        BEFORE ``_read_path_denied_response``. That guard returned its own
+        ad hoc ``tool_error`` message instead of the structured
+        ``path_not_allowed`` payload, and never called
+        ``log_readguard_denial`` — so a credential-leaking read of
+        ``/proc/self/environ`` produced neither the standard refusal shape
+        nor an audit trail line.
+        """
+        from tools import file_tools
+
+        raw = file_tools.read_file_tool("/proc/self/environ")
+        payload = json.loads(raw)
+        assert payload == DENIAL
+        assert payload["error"] == READ_PATH_DENIED_CODE
+
+        rows = _log_lines(deployment["home"])
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["tool"] == "read_file"
+        assert row["reason"] == READGUARD_REASON_FILE
+        assert row["path"] == os.path.normpath("/proc/self/environ")
 
     def test_search_files_denial_logged(self, deployment, tmp_path):
         from tools import file_tools
