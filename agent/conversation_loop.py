@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field, fields
@@ -889,19 +890,228 @@ def _length_continuation_output_cap(default: int = 32768) -> int:
     return max(1024, value)
 
 
-def _length_continuation_worthwhile(assistant_message, truncated_response_parts) -> bool:
-    """idcsre patch: only continue a length-truncated turn that produced visible text.
+# Ceiling on continuation REQUESTS issued for one length-truncated turn.
+# Was a bare literal 4 in three places (bound check, progress text, and the
+# give-up message), compared against a counter that advanced on every
+# truncation rather than on every continuation — so a turn that issued three
+# continuations, or zero, both reported "after 4 continuation attempts"
+# (spark incident 2026-09-09).  The counter now advances only when a
+# continuation is actually sent, and this constant is the number of such
+# sends, which keeps the per-turn request count identical to before.
+LENGTH_CONTINUATION_MAX_ATTEMPTS = 3
 
-    A truncation with no visible content means the whole budget went to hidden reasoning; asking the
-    model to "continue" just repeats that at a larger budget (upstream already turns reasoning off
-    for the retry — this skips the retry entirely).  ``HERMES_LENGTH_CONTINUATION_REASONING_ONLY=1``
-    restores the old always-continue behaviour."""
+
+# Ceiling on whole-turn replays when the model truncated mid tool-call.
+# Separate from the text-continuation ceiling above: that counter now counts
+# continuation REQUESTS, this one always counted replays, so they are not
+# interchangeable numbers.
+TRUNCATED_TOOL_CALL_MAX_RETRIES = 4
+
+
+def _length_continuation_max_attempts(
+    default: int = LENGTH_CONTINUATION_MAX_ATTEMPTS,
+) -> int:
+    """Continuation attempt ceiling, overridable per deployment."""
+    raw = os.environ.get("HERMES_LENGTH_CONTINUATION_ATTEMPTS", "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(0, value)
+
+
+def _reasoning_tokens_from_usage(response) -> int:
+    """``usage.completion_tokens_details.reasoning_tokens``, or 0.
+
+    vLLM (``--reasoning-parser qwen3``), DeepSeek and OpenAI-compatible
+    relays all report the reasoning share of the output budget here, and it
+    is the only exhaustion signal that survives when the provider returns
+    ``content: null`` with no reasoning text echoed back.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("completion_tokens_details")
+    if details is None:
+        return 0
+    value = (
+        details.get("reasoning_tokens")
+        if isinstance(details, dict)
+        else getattr(details, "reasoning_tokens", None)
+    )
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_reasoning_text(response, assistant_message=None) -> str:
+    """Reasoning text carried by either the raw response or the normalized message.
+
+    Providers that put thinking in a SIDE CHANNEL rather than in ``<think>``
+    tags use one of three field names: ``reasoning_content`` (vLLM, DeepSeek,
+    Moonshot), ``reasoning`` (OpenRouter, bifrost) or ``reasoning_details``
+    (OpenRouter structured form).
+    """
+    candidates = []
+    for holder in (assistant_message, response):
+        if holder is None:
+            continue
+        candidates.append(holder)
+        choices = getattr(holder, "choices", None)
+        if choices:
+            try:
+                message = getattr(choices[0], "message", None)
+            except (IndexError, TypeError):
+                message = None
+            if message is not None:
+                candidates.append(message)
+    for holder in candidates:
+        for attr in ("reasoning_content", "reasoning", "reasoning_details"):
+            value = getattr(holder, attr, None)
+            if value is None and isinstance(holder, dict):
+                value = holder.get(attr)
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, (list, tuple)) and value:
+                return str(value)
+    return ""
+
+
+def _thinking_exhausted_signal(
+    *,
+    has_tool_calls: bool,
+    content,
+    has_think_tags: bool,
+    has_content_after_think,
+    reasoning_text: str,
+    reasoning_tokens: int,
+) -> bool:
+    """True when the whole output budget went to hidden reasoning.
+
+    The original check only recognised inline ``<think>`` tags, so a vLLM
+    server started with ``--reasoning-parser qwen3`` — which strips the tags
+    and returns the thinking in ``reasoning_content`` with ``content: null``
+    — fell through to the continuation path, which then refused to continue
+    (no visible content) and reported a fabricated "after 4 continuation
+    attempts".  Side-channel reasoning fields and the usage counter are now
+    first-class evidence.
+    """
+    if has_tool_calls:
+        return False
+    visible = str(content).strip() if isinstance(content, str) else ""
+    if has_think_tags:
+        if content is not None and has_content_after_think(content):
+            return False
+        return True
+    if visible:
+        return False
+    return bool(reasoning_text) or reasoning_tokens > 0
+
+
+def _thinking_exhausted_message(max_tokens: Optional[int]) -> str:
+    budget = f"{max_tokens} tokens" if max_tokens else "本轮的输出上限"
+    return (
+        f"⚠️ 本轮输出预算（{budget}）全部被模型的思考过程用完，没有生成正文。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试，或由管理员调低思考预算。"
+    )
+
+
+def _length_giveup_message(attempts: int, max_attempts: int) -> str:
+    if attempts <= 0:
+        head = "⚠️ 本轮输出过长且无法续写。"
+    else:
+        head = f"⚠️ 已尝试续写 {attempts} 次仍未完成（上限 {max_attempts} 次）。"
+    return (
+        f"{head}"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试。"
+    )
+
+
+def _repetition_abort_message() -> str:
+    return (
+        "⚠️ 模型输出陷入重复，已中止；请换个问法或把任务拆小。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+    )
+
+
+def _truncated_tool_call_message(stub_stall: bool) -> str:
+    if stub_stall:
+        return (
+            "⚠️ 与模型的连接在生成工具调用时反复中断，工具没有被执行。"
+            "本轮没有写入任何内容，已保存的草稿不受影响，请重试。"
+        )
+    return (
+        "⚠️ 模型生成的工具调用参数超出输出长度上限，参数不完整，已拒绝执行。"
+        "本轮没有写入任何内容，已保存的草稿不受影响。"
+        "请把任务拆小（例如一次只改一个小节）再试。"
+    )
+
+
+def log_length_truncation(
+    *,
+    session_id,
+    usage,
+    reasoning_tokens,
+    has_content,
+    has_tool_calls,
+    attempt,
+    max_attempts,
+    action,
+) -> None:
+    """One WARNING line per decision on the finish_reason=length path.
+
+    The whole truncation / continuation / give-up chain used to be silent,
+    so a production incident could only be reconstructed from the gateway's
+    own request log.  ``action`` is one of ``truncated``,
+    ``thinking_exhausted``, ``repetition_abort``, ``continue``, ``give_up``
+    or ``give_up_tool_call``.
+    """
+    logger.warning(
+        "session=%s finish_reason=length prompt=%s completion=%s reasoning=%s "
+        "has_content=%s has_tool_calls=%s attempt=%s/%s action=%s",
+        session_id,
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+        reasoning_tokens,
+        has_content,
+        has_tool_calls,
+        attempt,
+        max_attempts,
+        action,
+    )
+
+
+def _length_continuation_worthwhile(
+    assistant_message, truncated_response_parts, *, retries: int = 0
+) -> bool:
+    """idcsre patch (folded to the compromise semantics): a reasoning-only truncation is
+    continued exactly ONCE.
+
+    A truncation with no visible content means the whole budget went to hidden reasoning.
+    Upstream answers that by re-issuing the request with a one-shot reasoning-off override, which
+    does recover the common case; the fork originally skipped the retry entirely so the operator
+    got the Chinese "thinking exhausted" notice immediately.  The compromise keeps both: the FIRST
+    reasoning-only truncation (``retries == 0``) gets upstream's reasoning-off continuation, and a
+    SECOND consecutive reasoning-only truncation is declared thinking-exhaustion by the caller
+    instead of burning another budget (see ``agent.turn_truncation._continue_text``).
+
+    ``retries`` is the number of continuation requests already ISSUED this turn.
+    ``HERMES_LENGTH_CONTINUATION_REASONING_ONLY=1`` restores the unconditional always-continue
+    behaviour (reasoning-only truncations keep continuing up to the normal ceiling)."""
     if os.environ.get("HERMES_LENGTH_CONTINUATION_REASONING_ONLY", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     if truncated_response_parts:
         return True
     content = getattr(assistant_message, "content", None) if assistant_message is not None else None
-    return bool(content and str(content).strip())
+    if content and str(content).strip():
+        return True
+    # Reasoning-only: upstream's reasoning-off retry gets exactly one shot.
+    return retries == 0
 
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:

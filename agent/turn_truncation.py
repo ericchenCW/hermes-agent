@@ -74,10 +74,14 @@ def normalize_response_for_agent(agent: Any, response: Any) -> Any:
 def partial_result(
     messages: List[Dict[str, Any]], api_call_count: int, final_response: str,
     error: Optional[str] = None, *, failed: bool = False, compression_exhausted: bool = False,
+    error_detail: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Typed incomplete-turn result (``partial`` unless ``failed``); ``error`` defaults to
     ``final_response``. ``compression_exhausted`` carries the #98722 typed bit the gateway
-    consumes to reset/move future input to a clean session (see run_turn.py)."""
+    consumes to reset/move future input to a clean session (see run_turn.py).
+
+    idcsre patch: ``error_detail`` carries the English diagnostic when ``error`` holds the
+    operator-facing Chinese notice, so log scrapers and tests keep a stable string."""
     result = {
         "final_response": final_response,
         "messages": messages,
@@ -88,6 +92,8 @@ def partial_result(
     }
     if compression_exhausted:
         result["compression_exhausted"] = True
+    if error_detail:
+        result["error_detail"] = error_detail
     return result
 
 
@@ -125,6 +131,9 @@ class _Trunc(TruncationVerdict):
     current_turn_user_idx: Any
     action: str = "fallthrough"
     result: Optional[Dict[str, Any]] = None
+    # idcsre patch: normalized response bits stashed for the readguard-style audit lines.
+    _trunc_content: Any = None
+    _trunc_has_tool_calls: bool = False
 
     def done(self, action: str, result: Optional[Dict[str, Any]] = None) -> TruncationVerdict:
         self.action, self.result = action, result
@@ -134,6 +143,7 @@ class _Trunc(TruncationVerdict):
         self, final_response: str, error: Optional[str] = None, *,
         result_messages: Optional[List[Dict[str, Any]]] = None, cleanup: bool = True,
         failed: bool = False, compression_exhausted: bool = False,
+        error_detail: Optional[str] = None,
     ) -> TruncationVerdict:
         """Persist and end the turn as partial (or ``failed``).
 
@@ -147,6 +157,7 @@ class _Trunc(TruncationVerdict):
         return self.done("return", partial_result(
             self.messages if result_messages is None else result_messages, self.api_call_count,
             final_response, error, failed=failed, compression_exhausted=compression_exhausted,
+            error_detail=error_detail,
         ))
 
     @property
@@ -154,15 +165,103 @@ class _Trunc(TruncationVerdict):
         return getattr(self.response, "id", "") == PARTIAL_STREAM_STUB_ID
 
 
-def _abort_reason(agent: Any, content: Any, has_tool_calls: bool) -> Optional[tuple]:
+def _log_length_event(st: Any, action: str, *, attempt: Any = None, max_attempts: Any = None) -> None:
+    """idcsre patch — one WARNING line per decision on the finish_reason=length path.
+
+    The whole truncation / continuation / give-up chain used to be silent, so a production
+    incident could only be reconstructed from the gateway's own request log."""
+    from agent.conversation_loop import _reasoning_tokens_from_usage, log_length_truncation
+
+    agent = st.agent
+    content = getattr(st, "_trunc_content", None)
+    log_length_truncation(
+        session_id=getattr(agent, "session_id", None),
+        usage=getattr(st.response, "usage", None),
+        reasoning_tokens=_reasoning_tokens_from_usage(st.response),
+        has_content=bool(content and str(content).strip()),
+        has_tool_calls=bool(getattr(st, "_trunc_has_tool_calls", False)),
+        attempt=st.length_continue_retries if attempt is None else attempt,
+        max_attempts=max_attempts,
+        action=action,
+    )
+
+
+def _exhausted_budget(agent: Any, response: Any) -> Optional[int]:
+    """The output budget quoted in the thinking-exhaustion notice."""
+    usage = getattr(response, "usage", None)
+    return getattr(usage, "completion_tokens", None) or getattr(agent, "max_tokens", None)
+
+
+def _drop_continuation_trail(st: _Trunc) -> None:
+    """Drop this turn's continuation fragments + unanswered nudges.
+
+    Leaving them behind made every later turn re-truncate against the same dead weight."""
+    idx = st.current_turn_user_idx
+    _turn_start = idx + 1 if isinstance(idx, int) and idx >= 0 else 0
+    st.messages[_turn_start:] = [
+        m for m in st.messages[_turn_start:]
+        if not (isinstance(m, dict) and (
+            m.get("_length_continuation_fragment") or m.get("_length_continuation_nudge")
+        ))
+    ]
+
+
+def _abort_reason(
+    agent: Any, content: Any, has_tool_calls: bool, response: Any = None,
+    *, length_continue_retries: int = 0,
+) -> Optional[tuple]:
     """``(vprint, user response, error)`` when continuation must NOT be attempted:
-    thinking exhausted the budget (reasoning blocks with no visible text after them —
-    ``content=None`` from non-<think> models is normal truncation), or a repetition loop
-    burned the budget on one fragment (reasoning stripped first)."""
+    the stream repetition guard already aborted the request, thinking exhausted the budget
+    (reasoning blocks with no visible text after them), or a repetition loop burned the budget
+    on one fragment (reasoning stripped first).
+
+    idcsre patch: two changes to the thinking-exhaustion arm.  (a) Side-channel reasoning —
+    vLLM ``--reasoning-parser qwen3``, DeepSeek, OpenRouter — never emits ``<think>`` tags and
+    returns ``content: null``, so the tag test alone missed the most common exhaustion shape in
+    production; ``reasoning_content`` / ``reasoning`` / ``reasoning_details`` and
+    ``usage.completion_tokens_details.reasoning_tokens`` are now first-class evidence.  Note this
+    makes ``content=None`` with reasoning evidence an abort rather than a normal truncation.
+    (b) The operator-facing text is Chinese (the English diagnostic stays in ``error``).
+    (c) Compromise semantics (master verdict 8): the side-channel arm from (a) only fires once a
+    continuation request has already gone out (``length_continue_retries > 0``).  Upstream reads
+    that shape as a normal truncation and answers it with the one-shot reasoning-off continuation,
+    so the FIRST occurrence falls through to ``_continue_text`` and gets exactly that retry; a
+    SECOND one is declared exhaustion.  Upstream's own arm — inline ``<think>`` tags with no text
+    after them — keeps aborting immediately, exactly as on main."""
+    from agent.conversation_loop import (
+        _reasoning_tokens_from_usage, _repetition_abort_message, _response_reasoning_text,
+        _thinking_exhausted_message, _thinking_exhausted_signal,
+    )
+
     if has_tool_calls:
         return None
-    if content and _THINK_TAG_RE.search(content) and not agent._has_content_after_think_block(content):
-        return _THINKING_EXHAUSTED
+    # The stream guard already cut the request short: the partial output is a degenerate loop,
+    # so neither continuing it nor keeping it is useful.
+    if response is not None and getattr(response, "_repetition_aborted", False):
+        return (
+            "🔁 Aborted mid-stream — model output entered a repetition loop.",
+            _repetition_abort_message(),
+            "Model output entered a repetition loop mid-stream; the request was aborted "
+            "before the output budget was exhausted.",
+        )
+    reasoning_tokens = _reasoning_tokens_from_usage(response)
+    has_think_tags = bool(content and _THINK_TAG_RE.search(content))
+    if _thinking_exhausted_signal(
+        has_tool_calls=has_tool_calls,
+        content=content,
+        has_think_tags=has_think_tags,
+        has_content_after_think=agent._has_content_after_think_block,
+        reasoning_text=_response_reasoning_text(response),
+        reasoning_tokens=reasoning_tokens,
+    ):
+        if not has_think_tags and length_continue_retries <= 0:
+            # Side-channel shape on its FIRST occurrence: upstream treats this as a normal
+            # truncation and answers it with the one-shot reasoning-off continuation, so fall
+            # through to _continue_text and let that retry happen. Upstream's own arm (inline
+            # <think> tags with nothing after them) still aborts on the spot, unchanged.
+            return None
+        return (_THINKING_EXHAUSTED[0], _thinking_exhausted_message(_exhausted_budget(agent, response)),
+                _THINKING_EXHAUSTED[2])
     visible = agent._strip_think_blocks(content) if isinstance(content, str) else content
     if visible and is_repetition_dominated(visible):
         return _REPETITION_DOMINATED
@@ -215,16 +314,24 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     Never appends an interim assistant row with NO visible content — strict providers
     reject it with 400 — only the nudge."""
     from agent.conversation_loop import (
-        _get_continuation_prompt, _join_truncated_parts, _length_continuation_worthwhile,
+        _get_continuation_prompt, _join_truncated_parts, _length_continuation_max_attempts,
+        _length_continuation_worthwhile, _length_giveup_message, _thinking_exhausted_message,
     )
 
     agent = st.agent
     messages = st.messages
-    st.length_continue_retries += 1
+    # idcsre patch: the counter must only advance when a continuation request is actually
+    # ISSUED. It used to advance on every truncation, so a turn that never continued still
+    # reported one attempt and the give-up text claimed four. ``max_attempts`` is the number of
+    # such sends (default 3, HERMES_LENGTH_CONTINUATION_ATTEMPTS overrides), which keeps the
+    # per-turn request count identical to upstream's ``n < 4`` on the old counter.
+    max_attempts = _length_continuation_max_attempts()
     n = st.length_continue_retries
     _interim_content = getattr(assistant_message, "content", None)
-    if not _interim_content and not st.is_stub:
-        # Thinking-only truncation: continuing with thinking ON re-burns the budget.
+    _reasoning_only = not _interim_content and not st.is_stub
+    if _reasoning_only:
+        # Thinking-only truncation: continuing with thinking ON re-burns the budget, so the
+        # (single) continuation upstream allows goes out with reasoning disabled.
         agent._ephemeral_reasoning_off = True
     if _interim_content:
         interim_msg = agent._build_assistant_message(assistant_message, st.finish_reason)
@@ -232,19 +339,28 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         append_message(messages, interim_msg)
         st.truncated_response_parts.append(_interim_content)
 
-    # idcsre patch: a reasoning-only truncation is not continued at all (see
-    # _length_continuation_worthwhile); the ceiling exit below keeps whatever is stitched so far.
-    if n < 4 and _length_continuation_worthwhile(assistant_message, st.truncated_response_parts):
+    # idcsre patch (compromise semantics): a reasoning-only truncation is continued exactly once
+    # — with reasoning off — and a second one is declared thinking-exhaustion below rather than
+    # burning another budget (see _length_continuation_worthwhile). The ceiling exit further down
+    # keeps whatever is stitched so far.
+    if n < max_attempts and _length_continuation_worthwhile(
+        assistant_message, st.truncated_response_parts, retries=n
+    ):
+        st.length_continue_retries += 1
+        n = st.length_continue_retries
+        _log_length_event(st, "continue", attempt=n, max_attempts=max_attempts)
         _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "
-                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry ({n}/4)..."
+                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry "
+                f"({n}/{max_attempts})..."
             )
         elif st.is_stub:
-            agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/4)...")
+            agent._vprint(
+                f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/{max_attempts})...")
         else:
-            agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...")
+            agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/{max_attempts})...")
         append_message(messages, {
             "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
             "_length_continuation_nudge": True,
@@ -253,32 +369,49 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         _retry.restart_with_length_continuation = True
         return st.done("break")
 
+    if _reasoning_only and n > 0 and not st.truncated_response_parts:
+        # Second consecutive thinking-only truncation, and the reasoning-off continuation was
+        # already spent: the model cannot get past its own reasoning this turn. Abort with the
+        # fork's Chinese notice instead of spending the remaining continuation budget.
+        _log_length_event(st, "thinking_exhausted", attempt=n, max_attempts=max_attempts)
+        agent._ephemeral_reasoning_off = False
+        agent._vprint(f"{agent.log_prefix}{_THINKING_EXHAUSTED[0]}", force=True)
+        _drop_continuation_trail(st)
+        agent._session_messages = messages
+        return st.end_turn(
+            _thinking_exhausted_message(_exhausted_budget(agent, st.response)),
+            _THINKING_EXHAUSTED[2],
+            error_detail=(
+                "Reasoning-only truncation repeated after the reasoning-off continuation "
+                f"(attempt {n}/{max_attempts})"
+            ),
+        )
+
+    _log_length_event(st, "give_up", attempt=n, max_attempts=max_attempts)
+    _giveup_message = _length_giveup_message(n, max_attempts)
     partial_response = agent._strip_think_blocks(_join_truncated_parts(st.truncated_response_parts)).strip()
     # The one-shot reasoning-off override must not leak into the next turn.
     agent._ephemeral_reasoning_off = False
     agent._vprint(
-        f"{agent.log_prefix}⚠️  Response still truncated after {n} continuation attempts — "
+        f"{agent.log_prefix}⚠️  Response still truncated after {n} continuation attempt(s) — "
         + ("keeping the partial response received so far." if partial_response
            else "no visible text was produced."),
         force=True,
     )
     # Unanswered continue nudges made every later turn re-truncate: drop the trail.
-    idx = st.current_turn_user_idx
-    _turn_start = idx + 1 if isinstance(idx, int) and idx >= 0 else 0
-    messages[_turn_start:] = [
-        m for m in messages[_turn_start:]
-        if not (isinstance(m, dict) and (
-            m.get("_length_continuation_fragment") or m.get("_length_continuation_nudge")
-        ))
-    ]
+    _drop_continuation_trail(st)
     if partial_response:
         append_message(messages, {
             "role": "assistant", "content": partial_response, "finish_reason": "length"
         })
     agent._session_messages = messages
     return st.end_turn(
-        partial_response or _CEILING_NO_TEXT,
-        "Response remained truncated after 4 continuation attempts",
+        partial_response or _giveup_message,
+        _giveup_message,
+        error_detail=(
+            f"Response remained truncated after {n} continuation attempt(s) "
+            f"(ceiling {max_attempts})"
+        ),
     )
 
 
@@ -286,14 +419,22 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     """Truncated tool call: re-run the same call (up to 4×) with a boosted max_tokens —
     a real output-cap truncation needs it, harmless for a network stall — else refuse to
     execute incomplete arguments."""
+    from agent.conversation_loop import (
+        TRUNCATED_TOOL_CALL_MAX_RETRIES, _truncated_tool_call_message,
+    )
+
     agent = st.agent
-    if st.truncated_tool_call_retries < 4:
+    # idcsre patch: named constant, separate from the text-continuation ceiling — that counter now
+    # counts continuation REQUESTS, this one always counted whole-turn replays.
+    max_retries = TRUNCATED_TOOL_CALL_MAX_RETRIES
+    if st.truncated_tool_call_retries < max_retries:
         st.truncated_tool_call_retries += 1
         n = st.truncated_tool_call_retries
         if st.is_stub:
-            agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
+            agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/{max_retries})...")
         else:
-            agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
+            agent._buffer_vprint(
+                f"⚠️  Truncated tool call detected — retrying API call ({n}/{max_retries})...")
         _tc_boost = (agent.max_tokens if agent.max_tokens else 4096) * (2 ** n)
         _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _tc_requested_cap is not None:
@@ -303,20 +444,24 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     agent._flush_status_buffer()
     if st.is_stub:
         agent._vprint(
-            f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after 4 retries — the action was not executed.",
+            f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after {max_retries} retries "
+            "— the action was not executed.",
             force=True,
         )
-        _final_response = "Stream repeatedly dropped mid tool-call (network); the tool was not executed"
+        _detail = "Stream repeatedly dropped mid tool-call (network); the tool was not executed"
     else:
         agent._vprint(
             f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
             force=True,
         )
-        _final_response = _TRUNCATED_FINAL
+        _detail = _TRUNCATED_FINAL
+    _log_length_event(st, "give_up_tool_call", attempt=st.truncated_tool_call_retries,
+                      max_attempts=max_retries)
+    _final_response = _truncated_tool_call_message(st.is_stub)
     agent._cleanup_task_resources(st.effective_task_id)
     # Prior tool batches can leave a tool-result tail; this path never reaches finalize_turn.
     close_interrupted_tool_sequence(st.messages, _final_response)
-    return st.end_turn(_final_response, cleanup=False)
+    return st.end_turn(_final_response, cleanup=False, error_detail=_detail)
 
 
 def recover_from_truncation(
@@ -376,12 +521,31 @@ def recover_from_truncation(
     _trunc_msg = normalize_response_for_agent(agent, response)
     _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
     _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
+    # idcsre patch: carried on the working state so the audit lines below can report them.
+    st._trunc_content = _trunc_content
+    st._trunc_has_tool_calls = _trunc_has_tool_calls
 
-    abort = _abort_reason(agent, _trunc_content, _trunc_has_tool_calls)
+    abort = _abort_reason(
+        agent, _trunc_content, _trunc_has_tool_calls, response,
+        length_continue_retries=st.length_continue_retries,
+    )
     if abort is not None:
         line, user_response, error = abort
+        if st.length_continue_retries > 0:
+            # A continuation nudge already went out this turn; don't leave it (or the
+            # fragments) in the transcript for later turns to re-truncate against.
+            _drop_continuation_trail(st)
+            agent._ephemeral_reasoning_off = False
+            agent._session_messages = st.messages
+        _log_length_event(
+            st,
+            "repetition_abort" if getattr(response, "_repetition_aborted", False)
+            else ("thinking_exhausted" if user_response is not _REPETITION_DOMINATED[1]
+                  else "repetition_dominated"),
+        )
         agent._vprint(f"{agent.log_prefix}{line}", force=True)
         return st.end_turn(user_response, error)
+    _log_length_event(st, "truncated")
 
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)

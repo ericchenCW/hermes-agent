@@ -13,11 +13,22 @@ def test_cap_default_and_env(monkeypatch):
     assert cl._length_continuation_output_cap() == 32768
 
 
-def test_reasoning_only_truncation_not_continued(monkeypatch):
+def test_reasoning_only_truncation_continued_exactly_once(monkeypatch):
+    """Compromise semantics (master verdict 8): the first reasoning-only truncation gets
+    upstream's reasoning-off continuation, a second one does not."""
     monkeypatch.delenv("HERMES_LENGTH_CONTINUATION_REASONING_ONLY", raising=False)
     empty = SimpleNamespace(content="", reasoning_content="lots of thinking")
-    assert cl._length_continuation_worthwhile(empty, []) is False
-    assert cl._length_continuation_worthwhile(SimpleNamespace(content="partial answer"), []) is True
-    assert cl._length_continuation_worthwhile(empty, ["earlier visible part"]) is True
-    monkeypatch.setenv("HERMES_LENGTH_CONTINUATION_REASONING_ONLY", "1")
+    # No continuation issued yet → upstream's reasoning-off retry gets its one shot.
     assert cl._length_continuation_worthwhile(empty, []) is True
+    assert cl._length_continuation_worthwhile(empty, [], retries=0) is True
+    # That shot is spent: a second reasoning-only truncation is thinking exhaustion, not a retry.
+    assert cl._length_continuation_worthwhile(empty, [], retries=1) is False
+    assert cl._length_continuation_worthwhile(empty, [], retries=2) is False
+    # Visible text (this fragment or an earlier one) always continues, at any retry count.
+    assert cl._length_continuation_worthwhile(SimpleNamespace(content="partial answer"), []) is True
+    assert cl._length_continuation_worthwhile(
+        SimpleNamespace(content="partial answer"), [], retries=2
+    ) is True
+    assert cl._length_continuation_worthwhile(empty, ["earlier visible part"], retries=2) is True
+    monkeypatch.setenv("HERMES_LENGTH_CONTINUATION_REASONING_ONLY", "1")
+    assert cl._length_continuation_worthwhile(empty, [], retries=2) is True

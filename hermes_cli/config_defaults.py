@@ -19,6 +19,25 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
+    # ``model`` is either a bare model name (string) or a mapping. As a
+    # mapping it also carries the deployment overrides read in
+    # agent/agent_init.py:
+    #   default            — model id
+    #   provider/base_url  — endpoint
+    #   context_length     — input window, when /models cannot report it
+    #   max_tokens         — output budget for one response
+    #   reasoning_max_tokens — optional thinking budget, sent as
+    #       ``extra_body.thinking_token_budget`` (and, when an OpenRouter-style
+    #       ``reasoning`` object is already present, its ``max_tokens``).
+    #       Unset (the default) means Hermes sends no budget and the model may
+    #       spend the ENTIRE ``max_tokens`` on hidden reasoning, returning no
+    #       visible content at all. Set it on reasoning models served through a
+    #       gateway that drops unknown request fields.
+    # Related env knobs for the truncation path:
+    #   HERMES_LENGTH_CONTINUATION_ATTEMPTS  — continuation ceiling (default 4)
+    #   HERMES_LENGTH_CONTINUATION_MAX_TOKENS — continuation output cap
+    #   HERMES_REPETITION_GUARD=0            — disable the streaming
+    #       repetition-loop abort
     "model": "",
     "providers": {},
     "fallback_providers": [],

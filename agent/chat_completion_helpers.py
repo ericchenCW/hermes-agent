@@ -39,6 +39,12 @@ from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (_sanitize_surrogates, _repair_tool_call_arguments)
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.repetition_guard import (
+    STREAM_CHECK_INTERVAL as _REP_CHECK_INTERVAL,
+    STREAM_TAIL_WINDOW as _REP_TAIL_WINDOW,
+    stream_repetition_guard_enabled,
+    tail_repetition_detected,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -2752,6 +2758,11 @@ class _StreamingCall(StreamingWaitMonitor):
         base_timeout, read_timeout, conn_cap = self._stream_timeouts()
         content_parts: list = []
         reasoning_parts: list = []
+        # idcsre patch — streaming repetition-guard state. A degenerate reasoning loop otherwise
+        # burns the whole output budget (and minutes of wall clock) before the truncation handler
+        # ever runs; qwen3-style models can spend 16k tokens on one repeated paragraph.
+        _rep_guard_on = stream_repetition_guard_enabled()
+        _rep_guard_state = {"aborted": False, "kind": "", "reasoning_chars": 0, "content_chars": 0}
         pending_text_parts: list[str] = []
         tool_calls = _ToolCallAccumulator()
         tool_calls_acc = tool_calls.acc
@@ -2772,6 +2783,51 @@ class _StreamingCall(StreamingWaitMonitor):
             pending_text_parts.clear()
             for text in pending_parts:
                 (self._route_suppressed_text if tool_calls_acc else self._emit_text)(text)
+
+        def _rep_guard_tripped(kind: str, parts: list, delta_len: int) -> bool:
+            """idcsre patch — True when the accumulated ``kind`` stream is looping verbatim.
+
+            Checked at most once per ``_REP_CHECK_INTERVAL`` accumulated characters so the
+            streaming hot path stays cheap."""
+            if not _rep_guard_on:
+                return False
+            key = f"{kind}_chars"
+            pending = _rep_guard_state[key] + delta_len
+            if pending < _REP_CHECK_INTERVAL:
+                _rep_guard_state[key] = pending
+                return False
+            _rep_guard_state[key] = 0
+            try:
+                # Only the trailing window matters — walk back over the accumulated deltas instead
+                # of re-joining the whole stream (quadratic over a long reasoning block).
+                tail_chunks: list[str] = []
+                tail_len = 0
+                for part in reversed(parts):
+                    tail_chunks.append(part)
+                    tail_len += len(part)
+                    if tail_len >= _REP_TAIL_WINDOW:
+                        break
+                tail_chunks.reverse()
+                if not tail_repetition_detected("".join(tail_chunks)):
+                    return False
+            except Exception:
+                return False
+            _rep_guard_state["aborted"] = True
+            _rep_guard_state["kind"] = kind
+            logger.warning(
+                "Repetition guard tripped on %s stream (session=%s model=%s); aborting the request "
+                "instead of burning the output budget. Set HERMES_REPETITION_GUARD=0 to disable.",
+                kind, getattr(self.agent, "session_id", None), getattr(self.agent, "model", None),
+            )
+            try:
+                self._close_managed_stream()
+            except Exception:
+                if self._attempt_request_client is not None:
+                    self.agent._abort_request_openai_client(
+                        self._attempt_request_client,
+                        reason="repetition_guard_stream_close_failed",
+                    )
+            return True
 
         from agent import relay_llm
         stream = self._set_managed_stream(relay_llm.stream(self.api_kwargs, _open_stream,
@@ -2826,12 +2882,19 @@ class _StreamingCall(StreamingWaitMonitor):
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 self._emit_reasoning(reasoning_text)
+                if _rep_guard_tripped("reasoning", reasoning_parts, len(reasoning_text)):
+                    break
 
             # Text (list-of-blocks deltas flattened once); possible echoed SSE is
             # buffered until it can be judged.
             delta_content = flatten_message_text(getattr(delta, "content", None), sep="")
             if delta_content:
                 content_parts.append(delta_content)
+                if not tool_calls_acc and _rep_guard_tripped(
+                    "content", content_parts, len(delta_content)
+                ):
+                    _flush_pending_stream_text()
+                    break
                 if tool_calls_acc:
                     self._route_suppressed_text(delta_content)
                 # idcsre patch: the SSE-leak heuristic only makes sense at a line start — a delta
@@ -2861,13 +2924,24 @@ class _StreamingCall(StreamingWaitMonitor):
 
         tool_calls.materialize()
         self._close_managed_stream()
+
+        if _rep_guard_state["aborted"]:
+            # idcsre patch: report it as an output-length truncation so the existing
+            # finish_reason == "length" handling in the turn loop owns the turn; the marker stamped
+            # on the response below tells that handler this was a repetition abort (no
+            # continuation, dedicated message) rather than a plain budget overrun.
+            finish_reason = "length"
         if self._stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(f"stream attempt {stream_attempt_id} was superseded")
         if stream.final_response is not None:
             return self._adopt_final_response(stream.final_response)
-        return self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
+        _response = self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
             finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider)
+        if _rep_guard_state["aborted"]:
+            with contextlib.suppress(Exception):
+                _response._repetition_aborted = _rep_guard_state["kind"] or True
+        return _response
 
     def _adopt_final_response(self, final_response):
         """Adapter returned a completed response for ``stream=True``: switch the

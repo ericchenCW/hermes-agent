@@ -205,27 +205,40 @@ class TestThinkingOnlyTruncation:
         # text) does not set it again — so the third call sees thinking ON.
         assert loop_agent._ephemeral_reasoning_off is False
 
-    def test_full_ceiling_with_empty_fragments_still_settles(self, loop_agent):
-        """All four attempts thinking-only: the turn must exit through the
-        ceiling with an actionable final_response, no poisoned transcript,
-        and no leaked reasoning-off flag."""
+    def test_all_thinking_only_settles_on_the_second_truncation(self, loop_agent):
+        """Every attempt thinking-only.
+
+        Compromise semantics (master verdict 8): the FIRST thinking-only truncation still gets
+        upstream's reasoning-off continuation, but the SECOND one is declared thinking-exhaustion
+        instead of walking the whole continuation ceiling — so the turn settles after exactly two
+        requests, with the fork's Chinese notice, no poisoned transcript and no leaked flag.
+        """
         loop_agent.client.chat.completions.create.side_effect = [
             _thinking_only_length_response() for _ in range(4)
         ]
         result = _run(loop_agent, "write me a long report")
 
+        calls = loop_agent.client.chat.completions.create.call_args_list
+        assert len(calls) == 2, (
+            "one reasoning-off continuation, then abort — the remaining continuation "
+            f"budget must not be spent, got {len(calls)} requests"
+        )
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+        # Fork: the user-facing notice is the Chinese thinking-exhaustion text (actionable: split
+        # the task up); the English diagnostic stays in error / error_detail.
         assert result["final_response"], (
-            "An all-empty ceiling exit must still surface a user-facing "
-            "message instead of an invisible None."
+            "An all-empty exit must still surface a user-facing message instead of "
+            "an invisible None."
         )
-        assert "reasoning" in (result["final_response"] or "").lower()
+        assert "思考过程用完" in (result["final_response"] or "")
+        assert "拆小" in (result["final_response"] or "")
+        assert "reasoning" in (result.get("error") or "")
+        assert "Reasoning-only truncation repeated" in (result.get("error_detail") or "")
         assert _no_empty_assistant_rows(result["messages"]) == []
         assert loop_agent._ephemeral_reasoning_off is False, (
-            "The ceiling exit must clear the pending one-shot override so the "
-            "next turn does not silently lose thinking."
+            "The exit must clear the pending one-shot override so the next turn "
+            "does not silently lose thinking."
         )
 
     def test_mixed_fragments_keep_visible_text(self, loop_agent):
@@ -308,6 +321,46 @@ class TestReasoningOffReachesTheWire:
             "system prompt must be byte-identical across the retry sequence "
             "(the override may only change request parameters, never the prefix)"
         )
+        assert loop_agent._ephemeral_reasoning_off is False
+
+    def test_second_thinking_only_truncation_aborts_after_the_reasoning_off_retry(self, loop_agent):
+        """The two halves of the compromise, asserted on the wire.
+
+        Request 1 goes out with the user's reasoning config and comes back thinking-only →
+        request 2 is upstream's one-shot reasoning-off continuation (the fork no longer
+        short-circuits it). That one is thinking-only too → the fork declares thinking
+        exhaustion, ends the turn with its Chinese notice, and issues NO third request.
+        """
+        loop_agent.reasoning_config = {"enabled": True, "effort": "high"}
+        loop_agent._supports_reasoning_extra_body = lambda: True
+        loop_agent.client.chat.completions.create.side_effect = [
+            _thinking_only_length_response(),
+            _thinking_only_length_response(),
+            _full_response("this must never be requested."),
+        ]
+        result = _run(loop_agent, "write me a long report")
+
+        calls = loop_agent.client.chat.completions.create.call_args_list
+        assert len(calls) == 2, f"expected exactly one continuation, got {len(calls)} requests"
+        wire = [(c.kwargs.get("extra_body") or {}).get("reasoning") for c in calls]
+        assert wire[0] == {"enabled": True, "effort": "high"}, wire
+        assert wire[1] == {"enabled": False, "effort": "none"}, (
+            f"the single continuation must go out with thinking off; got {wire!r}"
+        )
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "思考过程用完" in (result["final_response"] or "")
+        assert "拆小" in (result["final_response"] or "")
+        # The English diagnostic is what operators/log scrapers read.
+        assert "Model used all output tokens on reasoning" in (result.get("error") or "")
+        assert "Reasoning-only truncation repeated" in (result.get("error_detail") or "")
+        # No scaffolding survives: no empty assistant rows and no unanswered continue nudge.
+        assert _no_empty_assistant_rows(result["messages"]) == []
+        assert not [
+            m for m in result["messages"]
+            if isinstance(m, dict) and m.get("_length_continuation_nudge")
+        ], "the unanswered continuation nudge must be dropped from the transcript"
         assert loop_agent._ephemeral_reasoning_off is False
 
     def test_stale_flag_does_not_leak_into_next_turn(self, loop_agent):

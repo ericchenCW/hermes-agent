@@ -59,3 +59,62 @@ def _line_repetition_dominated(text: str, n: int) -> bool:
     """True when a single normalized line covers half the fragment via repeats."""
     counts = Counter(norm for norm in (line.strip() for line in text.splitlines()) if norm)
     return any(c >= _MIN_REPEAT_COUNT and c * len(line) >= n * _DOMINANCE_RATIO for line, c in counts.items())
+
+
+# ── Streaming tail guard (SRE fork) ────────────────────────────────────
+# The post-hoc :func:`is_repetition_dominated` check above only runs AFTER
+# the provider burned the entire output budget.  A qwen3-style reasoning
+# model that degenerates inside ``reasoning_content`` can spend 16k tokens
+# and four minutes of wall clock on one repeated paragraph before Hermes
+# ever sees the response (spark incident 2026-09-09).  The helpers below
+# run DURING streaming on the accumulated tail so the request can be
+# aborted as soon as the loop is unmistakable.
+#
+# Deliberately narrow: an exact verbatim repeat of the trailing
+# ``STREAM_MIN_FRAGMENT`` characters, at least ``STREAM_MIN_REPEATS``
+# times inside the trailing ``STREAM_TAIL_WINDOW`` characters.  Ordinary
+# prose never repeats 120 characters verbatim three times in 2K chars.
+
+# Trailing slice of the accumulated text the guard inspects.
+STREAM_TAIL_WINDOW = 2048
+# Length of the trailing fragment used as the repetition probe.
+STREAM_MIN_FRAGMENT = 120
+# How often that fragment must occur inside the window to trip the guard.
+STREAM_MIN_REPEATS = 3
+# Re-check only every N accumulated characters (str.count is cheap, but the
+# streaming loop is the hottest path in the agent).
+STREAM_CHECK_INTERVAL = 256
+
+
+def stream_repetition_guard_enabled() -> bool:
+    """False when ``HERMES_REPETITION_GUARD`` is set to a falsey value."""
+    import os
+
+    raw = os.environ.get("HERMES_REPETITION_GUARD", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def tail_repetition_detected(
+    text: str,
+    *,
+    window: int = STREAM_TAIL_WINDOW,
+    fragment: int = STREAM_MIN_FRAGMENT,
+    min_repeats: int = STREAM_MIN_REPEATS,
+) -> bool:
+    """True when the tail of ``text`` is an obvious verbatim repeat loop.
+
+    Takes the last ``window`` characters, uses the last ``fragment``
+    characters as the probe, and counts its (non-overlapping) occurrences.
+    ``str.count`` is a C-level scan, so this is O(window) per call.
+
+    Fail-open on anything it cannot judge (non-string, too short).
+    """
+    if not isinstance(text, str):
+        return False
+    if len(text) < fragment * min_repeats:
+        return False
+    tail = text[-window:]
+    probe = tail[-fragment:]
+    if not probe.strip():
+        return False
+    return tail.count(probe) >= min_repeats
