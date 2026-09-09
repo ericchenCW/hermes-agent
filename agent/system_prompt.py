@@ -478,10 +478,13 @@ def _timestamp_line(agent: Any) -> str:
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
-def _memory_parts(agent: Any) -> List[str]:
+def _memory_parts(agent: Any, scrub=None) -> List[str]:
     """Built-in memory/USER.md blocks plus the external provider block (gated on
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
-    tools the toolset config gated off)."""
+    tools the toolset config gated off).
+
+    idcsre patch: ``scrub`` (when given) rewrites vendor names in the provider block only — it is
+    Hermes-authored prose, unlike the memory entries and USER.md around it, which stay verbatim."""
     parts: List[str] = []
     if agent._memory_store:
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
@@ -502,7 +505,7 @@ def _memory_parts(agent: Any) -> List[str]:
             except Exception:
                 _ext_mem_block = None
             if _ext_mem_block:
-                parts.append(_ext_mem_block)
+                parts.append(scrub(_ext_mem_block) if scrub else _ext_mem_block)
     return parts
 
 
@@ -708,11 +711,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     # Skills are runtime-mutable, so the index leads the volatile band: on a longest-prefix
     # backend an unchanged index stays inside the reused prefix; a changed one re-prefills from here.
-    volatile_parts: List[str] = [skills_prompt, *_memory_parts(agent)]
+    # idcsre patch: volatile blocks that Hermes itself authors (the skills-index framing, the
+    # external-memory provider block, the runtime footer) get the same vendor scrub as the stable
+    # tier — the stable tier is not the only place the vendor name reaches the model, and a
+    # white-labeled deployment leaking "Hermes" from any of them is the same bug.  Caller-supplied
+    # text (``system_message``), context files, memory entries, USER.md and plugin sections stay
+    # verbatim.  Ordering is byte-identical to the unconfigured build.
+    _vscrub = (lambda t: scrub_vendor_names(t, _identity)) if _identity is not None else None
+    volatile_parts: List[str] = [
+        _vscrub(skills_prompt) if (_vscrub and skills_prompt) else skills_prompt,
+        *_memory_parts(agent, scrub=_vscrub),
+    ]
     # Plugin sections are confined to one coarse anchor in the volatile tail so
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
-    volatile_parts.append(_timestamp_line(agent))
+    # The runtime footer ("Model: auto / Provider: custom") is Hermes prose too — a model that has
+    # nothing else to go on will read it out as its identity.
+    _ts_line = _timestamp_line(agent)
+    volatile_parts.append(_vscrub(_ts_line) if (_vscrub and _ts_line) else _ts_line)
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
     if environment_hints:

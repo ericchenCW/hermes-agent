@@ -596,6 +596,29 @@ def _print_billing_or_entitlement_guidance(
     ))
 
 
+def _identity_prompt_stale(agent, stored_prompt: str) -> bool:
+    """idcsre patch — identity epoch: the "eternal session" problem one tier up.
+
+    A session created before ``agent.identity`` was configured (or before an identity-segment
+    change shipped) keeps its archived prompt on every later turn, so a container rebuilt with the
+    white-label fix still answers "I am Hermes Agent, built by Nous Research" in every pre-existing
+    conversation.  ``_bot_chat_prompt_stale`` only fires on a missing Bot Chat protocol section,
+    which an identity change never touches — hence this second, narrower trigger.  Idempotent and
+    at most once per agent, so it cannot make the prefix cache thrash; fails closed to "reuse"."""
+    if getattr(agent, "_identity_prompt_refreshed", False):
+        return False
+    try:
+        from agent.identity_config import resolve_identity, stored_prompt_identity_stale
+        from agent.system_prompt import _IDENTITY_UNSET
+
+        identity = getattr(agent, "_agent_identity", _IDENTITY_UNSET)
+        if identity is _IDENTITY_UNSET:
+            identity = resolve_identity(None)
+        return bool(stored_prompt_identity_stale(stored_prompt, identity))
+    except Exception:
+        return False
+
+
 def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
     """Bot Chat capability epoch check for a stored prompt.
 
@@ -675,6 +698,21 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+        if _identity_prompt_stale(agent, stored_prompt):
+            logger.info(
+                "Configured agent identity is missing from the stored system prompt for session "
+                "%s; rebuilding so the next turn answers with the operator identity (one-time "
+                "prefix-cache break).",
+                agent.session_id,
+            )
+            agent._identity_prompt_refreshed = True
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            _persist_system_prompt(
+                agent,
+                "Session DB update_system_prompt failed after identity refresh (session=%s): %s. "
+                "The refresh will re-fire next turn.",
+            )
+            return
         if _bot_chat_prompt_stale(agent, stored_prompt):
             logger.info(
                 "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
