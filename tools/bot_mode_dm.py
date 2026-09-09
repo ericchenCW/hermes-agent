@@ -16,12 +16,16 @@ existing background-process notification path (fire-and-forget, never
 blocks the sender's turn).
 
 Containment contract (MUST hold — reviewers check all three):
-- The tool schema is injected ONLY into a bot's canonical "Bot Chat"
-  session on Bot-Mode-managed installs — the exact same gate as the
-  protocol section in ``tools/bot_mode_probe.py``. It is NOT registered in
-  the global tool registry, is NOT part of any toolset, and never appears
-  in CLI sessions, ordinary gateway chats, group-room member sessions
-  (titled "Group: …"), cron agents, or subagents.
+- The tool schema is injected ONLY into sessions that pass
+  ``bot_mode_scope_allows`` on a Bot-Mode-managed install — the exact same
+  gate as the protocol section in ``agent/system_prompt.py``. By default
+  that is a bot's canonical "Bot Chat" session and nothing else; with
+  ``agent.bot_mode_protocol_scope: all`` it widens to every ordinary
+  session of that profile (for orchestrators that drive one bot through
+  many sessions), and never to group-room member sessions (titled
+  "Group: …"), cron agents, or subagents. It is NOT registered in the
+  global tool registry and is NOT part of any toolset, so it never appears
+  on installs that are not Bot-Mode-managed.
 - Dispatch is title-gated again at execution time (defense in depth): a
   forged call from a session that shouldn't have the tool returns a
   structured error instead of delivering.
@@ -70,6 +74,78 @@ _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+# ── protocol scope (config.yaml ``agent.bot_mode_protocol_scope``) ───────────
+#
+# "bot_chat" (default, upstream behaviour) — the protocol section and this
+# tool exist ONLY in a profile's canonical "Bot Chat" session.
+# "all" — every session of a Bot-Mode-managed profile qualifies, whatever
+# its title.  For external orchestrators (Haro) that drive one bot through
+# many sessions: Hermes session titles are globally unique, so "Bot Chat"
+# can only ever name one of them.
+#
+# The exclusions that "bot_chat" enforced *implicitly* (a group room, cron
+# agent or subagent never carries the canonical title) become EXPLICIT here,
+# so widening the scope cannot smuggle A2A messaging into them.
+BOT_MODE_SCOPE_BOT_CHAT = "bot_chat"
+BOT_MODE_SCOPE_ALL = "all"
+
+#: Bot Mode group-room plumbing sessions are titled "Group: <room>" by the
+#: desktop plugin (apps/desktop/src/plugins/hermes-bots). Never A2A surfaces.
+GROUP_SESSION_TITLE_PREFIX = "Group: "
+
+
+def _bot_mode_protocol_scope(agent: Any) -> str:
+    """Normalised scope for ``agent``; anything unknown means "bot_chat"."""
+    raw = str(getattr(agent, "_bot_mode_protocol_scope", BOT_MODE_SCOPE_BOT_CHAT) or "")
+    return BOT_MODE_SCOPE_ALL if raw.strip().lower() == BOT_MODE_SCOPE_ALL else BOT_MODE_SCOPE_BOT_CHAT
+
+
+def _is_subagent_context(agent: Any) -> bool:
+    """True for delegated subagents (they must never gain A2A messaging)."""
+    try:
+        if bool(getattr(agent, "is_subagent", False)):
+            return True
+        return int(getattr(agent, "_delegate_depth", 0) or 0) > 0
+    except Exception:
+        return False
+
+
+def _is_cron_context() -> bool:
+    """True inside a cron-scheduled turn (session ContextVar, env fallback)."""
+    try:
+        from gateway.session_context import get_session_env
+
+        raw = get_session_env("HERMES_CRON_SESSION", "") or ""
+    except Exception:
+        raw = os.getenv("HERMES_CRON_SESSION", "") or ""
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def bot_mode_scope_allows(agent: Any, title: str | None) -> bool:
+    """Single shared session gate for the Bot Mode teammate protocol.
+
+    Used by all three enforcement points — the system-prompt section
+    (agent/system_prompt.py), tool injection (``ensure_message_agent_tool``)
+    and execution-time dispatch (``message_agent_tool``) — so the three can
+    never drift apart. Does NOT check ``is_bot_mode_managed`` or the
+    ``bot_mode_protocol`` toggle; callers keep doing that themselves.
+    """
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    clean = str(title or "").strip()
+    if clean == BOT_CHAT_TITLE:
+        return True
+    if _bot_mode_protocol_scope(agent) != BOT_MODE_SCOPE_ALL:
+        return False
+    # Explicit re-statement of exclusions the title check used to imply.
+    if clean.startswith(GROUP_SESSION_TITLE_PREFIX):
+        return False
+    if _is_subagent_context(agent):
+        return False
+    if _is_cron_context():
+        return False
+    return True
 
 
 def message_agent_tool_schema() -> dict:
@@ -130,10 +206,10 @@ def ensure_message_agent_tool(agent: Any) -> bool:
     """Inject the ``message_agent`` schema into a Bot Chat agent's tool list.
 
     Called once per turn from the conversation loop. Idempotent and
-    deterministic for the life of a session: the gate (canonical Bot Chat
-    title on a Bot-Mode-managed install) is stable from the session's first
-    turn, so the tool list is byte-identical across turns — prompt-cache
-    safe. Every non-Bot-Chat session fails the gate on every turn and never
+    deterministic for the life of a session: the gate (``bot_mode_scope_allows``
+    on a Bot-Mode-managed install) is stable from the session's first turn,
+    so the tool list is byte-identical across turns — prompt-cache safe.
+    Every session that fails the scope gate fails it on every turn and never
     sees the schema. Never raises.
     """
     try:
@@ -147,9 +223,9 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_mode_managed
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not bot_mode_scope_allows(agent, _session_title(agent)):
             return False
         # Managed-install check, NOT section non-emptiness: a profile whose
         # SOUL.md carries the legacy plugin-appended protocol text gets an
@@ -250,16 +326,17 @@ def message_agent_tool(
     the Bot Chat gate, the sender identity, and the session key so the
     spawned transport is tracked against the right session.
     """
-    # ── defense-in-depth gate: only a canonical Bot Chat may deliver ──
+    # ── defense-in-depth gate: only an in-scope session may deliver ──
     home = _agent_home(agent)
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_mode_managed
 
         title = _session_title(agent)
-        if title != BOT_CHAT_TITLE:
+        if not bot_mode_scope_allows(agent, title):
             return _err(
-                "message_agent is only available in a Bot Mode 'Bot Chat' session. "
-                "This session is not one; do not retry."
+                "message_agent is only available in a Bot Mode 'Bot Chat' session "
+                "(or, with agent.bot_mode_protocol_scope: all, in any ordinary "
+                "session of a bot profile). This session is not one; do not retry."
             )
         if not is_bot_mode_managed(home):
             return _err(

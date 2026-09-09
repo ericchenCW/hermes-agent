@@ -745,17 +745,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
     if getattr(agent, "_bot_mode_protocol", True):
         try:
+            from tools.bot_mode_dm import bot_mode_scope_allows
             from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
                 epoch_line,
                 get_bot_mode_protocol_section,
+                is_bot_mode_managed,
             )
             _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
             if not _title:
                 _sdb = getattr(agent, "_session_db", None)
                 _sid = getattr(agent, "session_id", None)
                 _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-            if _title == BOT_CHAT_TITLE:
+            # Scope gate (config ``agent.bot_mode_protocol_scope``): the
+            # canonical "Bot Chat" title by default, any session of a
+            # Bot-Mode-managed profile under scope "all" — minus group
+            # rooms / cron / subagents, which stay excluded explicitly.
+            if bot_mode_scope_allows(agent, _title) and is_bot_mode_managed(_agent_home(agent)):
                 _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
                 if _bot_section:
                     post_workspace_parts.append(_bot_section)

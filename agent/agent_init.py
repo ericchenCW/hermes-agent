@@ -490,6 +490,28 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _resolve_bot_mode_protocol_scope(raw) -> str:
+    """Normalise ``agent.bot_mode_protocol_scope`` from config.
+
+    "bot_chat" (default, upstream behaviour) restricts the Bot Mode teammate
+    protocol to a profile's canonical "Bot Chat" session; "all" widens it to
+    every ordinary session of a Bot-Mode-managed profile (group rooms, cron
+    agents and subagents stay excluded — see
+    ``tools/bot_mode_dm.bot_mode_scope_allows``). Anything else is a config
+    typo: warn once and fall back to the safe default rather than silently
+    widening or narrowing the A2A surface.
+    """
+    value = str(raw or "").strip().lower()
+    if value in ("bot_chat", "all"):
+        return value
+    logger.warning(
+        "Invalid agent.bot_mode_protocol_scope=%r; falling back to 'bot_chat' "
+        "(valid values: 'bot_chat', 'all')",
+        raw,
+    )
+    return "bot_chat"
+
+
 def _normalize_run_budget_seconds(value) -> Optional[float]:
     """Normalize a wall-clock run budget value to a positive float or None.
 
@@ -2066,6 +2088,13 @@ def init_agent(
     # Bot Mode teammate protocol section (tools/bot_mode_probe.py) — pure
     # filesystem reads, no warm needed. Silent on non-Bot-Mode installs.
     agent._bot_mode_protocol = bool(_agent_section.get("bot_mode_protocol", True))
+    # How far the protocol reaches: "bot_chat" (upstream — canonical
+    # "Bot Chat" session only) or "all" (every session of a Bot-Mode-managed
+    # profile).  See tools/bot_mode_dm.bot_mode_scope_allows for the single
+    # shared gate; group rooms / cron / subagents stay excluded either way.
+    agent._bot_mode_protocol_scope = _resolve_bot_mode_protocol_scope(
+        _agent_section.get("bot_mode_protocol_scope", "bot_chat")
+    )
     # Session-title hint for the "Bot Chat" gate: hosts that defer the DB
     # title write past the first prompt build (tui_gateway pending_title)
     # set this so the gate doesn't depend on write ordering.

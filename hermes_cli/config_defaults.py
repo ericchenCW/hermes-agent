@@ -210,6 +210,21 @@ DEFAULT_CONFIG = {
         # Bot Mode teammate-messaging protocol section (silent unless a
         # profile is managed by the desktop's Bot Mode).
         "bot_mode_protocol": True,
+        # Which sessions the Bot Mode teammate protocol (prompt section +
+        # the `message_agent` tool) reaches.  Only meaningful when
+        # `bot_mode_protocol` is True and the install is Bot-Mode-managed.
+        #   "bot_chat" (default) — upstream behaviour: ONLY the canonical
+        #                          "Bot Chat" session of a bot profile.
+        #   "all"                — every session of a Bot-Mode-managed
+        #                          profile, whatever its title.  For external
+        #                          orchestrators that drive one bot through
+        #                          many sessions and cannot rename them
+        #                          (Hermes session titles are globally
+        #                          unique, so "Bot Chat" fits only one).
+        #                          Group-room sessions ("Group: …"), cron
+        #                          agents and subagents stay excluded.
+        # An unrecognised value falls back to "bot_chat" with a warning.
+        "bot_mode_protocol_scope": "bot_chat",
         # Embedder-supplied environment description appended to the system
         # prompt's environment-hints block. Lets a host that wraps Hermes
         # (sandbox runner, managed platform) explain the runtime environment
