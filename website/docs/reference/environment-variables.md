@@ -839,6 +839,8 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_ALLOW_PRIVATE_URLS` | `true`/`false` — allow tools to fetch localhost/private-network URLs. Off by default in gateway mode. |
 | `HERMES_REDACT_SECRETS` | `true`/`false` — control secret redaction in tool output, logs, and chat responses (default: `true`). |
 | `HERMES_WRITE_SAFE_ROOT` | Optional directory prefix that **hard-blocks** `write_file`/`patch` writes outside the listed roots (no approval prompt). Supports multiple directories separated by `os.pathsep` (`:` on Unix, `;` on Windows). See [HERMES_WRITE_SAFE_ROOT](#hermes_write_safe_root) below. |
+| `HERMES_READ_SAFE_ROOTS` | Optional comma- (or `os.pathsep`-) separated list of absolute directories that `read_file`, `search_files` and the terminal tool's read commands may read. Anything outside is refused with a fixed `path_not_allowed` payload. See [HERMES_READ_SAFE_ROOTS](#hermes_read_safe_roots) below. |
+| `HERMES_READ_SAFE_ROOTS_BYPASS` | Set to `1` to disable BOTH the read allowlist and its always-on denylist. For the deployment's own maintainer/operator role only. |
 | `HERMES_DISABLE_LAZY_INSTALLS` | Internal bridge var set automatically in the official Docker image to prevent runtime dependency installs into the immutable `/opt/hermes` tree. The user-facing equivalent is `security.allow_lazy_installs: false` in `config.yaml`; do not set this in `.env`. |
 | `HERMES_DISABLE_FILE_STATE_GUARD` | Set to `1` to turn off the "file changed since you read it" guard on `patch`/`write_file`. |
 | `HERMES_BUNDLED_SKILLS` | Comma-separated override for the list of bundled skills loaded at startup. |
@@ -866,6 +868,40 @@ export HERMES_WRITE_SAFE_ROOT=/path/to/project:/home/you/.hermes
 ```
 
 Unset the variable or remove it from `.env` to restore normal writes (still subject to the credential-path denylist — see [File write safety](../user-guide/security.md#file-write-safety)).
+
+### HERMES_READ_SAFE_ROOTS {#hermes_read_safe_roots}
+
+Read-direction sibling of `HERMES_WRITE_SAFE_ROOT`. It exists because a Hermes bot exposed to
+untrusted chat users through a read-only toolset (`read_file` / `search_files`, sometimes
+`terminal`) can otherwise be talked into returning its own `config.yaml` — model endpoints,
+runtime token references, IM credential references, internal addresses.
+
+```bash
+export HERMES_READ_SAFE_ROOTS=/knowledge,/opt/data/kb
+```
+
+Two layers apply:
+
+1. **Allowlist** — when the variable is set, a read target must resolve (after `realpath`, so
+   symlinks and `..` are followed) inside one of the listed roots.
+2. **Denylist** — always on, and it stacks on top of the allowlist:
+   `$HERMES_HOME`, `~/.hermes`, `/opt/data/config.yaml`, any `.env*` file, `*.key`, `*.pem`,
+   `/proc`, `/etc`.
+
+Every refusal returns the same structured payload, so it cannot be used to probe whether a
+path exists or what it contains:
+
+```json
+{"error": "path_not_allowed", "message": "该路径不在允许读取的范围内"}
+```
+
+The terminal tool applies the same rules to path operands parsed out of the command
+(`cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, `awk`, `python -c`, …). A command
+that cannot be fully parsed is refused as soon as it mentions an absolute path outside the
+allowlist or a `..` escape.
+
+Admin toolsets (`sre`) are constrained too. Set `HERMES_READ_SAFE_ROOTS_BYPASS=1` to lift both
+layers for the maintainer/operator role that administers the deployment itself.
 
 ## Interface
 

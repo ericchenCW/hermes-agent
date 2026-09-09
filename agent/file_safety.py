@@ -756,3 +756,399 @@ def get_container_mirror_warning(
         f"(Defense-in-depth — not a security boundary; the terminal tool "
         f"can still bypass.)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Read path allowlist (HERMES_READ_SAFE_ROOTS)
+#
+# Sibling of HERMES_WRITE_SAFE_ROOT, for the READ direction. Motivation: a
+# Hermes bot exposed to untrusted chat users through a read-only toolset
+# (``read_file`` / ``search_files`` / ``terminal``) could be talked into
+# returning its own ``config.yaml`` — model endpoints, runtime token
+# references, IM credential references, internal addresses.
+#
+# Two layers, both enforced by :func:`get_read_path_denial`:
+#
+#   1. **Allowlist** — when ``HERMES_READ_SAFE_ROOTS`` is set, a read target
+#      must resolve inside one of the listed roots. Anything else is refused
+#      with a fixed, content-free payload that leaks neither the file's
+#      existence nor its contents.
+#   2. **Denylist** — always on (it stacks on top of the allowlist): Hermes
+#      home/root trees, ``/opt/data/config.yaml``, any ``.env*`` file,
+#      ``*.key`` / ``*.pem``, ``/proc`` and ``/etc``.
+#
+# Unlike :func:`get_read_block_error` (documented as defense-in-depth, not a
+# boundary) this guard also covers the terminal tool's own read commands, so
+# a ``cat`` fallback does not walk around it.
+#
+# ``HERMES_READ_SAFE_ROOTS_BYPASS=1`` disables BOTH layers. It exists for the
+# maintainer / built-in operator role that administers the deployment itself.
+# ---------------------------------------------------------------------------
+
+READ_SAFE_ROOTS_ENV = "HERMES_READ_SAFE_ROOTS"
+READ_SAFE_ROOTS_BYPASS_ENV = "HERMES_READ_SAFE_ROOTS_BYPASS"
+
+#: Structured refusal returned for every read-path denial. Deliberately
+#: uniform: the caller learns nothing about the target beyond "not allowed"
+#: — not whether it exists, not what it contains, not which rule fired.
+READ_PATH_DENIED_CODE = "path_not_allowed"
+READ_PATH_DENIED_MESSAGE = "该路径不在允许读取的范围内"
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+# Suffixes that always hold key material.
+_READ_DENIED_SUFFIXES = (".key", ".pem")
+
+# Absolute trees that are never readable through the managed tools.
+_READ_DENIED_SYSTEM_PREFIXES = ("/proc", "/etc")
+
+# Exact absolute files that are never readable (beyond the Hermes trees).
+_READ_DENIED_EXACT = ("/opt/data/config.yaml",)
+
+
+def is_read_safe_root_bypassed() -> bool:
+    """Return True when ``HERMES_READ_SAFE_ROOTS_BYPASS`` disables the guard.
+
+    Config-key equivalent: ``security.read_safe_roots_bypass: true`` is
+    bridged to this env var by the CLI/gateway startup, the same way
+    ``security.redact_secrets`` bridges to ``HERMES_REDACT_SECRETS``.
+    """
+    return os.getenv(READ_SAFE_ROOTS_BYPASS_ENV, "").strip().lower() in _TRUTHY
+
+
+def get_safe_read_roots() -> set[str]:
+    """Return resolved ``HERMES_READ_SAFE_ROOTS`` paths.
+
+    Accepts commas (the documented separator) as well as ``os.pathsep``, so
+    ``/knowledge,/opt/data/kb`` and ``/knowledge:/opt/data/kb`` both work.
+    Empty/unresolvable entries are dropped; an empty result means "no
+    allowlist configured" (denylist only).
+    """
+    env = os.getenv(READ_SAFE_ROOTS_ENV, "")
+    if not env:
+        return set()
+    raw: list[str] = []
+    for chunk in env.split(os.pathsep):
+        raw.extend(chunk.split(","))
+    roots: set[str] = set()
+    for path in raw:
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            roots.add(os.path.realpath(os.path.expanduser(path)))
+        except (OSError, ValueError):
+            continue
+    return roots
+
+
+def _resolve_for_read_guard(path: str) -> Optional[str]:
+    """realpath+expanduser a candidate path; None when it cannot be resolved.
+
+    ``os.path.realpath`` resolves symlinks and normalizes ``..`` without
+    touching the filesystem for missing components, so a symlink pointing
+    out of an allowed root and a ``../../etc/passwd`` traversal both land on
+    their true target before the prefix test runs.
+    """
+    try:
+        return os.path.realpath(os.path.expanduser(str(path)))
+    except (OSError, ValueError):
+        return None
+
+
+def _under(candidate: str, prefix: str) -> bool:
+    """True when ``candidate`` is ``prefix`` itself or lives beneath it."""
+    return candidate == prefix or candidate.startswith(prefix.rstrip(os.sep) + os.sep)
+
+
+def _denied_prefixes() -> list[str]:
+    """Always-denied directory trees, in both raw and symlink-resolved form.
+
+    macOS ships ``/etc`` and ``/tmp`` as symlinks into ``/private``, so a
+    realpath-only comparison would miss ``/etc/passwd`` (it resolves to
+    ``/private/etc/passwd``). Listing both spellings keeps the denylist
+    platform-independent.
+    """
+    prefixes: list[str] = []
+    for prefix in _READ_DENIED_SYSTEM_PREFIXES:
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+        try:
+            real = os.path.realpath(prefix)
+        except (OSError, ValueError):
+            continue
+        if real not in prefixes:
+            prefixes.append(real)
+    # $HERMES_HOME (profile-aware), the global Hermes root, and the literal
+    # ~/.hermes default — the last one matters when HERMES_HOME has been
+    # pointed elsewhere but the stock profile still exists on disk.
+    for base in (
+        _hermes_home_path(),
+        _hermes_root_path(),
+        os.path.expanduser("~/.hermes"),
+    ):
+        for form in (str(base), os.path.realpath(base)):
+            if form and form not in prefixes:
+                prefixes.append(form)
+    return prefixes
+
+
+def _read_denylist_hit(candidates: tuple[str, ...]) -> bool:
+    """Return True when any spelling of the target hits the read denylist."""
+    prefixes = _denied_prefixes()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        lowered = os.path.basename(candidate).lower()
+
+        # Any .env / .env.local / .envrc / .env.whatever anywhere on disk.
+        if lowered.startswith(".env"):
+            return True
+
+        # Key material by extension.
+        if lowered.endswith(_READ_DENIED_SUFFIXES):
+            return True
+
+        if candidate in _READ_DENIED_EXACT:
+            return True
+
+        for prefix in prefixes:
+            try:
+                if _under(candidate, prefix):
+                    return True
+            except (OSError, ValueError):
+                continue
+
+    return False
+
+
+def get_read_path_denial(path: str) -> Optional[dict]:
+    """Return the structured refusal for ``path``, or ``None`` when allowed.
+
+    The returned mapping is exactly what tools should serialize back to the
+    model::
+
+        {"error": "path_not_allowed", "message": "该路径不在允许读取的范围内"}
+
+    It is intentionally identical for every denial reason so the response
+    cannot be used as an oracle for path existence, file type, or which rule
+    fired.
+
+    Callers that resolve relative paths against a non-process cwd (the file
+    tools' ``TERMINAL_CWD``) MUST pass the already-absolute path — this
+    function's own ``realpath`` is anchored at the Python process cwd.
+    """
+    if is_read_safe_root_bypassed():
+        return None
+
+    resolved = _resolve_for_read_guard(path)
+    if resolved is None:
+        # Unresolvable input: fail closed.
+        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
+
+    # The denylist is checked against BOTH the symlink-resolved path and the
+    # merely-normalized one, so neither ``/etc/passwd`` (a symlink on macOS)
+    # nor a symlink pointing INTO a denied tree can slip through.
+    try:
+        normalized = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
+    except (OSError, ValueError):
+        normalized = resolved
+    if _read_denylist_hit((resolved, normalized)):
+        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
+
+    roots = get_safe_read_roots()
+    if roots:
+        for root in roots:
+            if resolved == root or resolved.startswith(root + os.sep):
+                return None
+        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
+
+    return None
+
+
+def is_read_path_denied(path: str) -> bool:
+    """Boolean form of :func:`get_read_path_denial`."""
+    return get_read_path_denial(path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Terminal-command read guard
+#
+# The file tools' allowlist is worthless if ``cat /opt/data/config.yaml``
+# walks around it, so the same rules are applied to path operands extracted
+# from shell commands. Two tiers:
+#
+#   * **Known read commands** (``cat``/``head``/``grep``/``find``/``ls``/…):
+#     every operand is treated as a path and fully validated.
+#   * **Everything else, including commands we cannot parse**: any token that
+#     is an absolute path, a ``~`` path, or contains a ``..`` traversal is
+#     validated. Per the brief, a command we cannot fully resolve is refused
+#     as soon as it mentions an out-of-allowlist absolute path or a ``..``
+#     escape, rather than being waved through.
+#
+# This is a *path* guard, not a shell emulator: it does not try to model
+# every redirection or expansion. It raises the cost of the obvious
+# exfiltration shapes and fails closed on the ones it cannot read.
+# ---------------------------------------------------------------------------
+
+import re as _re
+import shlex as _shlex
+
+#: Commands whose operands are file paths.
+_READ_COMMANDS = frozenset({
+    "cat", "bat", "tac", "nl", "head", "tail", "less", "more", "most",
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "zgrep",
+    "find", "fd", "ls", "ll", "dir", "tree", "stat", "file", "du", "wc",
+    "sed", "awk", "gawk", "mawk", "cut", "sort", "uniq", "tr", "column",
+    "od", "xxd", "hexdump", "strings", "base64", "md5sum", "sha256sum",
+    "diff", "cmp", "readlink", "realpath", "jq", "yq", "xmllint",
+    "python", "python3", "perl", "ruby", "node", "php",
+    "cp", "install", "rsync", "scp", "tar", "zip", "unzip", "gzip", "gunzip",
+    "openssl", "curl", "wget", "dd", "vi", "vim", "nano", "emacs", "view",
+})
+
+#: Read commands whose FIRST non-flag operand is a script/pattern, not a
+#: path (``sed -n '1,5p' f``, ``grep foo f``, ``python -c 'code'``). That
+#: operand is only checked when it is itself absolute or ``~``-rooted.
+_SCRIPT_FIRST_COMMANDS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "zgrep",
+    "sed", "awk", "gawk", "mawk", "perl", "ruby", "python", "python3",
+    "node", "php",
+})
+
+#: Flags that mean "the pattern/script came from a flag", so the first
+#: operand is a path after all.
+_PATTERN_FLAGS = frozenset({"-e", "-f", "--regexp", "--file", "--expression", "-c"})
+
+#: Wrapper commands that prefix the real command.
+_COMMAND_PREFIXES = frozenset({
+    "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time",
+    "timeout", "nice", "ionice", "stdbuf", "xargs", "watch", "strace",
+})
+
+_SEGMENT_SPLIT_RE = _re.compile(r"&&|\|\||\$\(|[;\n|&()`]")
+
+_ENV_ASSIGN_TOKEN_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+#: Absolute paths embedded INSIDE another token — ``python -c 'open("/opt/…")'``,
+#: ``awk '{…}' /etc/x``, a heredoc body, an unparsed quoted blob. The
+#: lookbehind stops ``s/foo/bar/`` (sed script) and ``http://…`` from matching,
+#: because their ``/`` follows a word character.
+_EMBEDDED_ABS_PATH_RE = _re.compile(r"(?<![\w:])(/[A-Za-z0-9._+\-]+(?:/[A-Za-z0-9._+\-]+)*)")
+
+
+def _embedded_paths(token: str) -> list[str]:
+    """Absolute-path substrings hiding inside a single shell token."""
+    if not token or "://" in token:
+        return []
+    return _EMBEDDED_ABS_PATH_RE.findall(token)
+
+
+def _looks_absolute_or_escape(token: str) -> bool:
+    """True when a token names an absolute path or escapes upward."""
+    if not token or "://" in token:
+        return False
+    if token.startswith("/") or token.startswith("~"):
+        return True
+    parts = token.replace("\\", "/").split("/")
+    return ".." in parts
+
+
+def _command_path_candidates(command: str) -> list[str]:
+    """Extract path-ish operands from a shell command string."""
+    candidates: list[str] = []
+
+    # Baseline pass over the raw string: any multi-segment absolute path
+    # mentioned ANYWHERE in the command is checked, whatever the shell
+    # structure around it. This is what catches shapes the tokenizer cannot
+    # model — ``python -c 'open("/opt/data/config.yaml")'``, heredocs,
+    # nested substitutions. Single-segment matches (``/etc`` on its own) are
+    # left to the per-command pass so an incidental mention in a commit
+    # message or a comment does not fail the whole command closed.
+    for token in (command or "").split():
+        for found in _embedded_paths(token.strip("'\"")):
+            if found.count("/") >= 2:
+                candidates.append(found)
+
+    for segment in _SEGMENT_SPLIT_RE.split(command or ""):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            argv = _shlex.split(segment, posix=True)
+        except ValueError:
+            # Unbalanced quotes — we cannot parse it. Fall back to the
+            # conservative tier: flag anything that looks like an absolute
+            # path or a traversal.
+            for token in segment.split():
+                token = token.strip("'\"")
+                if _looks_absolute_or_escape(token):
+                    candidates.append(token)
+                candidates.extend(_embedded_paths(token))
+            continue
+        # Strip leading env assignments and wrapper commands.
+        while argv and (
+            _ENV_ASSIGN_TOKEN_RE.match(argv[0])
+            or os.path.basename(argv[0]) in _COMMAND_PREFIXES
+        ):
+            argv = argv[1:]
+        if not argv:
+            continue
+        name = os.path.basename(argv[0])
+        rest = argv[1:]
+        is_read_cmd = name in _READ_COMMANDS
+        skip_first_operand = (
+            is_read_cmd
+            and name in _SCRIPT_FIRST_COMMANDS
+            and not any(flag in _PATTERN_FLAGS for flag in rest)
+        )
+        seen_operand = False
+        for token in rest:
+            if not token or token == "-":
+                continue
+            # An absolute path hiding inside a bigger token (a ``python -c``
+            # program, an ``awk`` body, a quoted blob) is checked no matter
+            # which command it belongs to.
+            candidates.extend(_embedded_paths(token))
+            if token.startswith("-"):
+                continue
+            if not is_read_cmd:
+                if _looks_absolute_or_escape(token):
+                    candidates.append(token)
+                continue
+            if skip_first_operand and not seen_operand:
+                seen_operand = True
+                # A pattern/script operand is only a path when it is spelled
+                # as one (``grep /etc/passwd`` is still worth refusing).
+                if token.startswith("/") or token.startswith("~"):
+                    candidates.append(token)
+                continue
+            seen_operand = True
+            candidates.append(token)
+    return candidates
+
+
+def get_command_read_denial(command: str, cwd: Optional[str] = None) -> Optional[dict]:
+    """Return the structured refusal when a shell command reads a blocked path.
+
+    ``cwd`` anchors relative operands (the terminal tool's resolved working
+    directory). Returns ``None`` when nothing in the command is out of
+    bounds, or when ``HERMES_READ_SAFE_ROOTS_BYPASS`` is set.
+    """
+    if is_read_safe_root_bypassed():
+        return None
+    if not command or not isinstance(command, str):
+        return None
+
+    base = cwd or os.getcwd()
+    for token in _command_path_candidates(command):
+        expanded = os.path.expanduser(token)
+        if not os.path.isabs(expanded):
+            try:
+                expanded = os.path.join(base, expanded)
+            except (OSError, ValueError, TypeError):
+                continue
+        denial = get_read_path_denial(expanded)
+        if denial is not None:
+            return denial
+    return None

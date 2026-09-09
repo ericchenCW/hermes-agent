@@ -390,6 +390,7 @@ TIPS = [
     "display.tool_progress_command: true exposes /verbose on messaging platforms; it's CLI-only by default.",
     'HERMES_BACKGROUND_NOTIFICATIONS=result only pings when background tasks finish (vs concise/all/error/off).',
     'HERMES_WRITE_SAFE_ROOT restricts write_file/patch to directory prefixes; multiple paths via os.pathsep (: or ;).',
+    'HERMES_READ_SAFE_ROOTS restricts read_file/search_files/terminal reads to listed absolute roots; HERMES_READ_SAFE_ROOTS_BYPASS=1 lifts it.',
     'HERMES_IGNORE_RULES skips auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills.',
     'HERMES_ACCEPT_HOOKS auto-approves unseen shell hooks declared in config.yaml without a TTY prompt.',
     'auxiliary.goal_judge.model routes the /goal judge to a cheap fast model to keep loop cost near zero.',

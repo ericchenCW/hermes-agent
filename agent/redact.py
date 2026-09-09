@@ -771,6 +771,118 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+# ---------------------------------------------------------------------------
+# Key/value credential fallback for file CONTENT (file_read=True).
+#
+# ``file_read=True`` implies ``code_file=True``, which deliberately skips the
+# ENV / JSON / YAML assignment passes to avoid mangling source code. The side
+# effect was that a config file returned verbatim by ``read_file`` kept its
+# ``api_key: …`` / ``bot_secret: …`` / ``Authorization: …`` values in the
+# clear whenever the value had no recognized vendor prefix — exactly the leak
+# that a chat-facing bot returning its own ``config.yaml`` produces.
+#
+# This pass runs for file content only, with a NARROW key vocabulary (the
+# nine names from the security review) and the same word-boundary validation
+# used elsewhere, so document prose ("密码策略", "Secretary:", "tokenizer:")
+# is left alone. It covers YAML (``key: value``), env (``KEY=value``) and
+# JSON (``"key": "value"``) spellings in one regex.
+# ---------------------------------------------------------------------------
+_KV_SECRET_KEY_NAMES = (
+    r"(?:api[ _.\-]?key|apikey|bot[ _.\-]?secret|secret|token|password|passwd"
+    r"|credential|authorization)"
+)
+_KV_SECRET_RE = re.compile(
+    r"(?:^|(?<=[\s{,\[]))"
+    r"([\"\']?)([A-Za-z0-9_.\-]*" + _KV_SECRET_KEY_NAMES + r"[A-Za-z0-9_.\-]*)\1"
+    r"([ \t]*[:=][ \t]*)"
+    r"([\"\']?)([^\s\"\',}\]]+)\4",
+    re.IGNORECASE | re.MULTILINE,
+)
+_KV_SECRET_KEY_WORD_RE = re.compile(_KV_SECRET_KEY_NAMES, re.IGNORECASE)
+_AUTH_SCHEME_WORD_RE = re.compile(r"^(?:Bearer|Basic|Token|Digest|Negotiate)$", re.IGNORECASE)
+
+
+def _kv_key_is_secret(key: str) -> bool:
+    """True when one of the narrow secret names sits at a word boundary.
+
+    Own validator rather than ``_key_has_secret_keyword`` because that one's
+    vocabulary rejects ``authorization`` (its ``auth`` keyword fails the
+    word-end test against ``…orization``) while accepting broader words this
+    pass deliberately excludes.
+    """
+    for m in _KV_SECRET_KEY_WORD_RE.finditer(key):
+        if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
+            return True
+    return False
+
+
+def _redact_kv_secrets(text: str) -> str:
+    """Mask ``key: value`` / ``key=value`` / ``"key": "value"`` credentials."""
+    if ":" not in text and "=" not in text:
+        return text
+
+    def _sub(m):
+        key_quote, key, sep, val_quote, value = m.groups()
+        if _ENV_LOOKUP_VALUE_RE.match(value):
+            return m.group(0)
+        # Already masked by an earlier pass, or the value position holds an
+        # auth SCHEME word whose credential was masked by _AUTH_HEADER_RE
+        # ("Authorization: Bearer ***") — masking again destroys the scheme
+        # without hiding anything.
+        if (
+            value in {"***", "[REDACTED]"}
+            or value.startswith("\u00ab")  # « … » non-reusable sentinel
+            or _AUTH_SCHEME_WORD_RE.match(value)
+        ):
+            return m.group(0)
+        if not _kv_key_is_secret(key):
+            return m.group(0)
+        return f"{key_quote}{key}{key_quote}{sep}{val_quote}***{val_quote}"
+
+    return _KV_SECRET_RE.sub(_sub, text)
+
+
+# Standalone ``Bearer <token>`` outside an Authorization header (curl notes,
+# docs, pasted request logs). ``_AUTH_HEADER_RE`` only fires after
+# ``Authorization:``.
+_BEARER_TOKEN_RE = re.compile(r"\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})")
+
+# Long opaque blobs with no vendor prefix (raw hex secrets, base64 keys).
+# Only applied to file CONTENT, and skipped on lines that look like a hash /
+# revision listing — a 40-char hex there is a git SHA or a checksum, not a
+# credential, and masking it corrupts lockfiles and changelogs.
+_OPAQUE_HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_OPAQUE_B64_RE = re.compile(r"\b(?=[A-Za-z0-9+/_-]*[A-Z])(?=[A-Za-z0-9+/_-]*[a-z])"
+                            r"(?=[A-Za-z0-9+/_-]*[0-9])[A-Za-z0-9+/_-]{32,}={0,2}")
+_HASH_CONTEXT_RE = re.compile(
+    r"sha\d*|md5|hash|digest|checksum|integrity|commit|revision|etag|blob|uuid|guid",
+    re.IGNORECASE,
+)
+# WeCom identifiers (``ww…`` corp ids, ``wo…`` user ids) are not secrets and
+# are needed verbatim for support answers — never mask them.
+_WECOM_ID_RE = re.compile(r"^w[wo][A-Za-z0-9_-]*$")
+
+
+def _redact_opaque_tokens(text: str) -> str:
+    """Mask 32+ char hex / mixed-case base64 blobs in file content."""
+    out_lines = []
+    for line in text.split("\n"):
+        if _HASH_CONTEXT_RE.search(line):
+            out_lines.append(line)
+            continue
+
+        def _sub(m):
+            token = m.group(0)
+            if _WECOM_ID_RE.match(token):
+                return token
+            return "***"
+
+        line = _OPAQUE_HEX_RE.sub(_sub, line)
+        line = _OPAQUE_B64_RE.sub(_sub, line)
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def redact_sensitive_text(
     text: str,
     *,
@@ -1005,6 +1117,19 @@ def redact_sensitive_text(
                 return phone[:2] + "****" + phone[-2:]
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+
+    # Standalone ``Bearer <token>`` (no Authorization: prefix).
+    if "earer" in text:
+        text = _BEARER_TOKEN_RE.sub(lambda m: m.group(1) + "***", text)
+
+    # File CONTENT only: key/value credential fallback + opaque long tokens.
+    # These two passes are what stop a config file returned by read_file /
+    # search_files from handing back model endpoints, runtime tokens and IM
+    # credentials verbatim (the code_file=True skip above disables the
+    # ENV/JSON/YAML passes for exactly this text).
+    if file_read:
+        text = _redact_kv_secrets(text)
+        text = _redact_opaque_tokens(text)
 
     return text
 

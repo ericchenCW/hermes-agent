@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_read_block_error, get_read_path_denial
 from tools.binary_extensions import (
     has_binary_extension,
     has_opaque_document_extension,
@@ -597,6 +597,21 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return False
 
 
+def _read_path_denied_response(path: str) -> str | None:
+    """Return the structured ``path_not_allowed`` JSON for a blocked read.
+
+    ``HERMES_READ_SAFE_ROOTS`` allowlist + always-on denylist (see
+    ``agent.file_safety.get_read_path_denial``). The payload is uniform and
+    content-free on purpose: it must not reveal whether the path exists.
+    Pass an ALREADY-RESOLVED absolute path — the guard's own ``realpath`` is
+    anchored at the Python process cwd, which can differ from TERMINAL_CWD.
+    """
+    denial = get_read_path_denial(path)
+    if denial is None:
+        return None
+    return json.dumps(denial, ensure_ascii=False)
+
+
 def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
     """Return the read-safety error for a search result path.
 
@@ -608,8 +623,12 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     try:
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
-        return get_read_block_error(path)
-    return get_read_block_error(str(resolved))
+        resolved = path
+    resolved = str(resolved)
+    if get_read_path_denial(resolved) is not None:
+        # Uniform, content-free reason: the caller only removes the row.
+        return "path_not_allowed"
+    return get_read_block_error(resolved)
 
 
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
@@ -1637,6 +1656,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # ── Read allowlist / denylist guard ───────────────────────────
+        # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any
+        # stat/open so the refusal cannot leak path existence or file type.
+        _path_denied = _read_path_denied_response(str(_resolved))
+        if _path_denied:
+            return _path_denied
+
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
         # catches the class — any FIFO/socket/device wherever it lives. A
@@ -2591,7 +2617,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
-        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
+        _search_target = str(resolved_path) if resolved_path else path
+        _path_denied = _read_path_denied_response(_search_target)
+        if _path_denied:
+            return _path_denied
+        block_error = get_read_block_error(_search_target)
         if block_error:
             return tool_error(block_error)
 

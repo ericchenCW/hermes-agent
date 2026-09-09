@@ -705,6 +705,21 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    # Secret-redaction backstop for the FINAL user-visible reply.
+    # Tool results are already redacted at each tool boundary (read_file /
+    # search_files / terminal), but the model can quote a secret it saw in a
+    # tool result or system prompt straight into its answer. This is the one
+    # chokepoint every delivery surface (gateway, CLI, TUI, oneshot) passes
+    # through, so the mask is applied once here. ``force=True`` is NOT used:
+    # operators who deliberately set ``security.redact_secrets: false`` keep
+    # their opt-out, same as every other redaction site.
+    if isinstance(final_response, str) and final_response:
+        try:
+            from agent.redact import redact_sensitive_text as _redact_final
+            final_response = _redact_final(final_response)
+        except Exception:  # noqa: BLE001 - never break delivery on a redaction bug
+            logger.debug("final_response redaction failed", exc_info=True)
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,

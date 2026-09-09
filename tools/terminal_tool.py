@@ -3198,6 +3198,32 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        # ── Read allowlist / denylist guard ───────────────────────────
+        # Same rules as read_file/search_files (HERMES_READ_SAFE_ROOTS +
+        # always-on denylist), applied to path operands parsed out of the
+        # command — otherwise `cat /opt/data/config.yaml` walks straight
+        # around the file-tool guard. Uniform, content-free refusal.
+        from agent.file_safety import get_command_read_denial
+
+        _read_guard_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+        )
+        _cmd_denial = get_command_read_denial(command, _read_guard_cwd)
+        if _cmd_denial:
+            logger.warning(
+                "Blocked out-of-allowlist read path (command: %s)",
+                _safe_command_preview(command),
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _cmd_denial["error"],
+                "message": _cmd_denial["message"],
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Windows-only: NTFS locks loaded module files, so rewriting the local
         # checkout backing this interpreter can corrupt the running process.
         # POSIX keeps old inodes alive for open handles, so the guard is off
