@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -767,15 +768,30 @@ def get_container_mirror_warning(
 # returning its own ``config.yaml`` — model endpoints, runtime token
 # references, IM credential references, internal addresses.
 #
-# Two layers, both enforced by :func:`get_read_path_denial`:
+# Round 3 settled the guard into TWO TIERS, because this tree is also forked
+# for plain CLI / standalone-gateway deployments that never set an allowlist —
+# there, a blanket ``/etc`` deny broke ordinary operator work for no security
+# gain, while the credential files must stay unreadable regardless.
 #
-#   1. **Allowlist** — when ``HERMES_READ_SAFE_ROOTS`` is set, a read target
+#   ① **Credential & privacy denials — ALWAYS on, and they outrank the
+#      allowlist.** They do not depend on ``HERMES_READ_SAFE_ROOTS``:
+#        * ``$HERMES_HOME`` / the Hermes root / ``~/.hermes``:
+#          ``.env``, ``config.yaml``, ``auth.json``, ``state.db``,
+#          ``channel_directory.json``, plus the ``memories/`` and
+#          ``sessions/`` trees;
+#        * any ``.env*`` / ``*.key`` / ``*.pem`` anywhere on disk;
+#        * ``/proc/self/environ`` and ``/proc/<pid>/environ``.
+#
+#   ② **Directory-level denials — ONLY when ``HERMES_READ_SAFE_ROOTS`` is
+#      set.** ``/etc``, ``/sys``, ``/dev``, the rest of ``/proc``, and the
+#      remaining ``$HERMES_HOME`` subtrees (``logs/`` included). With no
+#      allowlist configured these follow upstream behaviour and read
+#      normally. An explicit allowlist root outranks this tier (but never ①).
+#
+#   ③ **Allowlist** — when ``HERMES_READ_SAFE_ROOTS`` is set, a read target
 #      must resolve inside one of the listed roots. Anything else is refused
 #      with a fixed, content-free payload that leaks neither the file's
 #      existence nor its contents.
-#   2. **Denylist** — always on (it stacks on top of the allowlist): Hermes
-#      home/root trees, ``/opt/data/config.yaml``, any ``.env*`` file,
-#      ``*.key`` / ``*.pem``, ``/proc`` and ``/etc``.
 #
 # Unlike :func:`get_read_block_error` (documented as defense-in-depth, not a
 # boundary) this guard also covers the terminal tool's own read commands, so
@@ -807,38 +823,17 @@ READGUARD_REASON_FILE = "denied_file"
 READGUARD_REASON_EXPORT = "kb_export"
 READGUARD_REASON_QUOTA = "kb_read_quota"
 
-# --- FILE-level denials -----------------------------------------------------
-# These win over the allowlist: a secret-bearing basename stays unreadable even
-# when it sits inside an explicitly allowed root (``/knowledge/.env``).
+# --- Tier ①: credential & privacy denials — ALWAYS on -----------------------
+# These win over the allowlist AND do not need one to be configured: a
+# secret-bearing file stays unreadable even inside an explicitly allowed root
+# (``/knowledge/.env``) and on a fork that never sets HERMES_READ_SAFE_ROOTS.
 
-# Suffixes that always hold key material.
+# Suffixes that always hold key material, anywhere on disk.
 _READ_DENIED_SUFFIXES = (".key", ".pem")
 
-# Basenames that are always secret/state bearing, wherever they live.
-_READ_DENIED_BASENAMES = frozenset({
-    "config.yaml",
-    "state.db",
-    "auth.json",
-    "channel_directory.json",
-})
-
-# --- DIRECTORY-level denials ------------------------------------------------
-# These LOSE to an explicit allowlist root (see ``_classify_read_path``): the
-# Haro container sets ``HERMES_HOME=/opt/data`` and still hands the bot
-# ``/opt/data/skills`` as a read root, so the whole-tree deny must not swallow
-# the allowed subtree. File-level denials above still apply inside it.
-
-# Absolute trees that are never readable through the managed tools.
-_READ_DENIED_SYSTEM_PREFIXES = ("/proc", "/etc", "/sys", "/dev")
-
-# Subdirectories of $HERMES_HOME / the Hermes root that are named explicitly.
-# Already covered by the whole-tree prefix, but listed so the intent survives a
-# future narrowing of that prefix (and so the tests can point at them).
-_HERMES_DENIED_SUBDIRS = ("memories", "sessions", "logs")
-
-# Files directly under $HERMES_HOME / the Hermes root that are named
-# explicitly. Also covered by the basename rules above; duplicated for the
-# same reason as ``_HERMES_DENIED_SUBDIRS``.
+# Files directly under $HERMES_HOME / the Hermes root / ~/.hermes. Deliberately
+# NOT a global basename rule: a knowledge-base document that happens to be
+# called ``config.yaml`` is ordinary content and must stay readable.
 _HERMES_DENIED_FILES = (
     ".env",
     "config.yaml",
@@ -847,8 +842,37 @@ _HERMES_DENIED_FILES = (
     "channel_directory.json",
 )
 
-# Exact absolute files that are never readable (beyond the Hermes trees).
-_READ_DENIED_EXACT = ("/opt/data/config.yaml", "/proc/self/environ")
+# Subtrees of $HERMES_HOME / the Hermes root / ~/.hermes that hold conversation
+# history and long-term user memory — privacy, not just credentials, so they
+# are denied whether or not an allowlist is configured.
+_HERMES_ALWAYS_DENIED_SUBDIRS = ("memories", "sessions")
+
+# Process environment blocks: every exported secret of a running process.
+# ``/proc/self/environ`` and ``/proc/<pid>/environ`` for any pid.
+_PROC_ENVIRON_RE = re.compile(r"^/proc/(?:self|\d+)/environ$")
+
+# Exact absolute files that are never readable, independent of HERMES_HOME —
+# the stock Haro container path, kept as a belt-and-braces literal.
+_READ_DENIED_EXACT = ("/opt/data/config.yaml",)
+
+# --- Tier ②: directory-level denials — only with an allowlist configured ----
+# These LOSE to an explicit allowlist root (see
+# :func:`classify_read_path_denial`): the Haro container sets
+# ``HERMES_HOME=/opt/data`` and still hands the bot ``/opt/data/skills`` as a
+# read root, so the whole-tree deny must not swallow the allowed subtree. And
+# they are skipped entirely when no allowlist is set, so a CLI/standalone fork
+# keeps upstream behaviour for ``/etc/hosts`` & co. Tier ① still applies in
+# both cases.
+
+# Absolute trees that are not readable through the managed tools.
+_READ_DENIED_SYSTEM_PREFIXES = ("/proc", "/etc", "/sys", "/dev")
+
+# Subdirectories of $HERMES_HOME / the Hermes root that are named explicitly.
+# Already covered by the whole-tree prefix, but listed so the intent survives a
+# future narrowing of that prefix (and so the tests can point at them).
+# ``memories``/``sessions`` are NOT here — they were promoted to tier ①;
+# ``logs`` (which holds readguard.jsonl) stays at this tier.
+_HERMES_DENIED_SUBDIRS = ("logs",)
 
 
 def is_read_safe_root_bypassed() -> bool:
@@ -906,8 +930,43 @@ def _under(candidate: str, prefix: str) -> bool:
     return candidate == prefix or candidate.startswith(prefix.rstrip(os.sep) + os.sep)
 
 
+def _hermes_bases() -> list[str]:
+    """$HERMES_HOME, the Hermes root and ``~/.hermes``, raw and realpath'd.
+
+    The literal ``~/.hermes`` matters when ``HERMES_HOME`` has been pointed
+    elsewhere but the stock profile still exists on disk.
+    """
+    bases: list[str] = []
+    for base in (
+        _hermes_home_path(),
+        _hermes_root_path(),
+        os.path.expanduser("~/.hermes"),
+    ):
+        for form in (str(base), os.path.realpath(base)):
+            if form and form not in bases:
+                bases.append(form)
+    return bases
+
+
+def _always_denied_prefixes() -> list[str]:
+    """Tier ① trees: ``memories/`` and ``sessions/`` under every Hermes base."""
+    prefixes: list[str] = []
+    for base in _hermes_bases():
+        for sub in _HERMES_ALWAYS_DENIED_SUBDIRS:
+            try:
+                candidate = os.path.join(base, sub)
+            except (OSError, ValueError, TypeError):
+                continue
+            for form in (candidate, os.path.realpath(candidate)):
+                if form and form not in prefixes:
+                    prefixes.append(form)
+    return prefixes
+
+
 def _denied_prefixes() -> list[str]:
-    """Always-denied directory trees, in both raw and symlink-resolved form.
+    """Tier ② directory trees, in both raw and symlink-resolved form.
+
+    Only consulted when ``HERMES_READ_SAFE_ROOTS`` is configured.
 
     macOS ships ``/etc`` and ``/tmp`` as symlinks into ``/private``, so a
     realpath-only comparison would miss ``/etc/passwd`` (it resolves to
@@ -925,23 +984,16 @@ def _denied_prefixes() -> list[str]:
         if real not in prefixes:
             prefixes.append(real)
     # $HERMES_HOME (profile-aware), the global Hermes root, and the literal
-    # ~/.hermes default — the last one matters when HERMES_HOME has been
-    # pointed elsewhere but the stock profile still exists on disk.
-    for base in (
-        _hermes_home_path(),
-        _hermes_root_path(),
-        os.path.expanduser("~/.hermes"),
-    ):
-        for form in (str(base), os.path.realpath(base)):
-            if form and form not in prefixes:
-                prefixes.append(form)
+    # ~/.hermes default.
+    for base in _hermes_bases():
+        if base not in prefixes:
+            prefixes.append(base)
         # Named explicitly even though the whole-tree prefix above already
-        # covers them: memories/, sessions/ and logs/ (which holds
-        # readguard.jsonl itself) must stay denied if that prefix is ever
-        # narrowed.
+        # covers it: logs/ (which holds readguard.jsonl itself) must stay
+        # denied if that prefix is ever narrowed.
         for sub in _HERMES_DENIED_SUBDIRS:
             try:
-                candidate = os.path.join(str(base), sub)
+                candidate = os.path.join(base, sub)
             except (OSError, ValueError, TypeError):
                 continue
             for form in (candidate, os.path.realpath(candidate)):
@@ -953,10 +1005,10 @@ def _denied_prefixes() -> list[str]:
 def _denied_exact_files() -> list[str]:
     """Explicitly named unreadable files (``$HERMES_HOME/config.yaml`` & co.)."""
     exact = list(_READ_DENIED_EXACT)
-    for base in (_hermes_home_path(), _hermes_root_path(), os.path.expanduser("~/.hermes")):
+    for base in _hermes_bases():
         for name in _HERMES_DENIED_FILES:
             try:
-                candidate = os.path.join(str(base), name)
+                candidate = os.path.join(base, name)
             except (OSError, ValueError, TypeError):
                 continue
             for form in (candidate, os.path.realpath(candidate)):
@@ -966,14 +1018,18 @@ def _denied_exact_files() -> list[str]:
 
 
 def _read_denied_file_hit(candidates: tuple[str, ...]) -> bool:
-    """FILE-level denial — outranks the allowlist.
+    """Tier ① — credential & privacy denial. Always on; outranks the allowlist.
 
-    A ``.env``/``*.key``/``*.pem``/``config.yaml``/``state.db``/``auth.json``/
-    ``channel_directory.json`` is refused even inside an explicitly allowed
-    read root, because those basenames only ever carry credentials or
-    application state.
+    Fires for ``.env*`` / ``*.key`` / ``*.pem`` anywhere on disk, for the named
+    ``$HERMES_HOME`` credential and state files, for the ``memories/`` and
+    ``sessions/`` trees under any Hermes base, and for ``/proc/<pid>/environ``.
+
+    Note what is deliberately absent: a bare ``config.yaml``/``state.db``
+    basename elsewhere on disk. A knowledge-base article named ``config.yaml``
+    is ordinary content, and blanket-denying the basename made it unreadable.
     """
     exact = _denied_exact_files()
+    always = _always_denied_prefixes()
     for candidate in candidates:
         if not candidate:
             continue
@@ -987,16 +1043,26 @@ def _read_denied_file_hit(candidates: tuple[str, ...]) -> bool:
         if lowered.endswith(_READ_DENIED_SUFFIXES):
             return True
 
-        if lowered in _READ_DENIED_BASENAMES:
-            return True
-
         if candidate in exact:
             return True
+
+        # /proc/self/environ and /proc/<pid>/environ — the exported secrets of
+        # any running process. Checked here (not at tier ②) so it stays denied
+        # on a deployment that configures no allowlist at all.
+        if _PROC_ENVIRON_RE.match(candidate):
+            return True
+
+        for prefix in always:
+            try:
+                if _under(candidate, prefix):
+                    return True
+            except (OSError, ValueError):
+                continue
     return False
 
 
 def _read_denied_prefix_hit(candidates: tuple[str, ...]) -> bool:
-    """DIRECTORY-level denial — LOSES to an explicit allowlist root."""
+    """Tier ② directory-level denial — LOSES to an explicit allowlist root."""
     prefixes = _denied_prefixes()
     for candidate in candidates:
         if not candidate:
@@ -1026,23 +1092,27 @@ def _allowlist_hit(resolved: str, roots: set[str]) -> bool:
 def classify_read_path_denial(path: str) -> Optional[str]:
     """Return the audit reason for refusing ``path``, or ``None`` when allowed.
 
-    Precedence (round 2 — the Haro container sets ``HERMES_HOME=/opt/data``
-    *and* allowlists ``/opt/data/skills``, so a whole-tree deny that outranked
-    the allowlist made the allowlisted subtree unreadable):
+    Precedence (round 3 — two tiers, because this tree is also forked for
+    CLI / standalone-gateway deployments that configure no allowlist):
 
       1. ``HERMES_READ_SAFE_ROOTS_BYPASS`` — everything allowed.
       2. Unresolvable input — refused (fail closed).
-      3. **File-level denials** (``.env*``, ``*.key``, ``*.pem``,
-         ``config.yaml``, ``state.db``, ``auth.json``,
-         ``channel_directory.json``, plus the explicitly named
-         ``$HERMES_HOME/...`` files). These outrank the allowlist.
-      4. **Explicit allowlist roots** — a path under one is allowed even when
-         it sits inside a directory-level denied tree.
-      5. **Directory-level denials** (``/proc``, ``/etc``, ``/sys``, ``/dev``,
-         ``$HERMES_HOME``, the Hermes root, ``~/.hermes`` — which covers
-         ``memories/``, ``sessions/``, ``logs/`` and every credential file
-         under them).
-      6. When an allowlist is configured, anything not under a root.
+      3. **Tier ① credential & privacy denials — always on, and they outrank
+         the allowlist**: ``.env*`` / ``*.key`` / ``*.pem`` anywhere,
+         ``/proc/<pid>/environ``, and under ``$HERMES_HOME`` / the Hermes root
+         / ``~/.hermes`` the files ``config.yaml``, ``state.db``,
+         ``auth.json``, ``channel_directory.json``, ``.env`` plus the
+         ``memories/`` and ``sessions/`` trees.
+      4. **No allowlist configured** — nothing further applies; upstream
+         behaviour resumes (``/etc/hosts``, ``$HERMES_HOME/logs/x.log`` and
+         ``~/.hermes/skills/x/SKILL.md`` all read normally).
+      5. **Explicit allowlist roots** — a path under one is allowed even when
+         it sits inside a tier ② denied tree (the Haro container sets
+         ``HERMES_HOME=/opt/data`` *and* allowlists ``/opt/data/skills``).
+      6. **Tier ② directory-level denials** (``/proc``, ``/etc``, ``/sys``,
+         ``/dev``, ``$HERMES_HOME``, the Hermes root, ``~/.hermes`` — which
+         covers ``logs/``).
+      7. Anything else not under an allowlist root.
     """
     if is_read_safe_root_bypassed():
         return None
@@ -1061,21 +1131,27 @@ def classify_read_path_denial(path: str) -> Optional[str]:
         normalized = resolved
     candidates = (resolved, normalized)
 
+    # Tier ①: always on, wins over everything below.
     if _read_denied_file_hit(candidates):
         return READGUARD_REASON_FILE
 
     roots = get_safe_read_roots()
-    if roots and _allowlist_hit(resolved, roots):
-        # Explicit allowlist beats the directory-level denies.
+    if not roots:
+        # No allowlist configured (CLI / standalone fork): tier ② is off and
+        # the guard stops here.
         return None
 
+    if _allowlist_hit(resolved, roots):
+        # Explicit allowlist beats the tier ② directory denies.
+        return None
+
+    # Tier ②. Subsumed by the closing "not under any root" refusal below, but
+    # kept explicit so the denied trees stay legible and the two rules can
+    # diverge later.
     if _read_denied_prefix_hit(candidates):
         return READGUARD_REASON_PATH
 
-    if roots:
-        return READGUARD_REASON_PATH
-
-    return None
+    return READGUARD_REASON_PATH
 
 
 def get_read_path_denial(path: str) -> Optional[dict]:

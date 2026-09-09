@@ -840,7 +840,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_REDACT_SECRETS` | `true`/`false` — control secret redaction in tool output, logs, and chat responses (default: `true`). |
 | `HERMES_WRITE_SAFE_ROOT` | Optional directory prefix that **hard-blocks** `write_file`/`patch` writes outside the listed roots (no approval prompt). Supports multiple directories separated by `os.pathsep` (`:` on Unix, `;` on Windows). See [HERMES_WRITE_SAFE_ROOT](#hermes_write_safe_root) below. |
 | `HERMES_READ_SAFE_ROOTS` | Optional comma- (or `os.pathsep`-) separated list of absolute directories that `read_file`, `search_files` and the terminal tool's read commands may read. Anything outside is refused with a fixed `path_not_allowed` payload. See [HERMES_READ_SAFE_ROOTS](#hermes_read_safe_roots) below. |
-| `HERMES_READ_SAFE_ROOTS_BYPASS` | Set to `1` to disable BOTH the read allowlist and its always-on denylist. For the deployment's own maintainer/operator role only. |
+| `HERMES_READ_SAFE_ROOTS_BYPASS` | Set to `1` to disable the read guard entirely — the allowlist, the always-on credential/privacy denials, and the directory-level denials. For the deployment's own maintainer/operator role only. |
 | `HERMES_KB_ROOTS` | Comma- (or `os.pathsep`-) separated knowledge-base roots. Defaults to the `HERMES_READ_SAFE_ROOTS` entries named `knowledge`. Drives the bulk-export guard and the per-turn read quota. See [HERMES_KB_ROOTS](#hermes_kb_roots) below. |
 | `HERMES_KB_READ_PER_TURN` | Max `read_file` calls against the knowledge roots in one turn (default: `20`). See [HERMES_KB_READ_PER_TURN](#hermes_kb_read_per_turn) below. |
 | `HERMES_DISABLE_LAZY_INSTALLS` | Internal bridge var set automatically in the official Docker image to prevent runtime dependency installs into the immutable `/opt/hermes` tree. The user-facing equivalent is `security.allow_lazy_installs: false` in `config.yaml`; do not set this in `.env`. |
@@ -882,21 +882,55 @@ runtime token references, IM credential references, internal addresses.
 export HERMES_READ_SAFE_ROOTS=/knowledge,/opt/data/kb
 ```
 
-Two layers apply:
+The guard has **two tiers**. Tier ① protects credentials and private data and is
+**always on**, whether or not `HERMES_READ_SAFE_ROOTS` is set. Tier ② denies whole
+directory trees and applies **only when the allowlist is configured** — so a plain CLI or a
+standalone gateway deployment that sets no allowlist keeps ordinary read behaviour
+(`cat /etc/hosts` works) while still being unable to read its own credentials.
 
-1. **Allowlist** — when the variable is set, a read target must resolve (after `realpath`, so
-   symlinks and `..` are followed) inside one of the listed roots.
-2. **File-level denylist** — always on, and it outranks the allowlist: any `.env*` file,
-   `*.key`, `*.pem`, and the basenames `config.yaml`, `state.db`, `auth.json`,
-   `channel_directory.json`, wherever they live. `/knowledge/.env` stays refused even though
-   `/knowledge` is an allowed root.
-3. **Directory-level denylist** — always on, but an **explicit allowlist root wins over it**:
-   `/proc`, `/etc`, `/sys`, `/dev`, `$HERMES_HOME` (including `memories/`, `sessions/` and
-   `logs/`), the Hermes root, and `~/.hermes`. This precedence is what lets a container run
-   `HERMES_HOME=/opt/data` and still hand the bot `/opt/data/skills` as a read root.
+**Tier ① — credential & privacy denials (always on, and they outrank the allowlist):**
 
-Precedence, in order: bypass → file-level deny → allowlist → directory-level deny →
-"not in any allowlisted root".
+* Under `$HERMES_HOME`, the Hermes root, and `~/.hermes`: `.env`, `config.yaml`, `auth.json`,
+  `state.db`, `channel_directory.json`, plus the whole `memories/` and `sessions/` trees.
+* Anywhere on disk: any `.env*` file, `*.key`, `*.pem`. `/knowledge/.env` stays refused even
+  though `/knowledge` is an allowed root.
+* `/proc/self/environ` and `/proc/<pid>/environ` for any pid — the exported secrets of a
+  running process.
+
+Note what tier ① deliberately does **not** cover: a bare `config.yaml` or `state.db`
+*basename* elsewhere on disk. A knowledge-base article that happens to be named
+`config.yaml` is ordinary content and reads normally; only the copies under the Hermes
+directories are protected.
+
+**Tier ② — directory-level denials (only when `HERMES_READ_SAFE_ROOTS` is set):**
+
+* `/etc`, `/sys`, `/dev`, and the rest of `/proc`.
+* The remaining `$HERMES_HOME` / Hermes-root / `~/.hermes` subtrees, `logs/` included.
+* An **explicit allowlist root wins over this tier** (but never over tier ①). That
+  precedence is what lets a container run `HERMES_HOME=/opt/data` and still hand the bot
+  `/opt/data/skills` as a read root.
+
+**Tier ③ — allowlist:** when the variable is set, a read target must resolve (after
+`realpath`, so symlinks and `..` are followed) inside one of the listed roots; anything else
+is refused.
+
+Precedence, in order: bypass → tier ① → (no allowlist configured → allow) → allowlist hit →
+tier ② → "not in any allowlisted root".
+
+Behaviour at a glance:
+
+| Path | No `HERMES_READ_SAFE_ROOTS` | With `HERMES_READ_SAFE_ROOTS=/knowledge,/opt/data/skills,/out` |
+|------|------|------|
+| `/etc/hosts` | allowed | refused |
+| `$HERMES_HOME/logs/x.log` | allowed | refused |
+| `~/.hermes/skills/x/SKILL.md` | allowed | refused (not an allowlisted root) |
+| `/opt/data/skills/x/SKILL.md` | allowed | allowed |
+| `/knowledge/x/config.yaml` | allowed | allowed |
+| `$HERMES_HOME/config.yaml` | **refused** | **refused** |
+| `~/.hermes/.env` | **refused** | **refused** |
+| `/opt/data/skills/x/.env` | **refused** | **refused** |
+| `$HERMES_HOME/memories/a.md` | **refused** | **refused** |
+| `/proc/self/environ` | **refused** | **refused** |
 
 Every refusal returns the same structured payload, so it cannot be used to probe whether a
 path exists or what it contains:
@@ -905,13 +939,14 @@ path exists or what it contains:
 {"error": "path_not_allowed", "message": "该路径不在允许读取的范围内"}
 ```
 
-The terminal tool applies the same rules to path operands parsed out of the command
-(`cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, `awk`, `python -c`, …). A command
-that cannot be fully parsed is refused as soon as it mentions an absolute path outside the
-allowlist or a `..` escape.
+The terminal tool applies the same two tiers to path operands parsed out of the command
+(`cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, `awk`, `python -c`, …): with no
+allowlist configured `cat /etc/hosts` runs and `cat $HERMES_HOME/config.yaml` is refused. A
+command that cannot be fully parsed is refused as soon as it mentions an absolute path
+outside the allowlist or a `..` escape.
 
-Admin toolsets (`sre`) are constrained too. Set `HERMES_READ_SAFE_ROOTS_BYPASS=1` to lift both
-layers for the maintainer/operator role that administers the deployment itself.
+Admin toolsets (`sre`) are constrained too. Set `HERMES_READ_SAFE_ROOTS_BYPASS=1` to lift all
+three tiers for the maintainer/operator role that administers the deployment itself.
 
 Every refusal — from this guard, from the bulk-export guard, and from the per-turn read quota —
 appends one JSON line to `$HERMES_HOME/logs/readguard.jsonl`:
@@ -922,8 +957,8 @@ appends one JSON line to `$HERMES_HOME/logs/readguard.jsonl`:
 
 `reason` is one of `path_not_allowed`, `denied_file`, `kb_export`, `kb_read_quota`. The line
 carries metadata only — never file content and never the command text — and the log lives
-under `logs/`, which the directory-level denylist refuses, so the agent cannot read its own
-audit trail. Writing the line is best effort: a failure is swallowed and never turns a
+under `logs/`, which tier ② refuses whenever an allowlist is configured, so a bot-facing
+deployment cannot read its own audit trail. Writing the line is best effort: a failure is swallowed and never turns a
 refusal into an allow.
 
 ### HERMES_KB_ROOTS {#hermes_kb_roots}

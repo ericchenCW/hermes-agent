@@ -165,18 +165,31 @@ class TestAllowlistBeatsDirectoryDeny:
         assert get_read_path_denial(path) == DENIAL
 
     def test_reason_codes_distinguish_the_two_tiers(self, deployment):
+        # Tier ① — credential & privacy, always on.
         assert (
             classify_read_path_denial(str(deployment["home"] / "config.yaml"))
             == READGUARD_REASON_FILE
         )
+        # Round 3 promoted memories/ and sessions/ from the directory tier to
+        # the always-on tier, so they now report ``denied_file``.
         assert (
             classify_read_path_denial(str(deployment["home"] / "memories" / "m.md"))
+            == READGUARD_REASON_FILE
+        )
+        assert (
+            classify_read_path_denial(str(deployment["home"] / "sessions" / "s.json"))
+            == READGUARD_REASON_FILE
+        )
+        # Tier ② — directory-level, gated on the allowlist being configured.
+        assert (
+            classify_read_path_denial(str(deployment["home"] / "logs" / "x.log"))
             == READGUARD_REASON_PATH
         )
+        assert classify_read_path_denial("/etc/passwd") == READGUARD_REASON_PATH
 
     def test_model_payload_stays_uniform_across_reasons(self, deployment):
         a = get_read_path_denial(str(deployment["home"] / "config.yaml"))
-        b = get_read_path_denial(str(deployment["home"] / "memories" / "m.md"))
+        b = get_read_path_denial(str(deployment["home"] / "logs" / "x.log"))
         c = get_read_path_denial("/proc/self/environ")
         assert a == b == c == DENIAL
 
