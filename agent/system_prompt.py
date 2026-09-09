@@ -318,18 +318,24 @@ def _skills_prompt(agent: Any) -> str:
 
 
 def _bot_mode_parts(agent: Any) -> List[str]:
-    """Bot Mode teammate protocol — only in a bot's canonical "Bot Chat" session.
+    """Bot Mode teammate protocol — in a bot's canonical "Bot Chat" session, or (idcsre patch,
+    config ``agent.bot_mode_protocol_scope: all``) any session of a Bot-Mode-managed profile.
     Marks the prompt timeless (the volatile date line is dropped) since a birth
     date pinned in a months-long session is misinformation."""
     parts: List[str] = []
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, epoch_line, get_bot_mode_protocol_section
+        from tools.bot_mode_dm import bot_mode_scope_allows
+        from tools.bot_mode_probe import epoch_line, get_bot_mode_protocol_section, is_bot_mode_managed
         _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
         if not _title:
             _sdb = getattr(agent, "_session_db", None)
             _sid = getattr(agent, "session_id", None)
             _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
+        # idcsre patch: the shared scope gate (config ``agent.bot_mode_protocol_scope``) — the
+        # canonical "Bot Chat" title by default, any session of a Bot-Mode-managed profile under
+        # scope "all", minus group rooms / cron / subagents which stay excluded explicitly.
+        _in_scope = bot_mode_scope_allows(agent, _title) and is_bot_mode_managed(_agent_home(agent))
+        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _in_scope else None
         if _bot_section:
             parts.append(_bot_section)
             # Capability epoch lets the restore path rebuild ONCE per

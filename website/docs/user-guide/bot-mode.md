@@ -120,7 +120,17 @@ The backend teaches each Bot's canonical Bot Chat session the messaging protocol
 ```yaml
 agent:
   bot_mode_protocol: true   # inject the bot-to-bot messaging protocol into canonical Bot Chats
+  bot_mode_protocol_scope: bot_chat   # "bot_chat" (default) or "all"
 ```
+
+`agent.bot_mode_protocol_scope` widens *which* sessions get the protocol.
+Session titles are globally unique in Hermes, so exactly one session per
+install can be the canonical "Bot Chat" — an external orchestrator that
+drives one Bot through many sessions cannot make them all qualify. Set the
+scope to `all` and every ordinary session of a Bot-Mode-managed profile gets
+the protocol section and the `message_agent` tool. Group-room member
+sessions, cron agents and subagents stay excluded either way, and an
+unrecognised value falls back to `bot_chat`.
 
 :::note
 Bot-to-bot delivery is per-invocation: the receiving Bot picks the message up when it next runs. Live interrupt of a Bot mid-conversation is future work.
