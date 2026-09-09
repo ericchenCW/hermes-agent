@@ -181,7 +181,7 @@ TOOLSETS = {
     # minimal file/terminal/vision/skills surface (#57315-class breakage).
     "sre": _ts(
         "Offline SRE Q&A: local retrieval (terminal/file), skills, todo, memory, clarify, vision",
-        ["terminal", "process",
+        ["terminal", "process_manage",
          "read_file", "write_file", "patch", "search_files",
          "vision_analyze",
          "skills_list", "skill_view", "skill_manage",
