@@ -602,11 +602,15 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
     The stored prompt embeds a capability fingerprint; a mismatch is a deliberate
     once-per-change rebuild. Unstamped prompts never match; probe failures fail closed
     to "reuse" so the cache is kept. Legacy upgrade: a Bot Chat prompt predating the
-    epoch mechanism gets ONE title-gated migration rebuild; the stamped result cannot
-    re-fire."""
+    epoch mechanism gets ONE migration rebuild; the stamped result cannot re-fire.
+
+    idcsre patch: that legacy upgrade goes through the same shared scope gate as the other two
+    enforcement points (prompt section + tool injection), so a session that qualifies only under
+    ``agent.bot_mode_protocol_scope: all`` also gets its stale prompt upgraded, not just the
+    canonical "Bot Chat" title."""
     try:
+        from tools.bot_mode_dm import bot_mode_scope_allows
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE,
             stored_bot_chat_prompt_needs_upgrade,
             stored_prompt_capability_stale,
         )
@@ -626,7 +630,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
                 title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
             except Exception:
                 title = ""
-        return title == BOT_CHAT_TITLE and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
+        return bot_mode_scope_allows(agent, title) and bool(
+            stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
     except Exception:
         return False
 
