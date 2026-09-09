@@ -144,6 +144,19 @@ DEFAULT_CONFIG = {
         # "Finish the job" prompt block for all models: don't stop at a stub, never fabricate output
         # when the real path is blocked. ~80 cached tokens. False disables.
         "task_completion_guidance": True,
+        # idcsre patch — white-label identity.  Upstream bakes "You are Hermes Agent, built by Nous
+        # Research." into the identity segment of the system prompt, which an embedder cannot undo
+        # by appending its own instructions.  Setting `name` REPLACES that segment with the
+        # configured identity plus a hard constraint (never self-identify as Hermes/Nous, never
+        # disclose the underlying model vendor).  `creator` names the provider, `intro` is an
+        # optional one-line self-introduction (generated from name/creator when empty).  All three
+        # empty (the default) = feature off, upstream identity untouched.  Per-field env overrides:
+        # HERMES_IDENTITY_NAME / HERMES_IDENTITY_CREATOR / HERMES_IDENTITY_INTRO.
+        "identity": {
+            "name": "",
+            "creator": "",
+            "intro": "",
+        },
         # Prompt block for all models steering independent tool calls (reads, searches, fetches,
         # read-only commands) into one batched turn; the runtime already runs them concurrently. ~70
         # cached tokens. False disables.

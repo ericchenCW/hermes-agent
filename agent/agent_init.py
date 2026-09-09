@@ -1352,6 +1352,12 @@ def _apply_agent_section(agent, _agent_cfg):
     # "auto" (codex_responses only), true (all api_modes), false, or model substrings.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # idcsre patch — white-label identity (agent.identity + HERMES_IDENTITY_* env).  None when no
+    # name is configured: the system prompt then keeps the upstream Hermes/Nous identity segment
+    # verbatim (default, zero behaviour change).
+    from agent.identity_config import resolve_identity
+    agent._agent_identity = resolve_identity(_agent_section.get("identity"))
+
     # Default-on boolean gates: anti-stall guards (notice-only), universal guidance toggles
     # (ALL models, unlike enforcement), the local toolchain probe, Bot Mode protocol section.
     for _key in (

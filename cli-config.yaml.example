@@ -1062,6 +1062,20 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # White-label identity. When `name` is non-empty it REPLACES the built-in
+  # "You are Hermes Agent, built by Nous Research." segment of the system
+  # prompt (plus the docs pointer that repeats it) with the text below, and
+  # appends a hard constraint: never self-identify as Hermes/Nous, never
+  # disclose the underlying model or its vendor. `intro` is optional — when
+  # empty it is generated from name/creator. All three empty (the default)
+  # keeps upstream behavior unchanged.
+  # Per-field env overrides (env wins over config), for container injection:
+  #   HERMES_IDENTITY_NAME / HERMES_IDENTITY_CREATOR / HERMES_IDENTITY_INTRO
+  # identity:
+  #   name: "IT 小助理"
+  #   creator: "嘉为科技 Haro 平台"
+  #   intro: ""
+
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

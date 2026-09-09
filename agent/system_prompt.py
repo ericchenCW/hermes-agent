@@ -25,11 +25,21 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
+from agent.identity_config import (
+    build_identity_prompt,
+    resolve_identity,
+    scrub_vendor_names,
+    strip_builtin_identity,
+)
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# idcsre patch — sentinel distinguishing "agent has no ``_agent_identity`` attribute at all" (an
+# object built by a path that never ran agent_init) from "agent_init ran and resolved none" (None).
+_IDENTITY_UNSET = object()
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
     re.MULTILINE,
@@ -496,13 +506,31 @@ def _memory_parts(agent: Any) -> List[str]:
     return parts
 
 
-def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool]:
+def _resolve_agent_identity(agent: Any):
+    """idcsre patch — the operator identity resolved in agent_init (config ``agent.identity`` +
+    HERMES_IDENTITY_*).  Agents built by paths that never ran agent_init (tests, embedders) fall
+    back to a pure-env resolution."""
+    identity = getattr(agent, "_agent_identity", _IDENTITY_UNSET)
+    return resolve_identity(None) if identity is _IDENTITY_UNSET else identity
+
+
+def _identity_parts(agent: Any, ctx_len: Optional[int], identity: Any = None) -> Tuple[List[str], bool]:
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
-    Returns ``(parts, soul_loaded)``."""
+    Returns ``(parts, soul_loaded)``.
+
+    idcsre patch: with an operator *identity* configured, SOUL.md keeps its persona/behaviour half
+    but loses the sentences asserting the upstream vendor identity, and the hardcoded fallback is
+    suppressed entirely (the configured segment replaces it).  ``soul_loaded`` still records that
+    SOUL.md was READ — it gates skip_soul for the context-file pass — even when the scrub leaves
+    nothing to inject."""
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
-    return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
+    if _soul_content:
+        if identity is not None:
+            _soul_content = strip_builtin_identity(_soul_content)
+        return ([_soul_content] if _soul_content else [], True)
+    return ([] if identity is not None else [DEFAULT_AGENT_IDENTITY], False)
 
 
 def _guidance_parts(agent: Any) -> List[str]:
@@ -628,14 +656,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _cc_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
-    stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    # idcsre patch — operator-configured identity (config ``agent.identity`` + HERMES_IDENTITY_*).
+    # When set it REPLACES the built-in Hermes/Nous identity segment instead of being appended after
+    # it: an external orchestrator cannot otherwise stop the model from answering "I am Hermes,
+    # built by Nous Research".  ``None`` (the default: empty ``name``) keeps upstream behaviour
+    # byte-for-byte.  The prefix is held OUT of ``stable_parts`` and prepended at the end — it is
+    # the one block that must keep the literal vendor names (its hard constraint says "never call
+    # yourself Hermes"), so the scrub below must not see it.
+    _identity = _resolve_agent_identity(agent)
+    _identity_prefix = build_identity_prompt(_identity) if _identity else ""
+    stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len, _identity)
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
     # idcsre patch: HERMES_PROMPT_HERMES_HELP=0 drops the pointer entirely (deployments where end
     # users never configure Hermes, e.g. an IT-support bot).
+    # idcsre patch: a configured identity also drops it — "You run on Hermes Agent (by Nous
+    # Research)" is a second vendor self-introduction, and a white-labeled deployment's users are
+    # not configuring Hermes itself anyway.
     _help_guidance_slot = None
-    if _prompt_section_enabled("HERMES_PROMPT_HERMES_HELP"):
+    if _identity is None and _prompt_section_enabled("HERMES_PROMPT_HERMES_HELP"):
         _help_guidance_slot = len(stable_parts)
         stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
@@ -679,7 +719,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Embedder hints are prose too; reserve the delimiter for the renderer.
         environment_hints = environment_hints.replace(_pb.RUNTIME_ENVIRONMENT_HEADING, "> " + _pb.RUNTIME_ENVIRONMENT_HEADING)
         volatile_parts.append(f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}")
-    return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
+    _stable = _join_tier(stable_parts)
+    if _identity is not None:
+        # idcsre patch — last pass over the BUILT-IN guidance tier only: surface hints and posture
+        # blocks still say "the Hermes terminal UI", "Active Hermes profile", etc.  Identifiers, env
+        # vars, paths and URLs (hermes_cli, HERMES_HOME, hermes-agent.nousresearch.com) are left
+        # intact by the scrubber's boundaries.  The context/volatile tiers are caller- and
+        # user-authored, so they are never rewritten.
+        _stable = scrub_vendor_names(_stable, _identity)
+        _stable = f"{_identity_prefix}\n\n{_stable}" if _stable else _identity_prefix
+    return {"stable": _stable, "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
 
 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
