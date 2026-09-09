@@ -1212,26 +1212,56 @@ def terminal_tool(
         # ── idcsre patch: read allowlist / denylist guard ─────────────
         # Same rules as read_file/search_files (HERMES_READ_SAFE_ROOTS + always-on denylist),
         # applied to path operands parsed out of the command — otherwise `cat
-        # /opt/data/config.yaml` walks straight around the file-tool guard. Runs BEFORE the approval
-        # guards; the refusal is uniform and content-free.
-        from agent.file_safety import get_command_read_denial
+        # /opt/data/config.yaml` walks straight around the file-tool guard. Runs BEFORE the
+        # approval guards; the refusal is uniform and content-free.
+        from agent.file_safety import (
+            get_command_export_denial,
+            get_command_read_denial_detail,
+            log_readguard_denial,
+        )
 
         _read_guard_cwd = _resolve_command_cwd(
             workdir=workdir,
             default_cwd=cwd,
             session_key=session_key,
         )
-        _cmd_denial = get_command_read_denial(command, _read_guard_cwd)
+        _cmd_denial = get_command_read_denial_detail(command, _read_guard_cwd)
         if _cmd_denial:
             logger.warning(
                 "Blocked out-of-allowlist read path (command: %s)",
                 _safe_command_preview(command),
+            )
+            log_readguard_denial(
+                "terminal", _cmd_denial.get("path", ""), _cmd_denial.get("reason", "")
             )
             return json.dumps({
                 "output": "",
                 "exit_code": -1,
                 "error": _cmd_denial["error"],
                 "message": _cmd_denial["message"],
+                "status": "blocked",
+            }, ensure_ascii=False)
+
+        # ── Knowledge-base bulk-export guard ──────────────────────────
+        # Reading knowledge files one at a time is the job; handing a chat
+        # user the whole corpus as an archive is not. tar/zip/7z/cp -r/rsync/
+        # find -exec cp/shutil.copytree over a knowledge directory are refused.
+        _export_denial = get_command_export_denial(command, _read_guard_cwd)
+        if _export_denial:
+            logger.warning(
+                "Blocked knowledge-base bulk export (command: %s)",
+                _safe_command_preview(command),
+            )
+            log_readguard_denial(
+                "terminal",
+                _export_denial.get("path", ""),
+                _export_denial.get("reason", ""),
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _export_denial["error"],
+                "message": _export_denial["message"],
                 "status": "blocked",
             }, ensure_ascii=False)
 

@@ -845,6 +845,8 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_WRITE_SAFE_ROOT` | Optional directory prefix that **hard-blocks** `write_file`/`patch` writes outside the listed roots (no approval prompt). Supports multiple directories separated by `os.pathsep` (`:` on Unix, `;` on Windows). See [HERMES_WRITE_SAFE_ROOT](#hermes_write_safe_root) below. |
 | `HERMES_READ_SAFE_ROOTS` | Optional comma- (or `os.pathsep`-) separated list of absolute directories that `read_file`, `search_files` and the terminal tool's read commands may read. Anything outside is refused with a fixed `path_not_allowed` payload. See [HERMES_READ_SAFE_ROOTS](#hermes_read_safe_roots) below. |
 | `HERMES_READ_SAFE_ROOTS_BYPASS` | Set to `1` to disable BOTH the read allowlist and its always-on denylist. For the deployment's own maintainer/operator role only. |
+| `HERMES_KB_ROOTS` | Comma- (or `os.pathsep`-) separated knowledge-base roots. Defaults to the `HERMES_READ_SAFE_ROOTS` entries named `knowledge`. Drives the bulk-export guard and the per-turn read quota. See [HERMES_KB_ROOTS](#hermes_kb_roots) below. |
+| `HERMES_KB_READ_PER_TURN` | Max `read_file` calls against the knowledge roots in one turn (default: `20`). See [HERMES_KB_READ_PER_TURN](#hermes_kb_read_per_turn) below. |
 | `HERMES_DISABLE_LAZY_INSTALLS` | Internal bridge var set automatically in the official Docker image to prevent runtime dependency installs into the immutable `/opt/hermes` tree. The user-facing equivalent is `security.allow_lazy_installs: false` in `config.yaml`; do not set this in `.env`. |
 | `HERMES_DISABLE_FILE_STATE_GUARD` | Set to `1` to turn off the "file changed since you read it" guard on `patch`/`write_file`. |
 | `HERMES_BUNDLED_SKILLS` | Comma-separated override for the list of bundled skills loaded at startup. |
@@ -888,9 +890,17 @@ Two layers apply:
 
 1. **Allowlist** — when the variable is set, a read target must resolve (after `realpath`, so
    symlinks and `..` are followed) inside one of the listed roots.
-2. **Denylist** — always on, and it stacks on top of the allowlist:
-   `$HERMES_HOME`, `~/.hermes`, `/opt/data/config.yaml`, any `.env*` file, `*.key`, `*.pem`,
-   `/proc`, `/etc`.
+2. **File-level denylist** — always on, and it outranks the allowlist: any `.env*` file,
+   `*.key`, `*.pem`, and the basenames `config.yaml`, `state.db`, `auth.json`,
+   `channel_directory.json`, wherever they live. `/knowledge/.env` stays refused even though
+   `/knowledge` is an allowed root.
+3. **Directory-level denylist** — always on, but an **explicit allowlist root wins over it**:
+   `/proc`, `/etc`, `/sys`, `/dev`, `$HERMES_HOME` (including `memories/`, `sessions/` and
+   `logs/`), the Hermes root, and `~/.hermes`. This precedence is what lets a container run
+   `HERMES_HOME=/opt/data` and still hand the bot `/opt/data/skills` as a read root.
+
+Precedence, in order: bypass → file-level deny → allowlist → directory-level deny →
+"not in any allowlisted root".
 
 Every refusal returns the same structured payload, so it cannot be used to probe whether a
 path exists or what it contains:
@@ -906,6 +916,47 @@ allowlist or a `..` escape.
 
 Admin toolsets (`sre`) are constrained too. Set `HERMES_READ_SAFE_ROOTS_BYPASS=1` to lift both
 layers for the maintainer/operator role that administers the deployment itself.
+
+Every refusal — from this guard, from the bulk-export guard, and from the per-turn read quota —
+appends one JSON line to `$HERMES_HOME/logs/readguard.jsonl`:
+
+```json
+{"ts":"2026-09-09T09:14:22Z","tool":"read_file","path":"/opt/data/config.yaml","session":"sess-1","subject":"wo-user-1","platform":"wecom","reason":"denied_file"}
+```
+
+`reason` is one of `path_not_allowed`, `denied_file`, `kb_export`, `kb_read_quota`. The line
+carries metadata only — never file content and never the command text — and the log lives
+under `logs/`, which the directory-level denylist refuses, so the agent cannot read its own
+audit trail. Writing the line is best effort: a failure is swallowed and never turns a
+refusal into an allow.
+
+### HERMES_KB_ROOTS {#hermes_kb_roots}
+
+Marks which read roots hold the knowledge corpus. Defaults to the `HERMES_READ_SAFE_ROOTS`
+entries whose basename is `knowledge`. Two guards use it:
+
+* **Bulk-export guard** (terminal tool). Reading knowledge files one at a time is the job;
+  handing a chat user the whole corpus is not. Refused, with
+  `{"error": "kb_export_forbidden", "message": "知识库内容不提供整包导出"}`:
+  `tar`/`zip`/`7z` over a knowledge directory, `cp -r|-R|-a`, `rsync`/`scp`,
+  `find <kb> … -exec cp`, `find <kb> … | xargs cp`,
+  `python -c '…shutil.copytree/make_archive…'`, and a globbed `cat <kb>/* > out`. It fails
+  closed: a source that is the knowledge root itself, a directory, or a glob is refused even
+  when the rest of the command cannot be parsed. A single-file
+  `cp /knowledge/x/a.md /out/` is not refused — the read quota below bounds that path.
+* **Per-turn read quota**, see `HERMES_KB_READ_PER_TURN`.
+
+### HERMES_KB_READ_PER_TURN {#hermes_kb_read_per_turn}
+
+How many knowledge files one turn may open through `read_file` (default `20`). Beyond it:
+
+```json
+{"error": "kb_read_quota", "message": "本轮读取知识库文件已达上限（20），请改用检索工具定位后再读"}
+```
+
+Counted per session and reset at every turn boundary (one inbound user message).
+`search_files` is deliberately not counted — pointing the model at retrieval is exactly the
+behaviour the refusal asks for. `HERMES_READ_SAFE_ROOTS_BYPASS=1` lifts the quota.
 
 ## Interface
 

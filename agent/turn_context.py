@@ -499,6 +499,13 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
 
 def _reset_per_turn_agent_state(agent: Any) -> None:
     """Reset retry counters, guardrails, iteration and run budgets at turn start."""
+    # idcsre patch — per-turn knowledge-base read budget (HERMES_KB_READ_PER_TURN). This is the
+    # single place a turn begins: one inbound user message, one reset.
+    try:
+        from agent.file_safety import reset_kb_read_quota
+        reset_kb_read_quota(getattr(agent, "session_id", None))
+    except Exception:
+        logger.debug("kb read quota reset skipped", exc_info=True)
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
     agent._turn_failed_file_mutations = {}

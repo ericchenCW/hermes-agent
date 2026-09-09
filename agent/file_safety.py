@@ -400,14 +400,59 @@ READ_PATH_DENIED_MESSAGE = "该路径不在允许读取的范围内"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# ---------------------------------------------------------------------------
+# Denial reason codes used by the readguard audit log (readguard.jsonl).
+# The MODEL-facing payload stays uniform (``path_not_allowed``); these codes
+# only ever reach the on-disk audit trail so an operator can tell a
+# not-in-allowlist miss from a named-secret hit.
+# ---------------------------------------------------------------------------
+READGUARD_REASON_PATH = "path_not_allowed"
+READGUARD_REASON_FILE = "denied_file"
+READGUARD_REASON_EXPORT = "kb_export"
+READGUARD_REASON_QUOTA = "kb_read_quota"
+
+# --- FILE-level denials -----------------------------------------------------
+# These win over the allowlist: a secret-bearing basename stays unreadable even
+# when it sits inside an explicitly allowed root (``/knowledge/.env``).
+
 # Suffixes that always hold key material.
 _READ_DENIED_SUFFIXES = (".key", ".pem")
 
+# Basenames that are always secret/state bearing, wherever they live.
+_READ_DENIED_BASENAMES = frozenset({
+    "config.yaml",
+    "state.db",
+    "auth.json",
+    "channel_directory.json",
+})
+
+# --- DIRECTORY-level denials ------------------------------------------------
+# These LOSE to an explicit allowlist root (see ``_classify_read_path``): the
+# Haro container sets ``HERMES_HOME=/opt/data`` and still hands the bot
+# ``/opt/data/skills`` as a read root, so the whole-tree deny must not swallow
+# the allowed subtree. File-level denials above still apply inside it.
+
 # Absolute trees that are never readable through the managed tools.
-_READ_DENIED_SYSTEM_PREFIXES = ("/proc", "/etc")
+_READ_DENIED_SYSTEM_PREFIXES = ("/proc", "/etc", "/sys", "/dev")
+
+# Subdirectories of $HERMES_HOME / the Hermes root that are named explicitly.
+# Already covered by the whole-tree prefix, but listed so the intent survives a
+# future narrowing of that prefix (and so the tests can point at them).
+_HERMES_DENIED_SUBDIRS = ("memories", "sessions", "logs")
+
+# Files directly under $HERMES_HOME / the Hermes root that are named
+# explicitly. Also covered by the basename rules above; duplicated for the
+# same reason as ``_HERMES_DENIED_SUBDIRS``.
+_HERMES_DENIED_FILES = (
+    ".env",
+    "config.yaml",
+    "state.db",
+    "auth.json",
+    "channel_directory.json",
+)
 
 # Exact absolute files that are never readable (beyond the Hermes trees).
-_READ_DENIED_EXACT = ("/opt/data/config.yaml",)
+_READ_DENIED_EXACT = ("/opt/data/config.yaml", "/proc/self/environ")
 
 
 def is_read_safe_root_bypassed() -> bool:
@@ -494,12 +539,45 @@ def _denied_prefixes() -> list[str]:
         for form in (str(base), os.path.realpath(base)):
             if form and form not in prefixes:
                 prefixes.append(form)
+        # Named explicitly even though the whole-tree prefix above already
+        # covers them: memories/, sessions/ and logs/ (which holds
+        # readguard.jsonl itself) must stay denied if that prefix is ever
+        # narrowed.
+        for sub in _HERMES_DENIED_SUBDIRS:
+            try:
+                candidate = os.path.join(str(base), sub)
+            except (OSError, ValueError, TypeError):
+                continue
+            for form in (candidate, os.path.realpath(candidate)):
+                if form and form not in prefixes:
+                    prefixes.append(form)
     return prefixes
 
 
-def _read_denylist_hit(candidates: tuple[str, ...]) -> bool:
-    """Return True when any spelling of the target hits the read denylist."""
-    prefixes = _denied_prefixes()
+def _denied_exact_files() -> list[str]:
+    """Explicitly named unreadable files (``$HERMES_HOME/config.yaml`` & co.)."""
+    exact = list(_READ_DENIED_EXACT)
+    for base in (_hermes_home_path(), _hermes_root_path(), os.path.expanduser("~/.hermes")):
+        for name in _HERMES_DENIED_FILES:
+            try:
+                candidate = os.path.join(str(base), name)
+            except (OSError, ValueError, TypeError):
+                continue
+            for form in (candidate, os.path.realpath(candidate)):
+                if form and form not in exact:
+                    exact.append(form)
+    return exact
+
+
+def _read_denied_file_hit(candidates: tuple[str, ...]) -> bool:
+    """FILE-level denial — outranks the allowlist.
+
+    A ``.env``/``*.key``/``*.pem``/``config.yaml``/``state.db``/``auth.json``/
+    ``channel_directory.json`` is refused even inside an explicitly allowed
+    read root, because those basenames only ever carry credentials or
+    application state.
+    """
+    exact = _denied_exact_files()
     for candidate in candidates:
         if not candidate:
             continue
@@ -513,17 +591,95 @@ def _read_denylist_hit(candidates: tuple[str, ...]) -> bool:
         if lowered.endswith(_READ_DENIED_SUFFIXES):
             return True
 
-        if candidate in _READ_DENIED_EXACT:
+        if lowered in _READ_DENIED_BASENAMES:
             return True
 
+        if candidate in exact:
+            return True
+    return False
+
+
+def _read_denied_prefix_hit(candidates: tuple[str, ...]) -> bool:
+    """DIRECTORY-level denial — LOSES to an explicit allowlist root."""
+    prefixes = _denied_prefixes()
+    for candidate in candidates:
+        if not candidate:
+            continue
         for prefix in prefixes:
             try:
                 if _under(candidate, prefix):
                     return True
             except (OSError, ValueError):
                 continue
-
     return False
+
+
+def _read_denylist_hit(candidates: tuple[str, ...]) -> bool:
+    """Back-compat shim: True when either denial tier fires."""
+    return _read_denied_file_hit(candidates) or _read_denied_prefix_hit(candidates)
+
+
+def _allowlist_hit(resolved: str, roots: set[str]) -> bool:
+    """True when ``resolved`` is one of ``roots`` or lives beneath one."""
+    for root in roots:
+        if resolved == root or resolved.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def classify_read_path_denial(path: str) -> Optional[str]:
+    """Return the audit reason for refusing ``path``, or ``None`` when allowed.
+
+    Precedence (round 2 — the Haro container sets ``HERMES_HOME=/opt/data``
+    *and* allowlists ``/opt/data/skills``, so a whole-tree deny that outranked
+    the allowlist made the allowlisted subtree unreadable):
+
+      1. ``HERMES_READ_SAFE_ROOTS_BYPASS`` — everything allowed.
+      2. Unresolvable input — refused (fail closed).
+      3. **File-level denials** (``.env*``, ``*.key``, ``*.pem``,
+         ``config.yaml``, ``state.db``, ``auth.json``,
+         ``channel_directory.json``, plus the explicitly named
+         ``$HERMES_HOME/...`` files). These outrank the allowlist.
+      4. **Explicit allowlist roots** — a path under one is allowed even when
+         it sits inside a directory-level denied tree.
+      5. **Directory-level denials** (``/proc``, ``/etc``, ``/sys``, ``/dev``,
+         ``$HERMES_HOME``, the Hermes root, ``~/.hermes`` — which covers
+         ``memories/``, ``sessions/``, ``logs/`` and every credential file
+         under them).
+      6. When an allowlist is configured, anything not under a root.
+    """
+    if is_read_safe_root_bypassed():
+        return None
+
+    resolved = _resolve_for_read_guard(path)
+    if resolved is None:
+        # Unresolvable input: fail closed.
+        return READGUARD_REASON_PATH
+
+    # The denylist is checked against BOTH the symlink-resolved path and the
+    # merely-normalized one, so neither ``/etc/passwd`` (a symlink on macOS)
+    # nor a symlink pointing INTO a denied tree can slip through.
+    try:
+        normalized = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
+    except (OSError, ValueError):
+        normalized = resolved
+    candidates = (resolved, normalized)
+
+    if _read_denied_file_hit(candidates):
+        return READGUARD_REASON_FILE
+
+    roots = get_safe_read_roots()
+    if roots and _allowlist_hit(resolved, roots):
+        # Explicit allowlist beats the directory-level denies.
+        return None
+
+    if _read_denied_prefix_hit(candidates):
+        return READGUARD_REASON_PATH
+
+    if roots:
+        return READGUARD_REASON_PATH
+
+    return None
 
 
 def get_read_path_denial(path: str) -> Optional[dict]:
@@ -541,33 +697,13 @@ def get_read_path_denial(path: str) -> Optional[dict]:
     Callers that resolve relative paths against a non-process cwd (the file
     tools' ``TERMINAL_CWD``) MUST pass the already-absolute path — this
     function's own ``realpath`` is anchored at the Python process cwd.
+
+    The *reason* (allowlist miss vs. named-secret file) is deliberately NOT
+    reflected here — use :func:`classify_read_path_denial` for the audit log.
     """
-    if is_read_safe_root_bypassed():
+    if classify_read_path_denial(path) is None:
         return None
-
-    resolved = _resolve_for_read_guard(path)
-    if resolved is None:
-        # Unresolvable input: fail closed.
-        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
-
-    # The denylist is checked against BOTH the symlink-resolved path and the
-    # merely-normalized one, so neither ``/etc/passwd`` (a symlink on macOS)
-    # nor a symlink pointing INTO a denied tree can slip through.
-    try:
-        normalized = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
-    except (OSError, ValueError):
-        normalized = resolved
-    if _read_denylist_hit((resolved, normalized)):
-        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
-
-    roots = get_safe_read_roots()
-    if roots:
-        for root in roots:
-            if resolved == root or resolved.startswith(root + os.sep):
-                return None
-        return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
-
-    return None
+    return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
 
 
 def is_read_path_denied(path: str) -> bool:
@@ -739,6 +875,22 @@ def get_command_read_denial(command: str, cwd: Optional[str] = None) -> Optional
     directory). Returns ``None`` when nothing in the command is out of
     bounds, or when ``HERMES_READ_SAFE_ROOTS_BYPASS`` is set.
     """
+    detail = get_command_read_denial_detail(command, cwd)
+    if detail is None:
+        return None
+    return {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE}
+
+
+def get_command_read_denial_detail(
+    command: str, cwd: Optional[str] = None
+) -> Optional[dict]:
+    """Like :func:`get_command_read_denial` but names the offending operand.
+
+    Returns ``{"error", "message", "path", "reason"}`` where ``path`` is the
+    FIRST out-of-bounds path found in the command and ``reason`` is the audit
+    code. Only the audit log consumes ``path``/``reason``; the model still gets
+    the uniform two-key payload.
+    """
     if is_read_safe_root_bypassed():
         return None
     if not command or not isinstance(command, str):
@@ -752,10 +904,484 @@ def get_command_read_denial(command: str, cwd: Optional[str] = None) -> Optional
                 expanded = os.path.join(base, expanded)
             except (OSError, ValueError, TypeError):
                 continue
-        denial = get_read_path_denial(expanded)
-        if denial is not None:
-            return denial
+        reason = classify_read_path_denial(expanded)
+        if reason is not None:
+            return {
+                "error": READ_PATH_DENIED_CODE,
+                "message": READ_PATH_DENIED_MESSAGE,
+                "path": os.path.normpath(expanded),
+                "reason": reason,
+            }
     return None
+
+
+# ---------------------------------------------------------------------------
+# Readguard audit log ($HERMES_HOME/logs/readguard.jsonl)
+#
+# Every refusal produced by the read guard, the knowledge-base export guard and
+# the per-turn read quota appends ONE json line. The line records *what was
+# refused and to whom* — never any file content, and never the command text.
+#
+# The log file itself lives under ``$HERMES_HOME/logs/``, which the
+# directory-level denylist already refuses, so the agent cannot read back its
+# own audit trail.
+#
+# Best effort by construction: a write failure (read-only volume, no space,
+# permission) is swallowed. An audit trail that can break a security refusal is
+# worse than a missing line.
+# ---------------------------------------------------------------------------
+
+READGUARD_LOG_DIRNAME = "logs"
+READGUARD_LOG_BASENAME = "readguard.jsonl"
+
+
+def get_readguard_log_path() -> str:
+    """Absolute path of the readguard audit log under ``$HERMES_HOME``."""
+    return os.path.join(
+        str(_hermes_home_path()), READGUARD_LOG_DIRNAME, READGUARD_LOG_BASENAME
+    )
+
+
+def _session_field(name: str) -> str:
+    """Read one ``HERMES_SESSION_*`` value without importing the gateway eagerly."""
+    try:
+        from gateway.session_context import get_session_env
+        return (get_session_env(name, "") or "").strip()
+    except Exception:  # noqa: BLE001 - audit must never break a refusal
+        return (os.getenv(name, "") or "").strip()
+
+
+def get_readguard_identity() -> dict:
+    """Session / subject / platform for the audit line.
+
+    Sourced from the gateway's per-task session context (``HERMES_SESSION_ID``,
+    ``HERMES_SESSION_USER_ID``, ``HERMES_SESSION_PLATFORM`` with
+    ``HERMES_SESSION_SOURCE`` as the CLI/TUI fallback). Anything missing is
+    recorded as ``"unknown"`` rather than omitted, so every line has the same
+    shape.
+    """
+    session = _session_field("HERMES_SESSION_ID") or _session_field("HERMES_SESSION_KEY")
+    subject = (
+        _session_field("HERMES_SESSION_USER_ID")
+        or _session_field("HERMES_SESSION_USER_ID_ALT")
+    )
+    platform = _session_field("HERMES_SESSION_PLATFORM") or _session_field(
+        "HERMES_SESSION_SOURCE"
+    )
+    return {
+        "session": session or "unknown",
+        "subject": subject or "unknown",
+        "platform": platform or "unknown",
+    }
+
+
+def log_readguard_denial(tool: str, path: str, reason: str) -> None:
+    """Append one audit line for a refusal. Never raises."""
+    try:
+        import datetime as _dt
+        import json as _json
+
+        identity = get_readguard_identity()
+        record = {
+            "ts": _dt.datetime.now(_dt.timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            "tool": tool,
+            "path": str(path or ""),
+            "session": identity["session"],
+            "subject": identity["subject"],
+            "platform": identity["platform"],
+            "reason": reason,
+        }
+        log_path = get_readguard_log_path()
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - see module note: refusal wins over audit
+        return
+
+
+def normalize_audit_path(path: str) -> str:
+    """Canonical form of ``path`` for the audit line; falls back to the input."""
+    try:
+        return os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
+    except (OSError, ValueError, TypeError):
+        return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-base roots (HERMES_KB_ROOTS)
+#
+# The bot is *supposed* to read knowledge files one at a time and answer from
+# them. It is not supposed to hand a chat user the whole corpus. Two guards
+# below share this notion of "the knowledge tree":
+#
+#   * the bulk-export guard (tar/zip/cp -r/rsync/... on a knowledge directory)
+#   * the per-turn read quota
+#
+# Default: the ``HERMES_READ_SAFE_ROOTS`` entries whose basename is
+# ``knowledge`` (Haro injects ``/knowledge`` there). Haro may also set
+# ``HERMES_KB_ROOTS`` explicitly.
+# ---------------------------------------------------------------------------
+
+KB_ROOTS_ENV = "HERMES_KB_ROOTS"
+KB_READ_PER_TURN_ENV = "HERMES_KB_READ_PER_TURN"
+KB_READ_PER_TURN_DEFAULT = 20
+
+KB_EXPORT_DENIED_CODE = "kb_export_forbidden"
+KB_EXPORT_DENIED_MESSAGE = "知识库内容不提供整包导出"
+
+KB_READ_QUOTA_CODE = "kb_read_quota"
+
+
+def get_kb_roots() -> set[str]:
+    """Return resolved knowledge-base roots."""
+    env = os.getenv(KB_ROOTS_ENV, "")
+    if env:
+        raw: list[str] = []
+        for chunk in env.split(os.pathsep):
+            raw.extend(chunk.split(","))
+        roots: set[str] = set()
+        for path in raw:
+            path = path.strip()
+            if not path:
+                continue
+            try:
+                roots.add(os.path.realpath(os.path.expanduser(path)))
+            except (OSError, ValueError):
+                continue
+        return roots
+    # Fall back to the read roots that look like a knowledge tree.
+    return {
+        root for root in get_safe_read_roots()
+        if os.path.basename(root.rstrip(os.sep)).lower() == "knowledge"
+    }
+
+
+def is_under_kb_root(path: str) -> bool:
+    """True when ``path`` resolves inside a configured knowledge root."""
+    roots = get_kb_roots()
+    if not roots:
+        return False
+    resolved = _resolve_for_read_guard(path)
+    if resolved is None:
+        return False
+    return _allowlist_hit(resolved, roots)
+
+
+# ---------------------------------------------------------------------------
+# Bulk-export guard
+#
+# Fail-closed by design: a command we cannot fully parse is refused as soon as
+# it pairs an archiving/copying verb with a knowledge path that is the root
+# itself, a directory, or a glob. Refusing a legitimate single-file copy that
+# happens to look recursive is cheap; letting the corpus out is not.
+# ---------------------------------------------------------------------------
+
+#: Verbs that can move a whole tree somewhere else.
+_EXPORT_ARCHIVE_COMMANDS = frozenset({
+    "tar", "zip", "7z", "7za", "7zr", "rar", "gzip", "bzip2", "xz", "zstd",
+})
+_EXPORT_COPY_COMMANDS = frozenset({"cp", "install"})
+#: Always bulk by nature — any knowledge operand is refused.
+_EXPORT_SYNC_COMMANDS = frozenset({"rsync", "scp", "sftp"})
+
+_EXPORT_RECURSIVE_FLAGS = frozenset({
+    "-r", "-R", "-a", "-ar", "-ra", "-rp", "-Rp", "-av", "-avz", "-rf", "-Rf",
+    "--recursive", "--archive",
+})
+
+#: Python one-liners that copy a tree or build an archive.
+_EXPORT_PYTHON_MARKERS = (
+    "copytree", "make_archive", "tarfile", "zipfile", "shutil.copy",
+)
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _has_glob(token: str) -> bool:
+    return any(ch in token for ch in _GLOB_CHARS)
+
+
+def _glob_prefix(token: str) -> str:
+    """Longest leading directory of a glob token that has no wildcard."""
+    parts = token.split("/")
+    kept: list[str] = []
+    for part in parts:
+        if _has_glob(part):
+            break
+        kept.append(part)
+    return "/".join(kept) or "/"
+
+
+def _abs_for_export(token: str, base: str) -> Optional[str]:
+    try:
+        expanded = os.path.expanduser(token)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not os.path.isabs(expanded):
+        try:
+            expanded = os.path.join(base, expanded)
+        except (OSError, ValueError, TypeError):
+            return None
+    return _resolve_for_read_guard(expanded)
+
+
+def _kb_operand(token: str, base: str, roots: set[str]) -> Optional[str]:
+    """Return the resolved path when ``token`` names something in a KB root."""
+    if not token or token.startswith("-") or "://" in token:
+        return None
+    probe = _glob_prefix(token) if _has_glob(token) else token
+    resolved = _abs_for_export(probe, base)
+    if resolved is None:
+        return None
+    if _allowlist_hit(resolved, roots):
+        return resolved
+    return None
+
+
+def _is_bulk_source(token: str, resolved: str, roots: set[str]) -> bool:
+    """True when the operand designates a whole tree rather than one file."""
+    if _has_glob(token):
+        return True
+    if resolved in roots:
+        return True
+    if token.endswith("/"):
+        return True
+    try:
+        if os.path.isdir(resolved):
+            return True
+    except OSError:
+        pass
+    # Fail closed: a path we cannot stat and that carries no file extension is
+    # treated as a directory.
+    if not os.path.exists(resolved) and not os.path.splitext(resolved)[1]:
+        return True
+    return False
+
+
+def get_command_export_denial(
+    command: str, cwd: Optional[str] = None
+) -> Optional[dict]:
+    """Refuse a command that would export the knowledge base in bulk.
+
+    Returns ``{"error": "kb_export_forbidden", "message": ...}`` (plus a private
+    ``path`` used only for the audit line) or ``None``.
+
+    Recognised shapes: ``tar``/``zip``/``7z`` over a knowledge directory,
+    ``cp -r|-R|-a``, ``rsync``/``scp``, ``find <kb> ... -exec cp``,
+    ``find <kb> | xargs cp``, ``python -c '...shutil.copytree/make_archive...'``,
+    and a ``cat <kb>/*`` redirected to a file. A single-file
+    ``cp /knowledge/x/a.md /out/`` is NOT refused — the per-turn read quota is
+    what bounds that path.
+    """
+    if not command or not isinstance(command, str):
+        return None
+    roots = get_kb_roots()
+    if not roots:
+        return None
+
+    base = cwd or os.getcwd()
+
+    def deny(path: str) -> dict:
+        return {
+            "error": KB_EXPORT_DENIED_CODE,
+            "message": KB_EXPORT_DENIED_MESSAGE,
+            "path": path,
+            "reason": READGUARD_REASON_EXPORT,
+        }
+
+    # ``find <kb> ... -exec cp`` / ``find <kb> ... | xargs cp`` and Python
+    # one-liners are easier to spot on the whole string than per segment.
+    lowered = command.lower()
+    whole_tokens: list[str] = []
+    for token in command.split():
+        whole_tokens.append(token.strip("'\"();"))
+
+    def first_kb_token(bulk_only: bool = False) -> Optional[str]:
+        for token in whole_tokens:
+            for candidate in [token] + _embedded_paths(token):
+                resolved = _kb_operand(candidate, base, roots)
+                if resolved is None:
+                    continue
+                if bulk_only and not _is_bulk_source(candidate, resolved, roots):
+                    continue
+                return resolved
+        return None
+
+    if "-exec" in whole_tokens or "xargs" in whole_tokens:
+        if any(v in lowered for v in ("cp ", "cp\t", "rsync", "tar ", "install ")):
+            hit = first_kb_token()
+            if hit:
+                return deny(hit)
+
+    if any(marker in command for marker in _EXPORT_PYTHON_MARKERS):
+        hit = first_kb_token()
+        if hit:
+            return deny(hit)
+
+    for segment in _SEGMENT_SPLIT_RE.split(command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            argv = _shlex.split(segment, posix=True)
+        except ValueError:
+            argv = [t.strip("'\"") for t in segment.split()]
+        while argv and (
+            _ENV_ASSIGN_TOKEN_RE.match(argv[0])
+            or os.path.basename(argv[0]) in _COMMAND_PREFIXES
+        ):
+            argv = argv[1:]
+        if not argv:
+            continue
+        name = os.path.basename(argv[0])
+        rest = argv[1:]
+
+        if name in _EXPORT_SYNC_COMMANDS:
+            for token in rest:
+                resolved = _kb_operand(token, base, roots)
+                if resolved is not None:
+                    return deny(resolved)
+            continue
+
+        if name in _EXPORT_ARCHIVE_COMMANDS:
+            for token in rest:
+                resolved = _kb_operand(token, base, roots)
+                if resolved is None:
+                    continue
+                if _is_bulk_source(token, resolved, roots):
+                    return deny(resolved)
+            continue
+
+        if name in _EXPORT_COPY_COMMANDS:
+            recursive = any(
+                flag in _EXPORT_RECURSIVE_FLAGS
+                or (
+                    flag.startswith("-")
+                    and not flag.startswith("--")
+                    and any(c in flag[1:] for c in "rRa")
+                )
+                for flag in rest
+                if flag.startswith("-")
+            )
+            for token in rest:
+                resolved = _kb_operand(token, base, roots)
+                if resolved is None:
+                    continue
+                if recursive or _is_bulk_source(token, resolved, roots):
+                    return deny(resolved)
+            continue
+
+        # ``cat /knowledge/x/* > /out/all.md`` — a glob read funnelled into a
+        # file is an export in everything but name.
+        if name in ("cat", "tail", "head") and ">" in segment:
+            for token in rest:
+                if not _has_glob(token):
+                    continue
+                resolved = _kb_operand(token, base, roots)
+                if resolved is not None:
+                    return deny(resolved)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Per-turn knowledge read quota (HERMES_KB_READ_PER_TURN)
+#
+# A chat user cannot ask for the corpus in one archive (guard above), so the
+# next-best exfiltration is "read me every file". The quota bounds how many
+# knowledge files ONE turn may open through ``read_file``; ``search_files`` is
+# deliberately not counted, since pointing the model at the retrieval tool is
+# exactly the behaviour the refusal asks for.
+#
+# Turn boundary: ``agent/turn_context.py`` calls :func:`reset_kb_read_quota`
+# once per turn, right where the turn id is minted and ``note_turn_start``
+# fires — i.e. once per inbound user message. Counters are process-local and
+# keyed by session id, so concurrent sessions do not share a budget.
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_KB_READ_COUNTS: dict = {}
+_KB_READ_LOCK = _threading.Lock()
+
+
+def get_kb_read_limit() -> int:
+    """Per-turn knowledge read budget (``HERMES_KB_READ_PER_TURN``)."""
+    raw = (os.getenv(KB_READ_PER_TURN_ENV, "") or "").strip()
+    if not raw:
+        return KB_READ_PER_TURN_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return KB_READ_PER_TURN_DEFAULT
+    return value if value >= 0 else KB_READ_PER_TURN_DEFAULT
+
+
+def _kb_quota_session_key() -> str:
+    return get_readguard_identity()["session"]
+
+
+def reset_kb_read_quota(session_id: Optional[str] = None) -> None:
+    """Clear the per-turn counter at a turn boundary. Never raises.
+
+    Called with the agent's ``session_id``; the counting side derives its key
+    from the gateway session context, which can spell the same session
+    differently (or not at all, under the CLI), so both keys are cleared.
+    """
+    try:
+        keys = {_kb_quota_session_key()}
+        if session_id:
+            keys.add(str(session_id))
+        with _KB_READ_LOCK:
+            for key in keys:
+                _KB_READ_COUNTS.pop(key, None)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def reset_all_kb_read_quotas() -> None:
+    """Drop every counter (test helper / process-wide reset)."""
+    with _KB_READ_LOCK:
+        _KB_READ_COUNTS.clear()
+
+
+def get_kb_read_quota_denial() -> dict:
+    limit = get_kb_read_limit()
+    return {
+        "error": KB_READ_QUOTA_CODE,
+        "message": (
+            f"本轮读取知识库文件已达上限（{limit}），"
+            "请改用检索工具定位后再读"
+        ),
+    }
+
+
+def check_kb_read_quota(path: str) -> Optional[dict]:
+    """Count one ``read_file`` against the per-turn knowledge budget.
+
+    Returns the refusal payload once the budget is spent, else ``None`` (and
+    charges the read). Non-knowledge paths are never counted, and
+    ``HERMES_READ_SAFE_ROOTS_BYPASS`` lifts the limit entirely.
+    """
+    try:
+        if is_read_safe_root_bypassed():
+            return None
+        if not is_under_kb_root(path):
+            return None
+        limit = get_kb_read_limit()
+        if limit <= 0:
+            return None
+        key = _kb_quota_session_key()
+        with _KB_READ_LOCK:
+            used = _KB_READ_COUNTS.get(key, 0)
+            if used >= limit:
+                return get_kb_read_quota_denial()
+            _KB_READ_COUNTS[key] = used + 1
+        return None
+    except Exception:  # noqa: BLE001 - a broken counter must not block reads
+        return None
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

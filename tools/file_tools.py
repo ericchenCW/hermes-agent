@@ -18,7 +18,12 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from agent.file_safety import get_read_block_error, get_read_path_denial
+from agent.file_safety import (
+    READ_PATH_DENIED_CODE,
+    READ_PATH_DENIED_MESSAGE,
+    get_read_block_error,
+    get_read_path_denial,
+)
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
@@ -213,19 +218,34 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return _is_blocked_device_path(resolved)
 
 
-def _read_path_denied_response(path: str) -> str | None:
-    """idcsre patch — the structured ``path_not_allowed`` JSON for a blocked read.
+def _read_path_denied_response(path: str, tool: str | None = None) -> str | None:
+    """Return the structured ``path_not_allowed`` JSON for a blocked read.
 
     ``HERMES_READ_SAFE_ROOTS`` allowlist + always-on denylist (see
-    ``agent.file_safety.get_read_path_denial``). The payload is uniform and content-free on
-    purpose: it must not reveal whether the path exists.  Pass an ALREADY-RESOLVED absolute path —
-    the guard's own ``realpath`` is anchored at the Python process cwd, which can differ from
-    TERMINAL_CWD.
+    ``agent.file_safety.get_read_path_denial``). The payload is uniform and
+    content-free on purpose: it must not reveal whether the path exists.
+    Pass an ALREADY-RESOLVED absolute path — the guard's own ``realpath`` is
+    anchored at the Python process cwd, which can differ from TERMINAL_CWD.
+
+    When ``tool`` is given the refusal is also appended to the readguard audit
+    log (``$HERMES_HOME/logs/readguard.jsonl``); the search-result row filter
+    passes ``None`` because it fires once per hit and would flood the trail.
     """
-    denial = get_read_path_denial(path)
-    if denial is None:
+    from agent.file_safety import (
+        classify_read_path_denial,
+        log_readguard_denial,
+        normalize_audit_path,
+    )
+
+    reason = classify_read_path_denial(path)
+    if reason is None:
         return None
-    return json.dumps(denial, ensure_ascii=False)
+    if tool:
+        log_readguard_denial(tool, normalize_audit_path(path), reason)
+    return json.dumps(
+        {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE},
+        ensure_ascii=False,
+    )
 
 
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
@@ -572,14 +592,36 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
-        # ── idcsre patch: read allowlist / denylist guard ─────────────
-        # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any stat/open so the refusal
-        # cannot leak path existence or file type.
-        _path_denied = _read_path_denied_response(str(_resolved))
+        # ── Read allowlist / denylist guard ───────────────────────────
+        # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any
+        # stat/open so the refusal cannot leak path existence or file type.
+        _path_denied = _read_path_denied_response(str(_resolved), tool="read_file")
         if _path_denied:
             return _path_denied
 
-        # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
+        # ── Per-turn knowledge-base read quota ────────────────────────
+        # Bulk export is refused by the terminal guard, so the remaining
+        # exfiltration shape is "read me every knowledge file". Bound it per
+        # turn and point the model at retrieval instead. search_files is
+        # deliberately not counted.
+        from agent.file_safety import (
+            check_kb_read_quota as _check_kb_read_quota,
+            log_readguard_denial as _log_readguard_denial,
+            normalize_audit_path as _normalize_audit_path,
+            READGUARD_REASON_QUOTA as _REASON_QUOTA,
+        )
+
+        _quota_denied = _check_kb_read_quota(str(_resolved))
+        if _quota_denied:
+            _log_readguard_denial(
+                "read_file", _normalize_audit_path(str(_resolved)), _REASON_QUOTA
+            )
+            return json.dumps(_quota_denied, ensure_ascii=False)
+
+        # ── Special-file type guard (stat-based) ──────────────────────
+        # The name blocklist above catches /dev/* and /proc/* aliases; this
+        # catches the class — any FIFO/socket/device wherever it lives. A
+        # read on a FIFO blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
             kind = _special_file_kind(_resolved)
             if kind is not None:
@@ -984,7 +1026,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             if isinstance(exc, RuntimeError) and not get_read_block_error(path):
                 raise
         # idcsre patch: read allowlist / denylist, ahead of the internal denylist.
-        _path_denied = _read_path_denied_response(resolved_search_path)
+        _path_denied = _read_path_denied_response(resolved_search_path, tool="search_files")
         if _path_denied:
             return _path_denied
         block_error = get_read_block_error(resolved_search_path)
