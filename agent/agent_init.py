@@ -2062,6 +2062,12 @@ def init_agent(
     # targets.
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
+    # White-label identity (agent.identity + HERMES_IDENTITY_* env). None when
+    # no name is configured — the system prompt then keeps the upstream
+    # Hermes/Nous identity segment verbatim (default, zero behavior change).
+    from agent.identity_config import resolve_identity
+    agent._agent_identity = resolve_identity(_agent_section.get("identity"))
+
     # Universal parallel-tool-call guidance toggle.  Default True.  Separate
     # flag from task_completion_guidance because a user may want one but not
     # the other.  Steers the model to batch independent tool calls into a

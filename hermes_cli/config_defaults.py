@@ -190,6 +190,22 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # White-label identity.  Upstream bakes "You are Hermes Agent, built
+        # by Nous Research." into the identity segment of the system prompt,
+        # which an embedder cannot undo by appending its own instructions.
+        # Setting `name` REPLACES that segment with the configured identity
+        # plus a hard constraint (never self-identify as Hermes/Nous, never
+        # disclose the underlying model vendor).  `creator` names the
+        # provider, `intro` is an optional one-line self-introduction
+        # (generated from name/creator when empty).  All three empty (the
+        # default) = feature off, upstream identity untouched.  Env
+        # overrides, per field: HERMES_IDENTITY_NAME / HERMES_IDENTITY_CREATOR
+        # / HERMES_IDENTITY_INTRO.
+        "identity": {
+            "name": "",
+            "creator": "",
+            "intro": "",
+        },
         # Universal parallel-tool-call guidance — short prompt block applied to
         # all models that tells the model to batch independent tool calls
         # (reads, searches, web fetches, read-only commands) into one turn

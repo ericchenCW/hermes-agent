@@ -52,12 +52,23 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
+from agent.identity_config import (
+    build_identity_prompt,
+    resolve_identity,
+    scrub_vendor_names,
+    strip_builtin_identity,
+)
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# Sentinel: distinguishes "agent has no ``_agent_identity`` attribute at all"
+# (an object built by a path that never ran agent_init) from "agent_init ran
+# and resolved no identity" (None).
+_IDENTITY_UNSET = object()
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -474,6 +485,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
+    # Operator-configured identity (config.yaml ``agent.identity`` +
+    # HERMES_IDENTITY_* env, resolved in agent_init).  When set, it REPLACES
+    # the built-in Hermes/Nous identity segment instead of being appended
+    # after it -- an external orchestrator cannot otherwise stop the model
+    # from answering "I am Hermes, built by Nous Research".  ``None`` (the
+    # default: empty ``name``) keeps upstream behavior byte-for-byte.
+    # Agents built by paths that never ran agent_init (tests, embedders)
+    # fall back to a pure-env resolution.
+    _identity = getattr(agent, "_agent_identity", _IDENTITY_UNSET)
+    if _identity is _IDENTITY_UNSET:
+        _identity = resolve_identity(None)
+    # Held out of ``stable_parts`` and prepended at the end: it is the one
+    # block that must keep the literal vendor names (its hard constraint
+    # says "never call yourself Hermes"), so the scrub below must not see it.
+    _identity_prefix = build_identity_prompt(_identity) if _identity else ""
+
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
@@ -484,12 +511,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # reads the launch profile's SOUL.md instead (#50233).
         _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
         if _soul_content:
-            stable_parts.append(_soul_content)
+            # ``_soul_loaded`` records that SOUL.md was READ (it gates
+            # skip_soul for the context-file pass), even when the identity
+            # scrub below leaves nothing to inject.
             _soul_loaded = True
+            if _identity is not None:
+                # Keep the persona/behavior half of SOUL.md, drop the
+                # sentences that assert the upstream vendor identity (the
+                # seeded default SOUL.md opens with exactly one).
+                _soul_content = strip_builtin_identity(_soul_content)
+            if _soul_content:
+                stable_parts.append(_soul_content)
 
     if not _soul_loaded:
-        # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        # Fallback to hardcoded identity -- suppressed entirely when an
+        # operator identity was injected above (it is its replacement).
+        if _identity is None:
+            stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a
@@ -501,8 +539,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     # HERMES_PROMPT_HERMES_HELP=0 drops the pointer entirely (deployments
     # where end users never configure Hermes, e.g. an IT-support bot).
+    # A configured identity also drops it: "You run on Hermes Agent (by Nous
+    # Research)" is a second vendor self-introduction, and a white-labeled
+    # deployment's users are not configuring Hermes itself anyway.
     _help_guidance_slot = None
-    if _prompt_section_enabled("HERMES_PROMPT_HERMES_HELP"):
+    if _identity is None and _prompt_section_enabled("HERMES_PROMPT_HERMES_HELP"):
         _help_guidance_slot = len(stable_parts)
         stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
 
@@ -1034,8 +1075,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    _stable = "\n\n".join(p.strip() for p in stable_parts if p and p.strip())
+    if _identity is not None:
+        # Last pass over the BUILT-IN guidance tier only: surface hints and
+        # posture blocks still say "the Hermes terminal UI", "Active Hermes
+        # profile", etc.  Identifiers, env vars, paths and URLs (hermes_cli,
+        # HERMES_HOME, hermes-agent.nousresearch.com) are left intact by the
+        # scrubber's boundaries.  The context/volatile tiers are caller- and
+        # user-authored, so they are never rewritten.
+        _stable = scrub_vendor_names(_stable, _identity)
+        _stable = f"{_identity_prefix}\n\n{_stable}" if _stable else _identity_prefix
     return {
-        "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
+        "stable":   _stable,
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
         "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
     }
