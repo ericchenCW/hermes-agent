@@ -104,16 +104,28 @@ class TestAllowlist:
 
 
 class TestDenylistWithoutAllowlist:
-    """④ With no allowlist configured, the denylist still applies."""
+    """④ With no allowlist configured, only the tier ① denials apply.
+
+    Round 3 split the denylist in two. Tier ① (credential & privacy) is
+    unconditional; tier ② (whole directory trees such as ``/etc``) is skipped
+    entirely when ``HERMES_READ_SAFE_ROOTS`` is unset, so a CLI or standalone
+    gateway fork keeps upstream read behaviour. See
+    ``TestTwoTierMatrix`` for the full two-tier behaviour matrix.
+    """
 
     def test_hermes_config_yaml(self):
         assert get_read_path_denial("/opt/data/config.yaml") == DENIAL
 
-    def test_etc_passwd(self):
-        assert get_read_path_denial("/etc/passwd") == DENIAL
+    def test_etc_passwd_allowed_without_allowlist(self):
+        # Tier ②: gated on HERMES_READ_SAFE_ROOTS being set.
+        assert get_read_path_denial("/etc/passwd") is None
 
     def test_proc(self):
         assert get_read_path_denial("/proc/self/environ") == DENIAL
+
+    @pytest.mark.parametrize("pid", ["1", "42", "99999"])
+    def test_proc_pid_environ(self, pid):
+        assert get_read_path_denial(f"/proc/{pid}/environ") == DENIAL
 
     def test_hermes_home(self, monkeypatch, tmp_path: Path):
         home = tmp_path / "hermes-home"
@@ -134,6 +146,14 @@ class TestDenylistWithoutAllowlist:
 
     def test_ordinary_file_allowed(self, tmp_path: Path):
         assert get_read_path_denial(str(tmp_path / "notes.md")) is None
+
+    def test_config_yaml_outside_hermes_home_allowed(self, monkeypatch, tmp_path: Path):
+        # Round 3: the basename is no longer denied globally — a knowledge-base
+        # article that happens to be called config.yaml is ordinary content.
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert get_read_path_denial(str(tmp_path / "kb" / "config.yaml")) is None
 
 
 class TestDenylistStacksOnAllowlist:
@@ -170,7 +190,7 @@ class TestBypass:
     def test_falsey_values_do_not_bypass(self, monkeypatch):
         for value in ("0", "false", "", "no"):
             monkeypatch.setenv("HERMES_READ_SAFE_ROOTS_BYPASS", value)
-            assert get_read_path_denial("/etc/passwd") == DENIAL
+            assert get_read_path_denial("/opt/data/config.yaml") == DENIAL
 
 
 class TestCommandReadGuard:
@@ -188,20 +208,42 @@ class TestCommandReadGuard:
 
     @pytest.mark.parametrize("command", [
         "head -5 /opt/data/config.yaml",
+        "sed -n '1,5p' /opt/data/config.yaml",
+        "python3 -c 'print(open(\"/opt/data/config.yaml\").read())'",
+        "cat /opt/data/config.yaml | head -3",
+        "cat /proc/self/environ",
+        "echo x && cat /proc/1/environ",
+        "cat /srv/app/.env",
+        "head -1 /srv/certs/server.key",
+    ])
+    def test_denied_shapes(self, command):
+        """Tier ① shapes: refused whether or not an allowlist is configured."""
+        assert get_command_read_denial(command, "/tmp") == DENIAL, command
+
+    _TIER2_COMMANDS = [
         "tail -n 20 /etc/passwd",
         "less /proc/cpuinfo",
         "grep -rn secret /etc",
         "find /etc -name '*.conf'",
         "ls /etc",
-        "sed -n '1,5p' /opt/data/config.yaml",
         "awk '{print}' /etc/hosts",
-        "python3 -c 'print(open(\"/opt/data/config.yaml\").read())'",
         "cat /tmp/../etc/passwd",
-        "cat /opt/data/config.yaml | head -3",
         "echo x && cat /etc/shadow",
-    ])
-    def test_denied_shapes(self, command):
-        assert get_command_read_denial(command, "/tmp") == DENIAL, command
+    ]
+
+    @pytest.mark.parametrize("command", _TIER2_COMMANDS)
+    def test_directory_tier_shapes_allowed_without_allowlist(self, command, tmp_path):
+        """Tier ② shapes read normally when no allowlist is configured."""
+        assert get_command_read_denial(command, str(tmp_path)) is None, command
+
+    @pytest.mark.parametrize("command", _TIER2_COMMANDS)
+    def test_directory_tier_shapes_denied_with_allowlist(
+        self, command, monkeypatch, tmp_path
+    ):
+        kb = tmp_path / "knowledge"
+        kb.mkdir()
+        monkeypatch.setenv("HERMES_READ_SAFE_ROOTS", str(kb))
+        assert get_command_read_denial(command, str(kb)) == DENIAL, command
 
     def test_relative_escape_uses_cwd(self, monkeypatch, tmp_path: Path):
         kb = tmp_path / "knowledge"
@@ -257,11 +299,11 @@ class TestReadFileToolResponse:
 
         home = tmp_path / "hermes-home"
         home.mkdir()
-        (home / "there.yaml").write_text("x")
+        (home / ".env").write_text("x")
         monkeypatch.setenv("HERMES_HOME", str(home))
 
-        present = file_tools.read_file_tool(str(home / "there.yaml"))
-        absent = file_tools.read_file_tool(str(home / "not-there.yaml"))
+        present = file_tools.read_file_tool(str(home / ".env"))
+        absent = file_tools.read_file_tool(str(home / ".env.not-there"))
         assert present == absent
 
     def test_allowed_root_read_still_works(self, monkeypatch, tmp_path: Path):
@@ -349,3 +391,135 @@ class TestTerminalToolIntegration:
         payload = json.loads(raw)
         assert payload.get("error") != READ_PATH_DENIED_CODE
         assert "plain knowledge line" in payload.get("output", "")
+
+
+class TestTwoTierMatrix:
+    """⑥ Round 3: tier ① is unconditional, tier ② is allowlist-gated.
+
+    This tree is forked for plain CLI and standalone-gateway deployments that
+    never set ``HERMES_READ_SAFE_ROOTS``. There, blanket-denying ``/etc`` broke
+    ordinary operator work for no security gain — but the credential and
+    privacy files must stay unreadable regardless. The two blocks below are the
+    agreed behaviour matrix.
+    """
+
+    @pytest.fixture
+    def home(self, monkeypatch, tmp_path: Path) -> Path:
+        """A Haro-shaped ``HERMES_HOME`` with NO allowlist configured."""
+        home = tmp_path / "opt-data"
+        for sub in ("logs", "memories", "sessions", "skills/x"):
+            (home / sub).mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
+
+    # --- no allowlist: tier ① only -----------------------------------------
+
+    def test_etc_hosts_allowed(self, home):
+        assert get_read_path_denial("/etc/hosts") is None
+
+    def test_hermes_skill_allowed(self, home):
+        assert get_read_path_denial(
+            os.path.expanduser("~/.hermes/skills/x/SKILL.md")
+        ) is None
+
+    def test_hermes_home_log_allowed(self, home):
+        assert get_read_path_denial(str(home / "logs" / "x.log")) is None
+
+    def test_hermes_home_skill_allowed(self, home):
+        assert get_read_path_denial(str(home / "skills" / "x" / "SKILL.md")) is None
+
+    def test_hermes_home_config_denied(self, home):
+        assert get_read_path_denial(str(home / "config.yaml")) == DENIAL
+
+    @pytest.mark.parametrize(
+        "name", ["config.yaml", "state.db", "auth.json", "channel_directory.json", ".env"]
+    )
+    def test_hermes_home_credential_files_denied(self, home, name):
+        assert get_read_path_denial(str(home / name)) == DENIAL
+
+    def test_default_hermes_dotenv_denied(self, home):
+        assert get_read_path_denial(os.path.expanduser("~/.hermes/.env")) == DENIAL
+
+    def test_proc_environ_denied(self, home):
+        assert get_read_path_denial("/proc/self/environ") == DENIAL
+        assert get_read_path_denial("/proc/1234/environ") == DENIAL
+
+    def test_proc_environ_normpath_spelling_denied(self, home):
+        # The guard checks realpath AND normpath, so a ``..`` spelling of the
+        # same file cannot dodge the regex.
+        assert get_read_path_denial("/proc/self/../self/environ") == DENIAL
+
+    def test_hermes_memories_denied(self, home):
+        assert get_read_path_denial(str(home / "memories" / "a.md")) == DENIAL
+
+    def test_hermes_sessions_denied(self, home):
+        assert get_read_path_denial(str(home / "sessions" / "s.json")) == DENIAL
+
+    def test_other_proc_entries_allowed(self, home):
+        assert get_read_path_denial("/proc/cpuinfo") is None
+
+    # --- allowlist configured: round-2 behaviour, unchanged -----------------
+
+    @pytest.fixture
+    def allowlisted(self, monkeypatch, tmp_path: Path) -> dict:
+        """``/knowledge,/opt/data/skills,/out`` against a Haro-shaped home."""
+        home = tmp_path / "opt-data"
+        (home / "skills" / "x").mkdir(parents=True)
+        (home / "logs").mkdir()
+        kb = tmp_path / "knowledge"
+        (kb / "x").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv(
+            "HERMES_READ_SAFE_ROOTS", f"{kb},{home / 'skills'},{out}"
+        )
+        return {"home": home, "kb": kb, "out": out}
+
+    def test_allowlisted_skill_allowed(self, allowlisted):
+        target = allowlisted["home"] / "skills" / "x" / "SKILL.md"
+        assert get_read_path_denial(str(target)) is None
+
+    def test_env_in_allowlisted_skill_denied(self, allowlisted):
+        target = allowlisted["home"] / "skills" / "x" / ".env"
+        assert get_read_path_denial(str(target)) == DENIAL
+
+    def test_hermes_home_logs_denied_with_allowlist(self, allowlisted):
+        target = allowlisted["home"] / "logs" / "x.log"
+        assert get_read_path_denial(str(target)) == DENIAL
+
+    @pytest.mark.parametrize("path", ["/etc/hosts", "/etc/passwd", "/proc/cpuinfo"])
+    def test_system_trees_denied_with_allowlist(self, allowlisted, path):
+        assert get_read_path_denial(path) == DENIAL
+
+    def test_kb_document_named_config_yaml_allowed(self, allowlisted):
+        # The whole point of round 3's narrowing: a knowledge-base article that
+        # happens to be called config.yaml is ordinary content.
+        target = allowlisted["kb"] / "x" / "config.yaml"
+        assert get_read_path_denial(str(target)) is None
+
+    # --- terminal command guard follows the same two tiers ------------------
+
+    def test_terminal_cat_etc_hosts_allowed_without_allowlist(self, home):
+        assert get_command_read_denial("cat /etc/hosts", str(home)) is None
+
+    def test_terminal_cat_hermes_config_denied_without_allowlist(self, home):
+        assert get_command_read_denial(
+            f"cat {home}/config.yaml", str(home)
+        ) == DENIAL
+
+    def test_terminal_cat_proc_environ_denied_without_allowlist(self, home):
+        assert get_command_read_denial("cat /proc/self/environ", str(home)) == DENIAL
+
+    def test_terminal_cat_hermes_memories_denied_without_allowlist(self, home):
+        assert get_command_read_denial(
+            f"cat {home}/memories/a.md", str(home)
+        ) == DENIAL
+
+    def test_terminal_cat_hermes_log_allowed_without_allowlist(self, home):
+        assert get_command_read_denial(f"cat {home}/logs/x.log", str(home)) is None
+
+    def test_terminal_cat_etc_hosts_denied_with_allowlist(self, allowlisted):
+        assert get_command_read_denial(
+            "cat /etc/hosts", str(allowlisted["kb"])
+        ) == DENIAL
