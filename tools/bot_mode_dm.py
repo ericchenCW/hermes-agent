@@ -307,6 +307,12 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     # Local teammate.
     is_local_shape = bool(_LOCAL_TARGET_RE.match(raw_target))
     if not is_local_shape and "@" not in raw_target:
+        # idcsre patch: a target that is neither handle-shaped nor connection-qualified may still
+        # be a teammate's DISPLAY name ("IT 小助理") — those live only in the relay roster, so try
+        # the relay before calling the target invalid (the regex gate rejected CJK names outright).
+        relayed = _try_relay_delivery(root, raw_target, content, me, **delivery)
+        if relayed is not None:
+            return relayed
         return _roster_err(f"Invalid target: {raw_target!r}.")
     resolved = _resolve_local_name(raw_target, roster) if is_local_shape else None
     if resolved is None or resolved == me:
@@ -320,7 +326,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             return _err("You can't message yourself. Pick a teammate from the roster.")
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
-                           "(roles are listed in your system prompt).")
+                           "(roles are listed in your system prompt) — you can pass a "
+                           "teammate's display name (e.g. 'IT 小助理') or their @handle.")
     return _start_delivery(["hermes", "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
                            stdin_file=False, profile_home=roster_homes[resolved], **delivery)
 
@@ -334,7 +341,12 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
     try:
         from tools.bot_mode_probe import _handle
         from tools.bot_relay import (
-            EnvelopeRefusedError, enqueue_envelope, read_remote_roster, resolve_remote_target, waiter_command,
+            EnvelopeRefusedError,
+            describe_remote_target,
+            enqueue_envelope,
+            read_remote_roster,
+            resolve_remote_target,
+            waiter_command,
         )
 
         roster = read_remote_roster(root)
@@ -342,9 +354,16 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         if match is None:
             return None
         if match == "ambiguous":
-            want = raw_target.strip().lstrip("@").lower()
-            forms = ", ".join(f"{r['handle']}@{r['connection_id']}" for r in roster if r["handle"].lower() == want)
-            return _err(f"'{raw_target}' exists on several connected machines — disambiguate with one of: {forms}.")
+            candidates = getattr(match, "candidates", None) or [
+                r
+                for r in roster
+                if r["handle"].lower() == raw_target.strip().lstrip("@").lower()
+            ]
+            forms = "; ".join(describe_remote_target(r) for r in candidates)
+            return _err(
+                f"'{raw_target}' matches several teammates — pick the one you "
+                f"mean and pass its exact target: {forms}."
+            )
         try:
             envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
         except EnvelopeRefusedError as exc:
