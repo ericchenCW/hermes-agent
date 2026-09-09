@@ -11,7 +11,12 @@ import sys
 import threading
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_read_block_error, get_read_path_denial
+from agent.file_safety import (
+    READ_PATH_DENIED_CODE,
+    READ_PATH_DENIED_MESSAGE,
+    get_read_block_error,
+    get_read_path_denial,
+)
 from tools.binary_extensions import (
     has_binary_extension,
     has_opaque_document_extension,
@@ -597,7 +602,7 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return False
 
 
-def _read_path_denied_response(path: str) -> str | None:
+def _read_path_denied_response(path: str, tool: str | None = None) -> str | None:
     """Return the structured ``path_not_allowed`` JSON for a blocked read.
 
     ``HERMES_READ_SAFE_ROOTS`` allowlist + always-on denylist (see
@@ -605,11 +610,26 @@ def _read_path_denied_response(path: str) -> str | None:
     content-free on purpose: it must not reveal whether the path exists.
     Pass an ALREADY-RESOLVED absolute path — the guard's own ``realpath`` is
     anchored at the Python process cwd, which can differ from TERMINAL_CWD.
+
+    When ``tool`` is given the refusal is also appended to the readguard audit
+    log (``$HERMES_HOME/logs/readguard.jsonl``); the search-result row filter
+    passes ``None`` because it fires once per hit and would flood the trail.
     """
-    denial = get_read_path_denial(path)
-    if denial is None:
+    from agent.file_safety import (
+        classify_read_path_denial,
+        log_readguard_denial,
+        normalize_audit_path,
+    )
+
+    reason = classify_read_path_denial(path)
+    if reason is None:
         return None
-    return json.dumps(denial, ensure_ascii=False)
+    if tool:
+        log_readguard_denial(tool, normalize_audit_path(path), reason)
+    return json.dumps(
+        {"error": READ_PATH_DENIED_CODE, "message": READ_PATH_DENIED_MESSAGE},
+        ensure_ascii=False,
+    )
 
 
 def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
@@ -1659,9 +1679,28 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # ── Read allowlist / denylist guard ───────────────────────────
         # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any
         # stat/open so the refusal cannot leak path existence or file type.
-        _path_denied = _read_path_denied_response(str(_resolved))
+        _path_denied = _read_path_denied_response(str(_resolved), tool="read_file")
         if _path_denied:
             return _path_denied
+
+        # ── Per-turn knowledge-base read quota ────────────────────────
+        # Bulk export is refused by the terminal guard, so the remaining
+        # exfiltration shape is "read me every knowledge file". Bound it per
+        # turn and point the model at retrieval instead. search_files is
+        # deliberately not counted.
+        from agent.file_safety import (
+            check_kb_read_quota as _check_kb_read_quota,
+            log_readguard_denial as _log_readguard_denial,
+            normalize_audit_path as _normalize_audit_path,
+            READGUARD_REASON_QUOTA as _REASON_QUOTA,
+        )
+
+        _quota_denied = _check_kb_read_quota(str(_resolved))
+        if _quota_denied:
+            _log_readguard_denial(
+                "read_file", _normalize_audit_path(str(_resolved)), _REASON_QUOTA
+            )
+            return json.dumps(_quota_denied, ensure_ascii=False)
 
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
@@ -2618,7 +2657,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
         _search_target = str(resolved_path) if resolved_path else path
-        _path_denied = _read_path_denied_response(_search_target)
+        _path_denied = _read_path_denied_response(_search_target, tool="search_files")
         if _path_denied:
             return _path_denied
         block_error = get_read_block_error(_search_target)

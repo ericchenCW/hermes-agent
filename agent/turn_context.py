@@ -644,6 +644,14 @@ def build_turn_context(
     from agent.agent_runtime_helpers import note_turn_start
     note_turn_start(agent, turn_id)
 
+    # Per-turn knowledge-base read budget (HERMES_KB_READ_PER_TURN). This is
+    # the single place a turn begins — one inbound user message, one reset.
+    try:
+        from agent.file_safety import reset_kb_read_quota
+        reset_kb_read_quota(getattr(agent, "session_id", None))
+    except Exception:
+        logger.debug("kb read quota reset skipped", exc_info=True)
+
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
