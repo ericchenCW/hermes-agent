@@ -18,7 +18,7 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_read_block_error, get_read_path_denial
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
@@ -213,6 +213,21 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return _is_blocked_device_path(resolved)
 
 
+def _read_path_denied_response(path: str) -> str | None:
+    """idcsre patch — the structured ``path_not_allowed`` JSON for a blocked read.
+
+    ``HERMES_READ_SAFE_ROOTS`` allowlist + always-on denylist (see
+    ``agent.file_safety.get_read_path_denial``). The payload is uniform and content-free on
+    purpose: it must not reveal whether the path exists.  Pass an ALREADY-RESOLVED absolute path —
+    the guard's own ``realpath`` is anchored at the Python process cwd, which can differ from
+    TERMINAL_CWD.
+    """
+    denial = get_read_path_denial(path)
+    if denial is None:
+        return None
+    return json.dumps(denial, ensure_ascii=False)
+
+
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
     """Remove credential/cache/env paths from a SearchResult in-place; return the omitted count.
 
@@ -227,7 +242,9 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
             target = str(_resolve_path_for_task(path, task_id))
         except (OSError, ValueError, RuntimeError):
             target = path
-        if get_read_block_error(target):
+        # idcsre patch: the read allowlist/denylist filters search hits too, with the same
+        # content-free outcome — the caller only removes the row.
+        if get_read_path_denial(target) is not None or get_read_block_error(target):
             omitted += 1
             return False
         return True
@@ -554,6 +571,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 "block or produce infinite output.")
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        # ── idcsre patch: read allowlist / denylist guard ─────────────
+        # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any stat/open so the refusal
+        # cannot leak path existence or file type.
+        _path_denied = _read_path_denied_response(str(_resolved))
+        if _path_denied:
+            return _path_denied
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
@@ -959,6 +983,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             # path is itself denylisted (that error wins).
             if isinstance(exc, RuntimeError) and not get_read_block_error(path):
                 raise
+        # idcsre patch: read allowlist / denylist, ahead of the internal denylist.
+        _path_denied = _read_path_denied_response(resolved_search_path)
+        if _path_denied:
+            return _path_denied
         block_error = get_read_block_error(resolved_search_path)
         if block_error:
             return tool_error(block_error)

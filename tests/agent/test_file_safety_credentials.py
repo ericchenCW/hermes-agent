@@ -97,7 +97,10 @@ def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
     )
     raw = json.dumps(out)
     assert "error" in out
-    assert "credential store" in out["error"]
+    # Fork: the HERMES_READ_SAFE_ROOTS guard runs ahead of the internal denylist and answers with
+    # the uniform, content-free path_not_allowed payload (it must not reveal which rule hit or
+    # whether the path exists), so the refusal is that one rather than the "credential store" text.
+    assert out["error"] in ("path_not_allowed",) or "credential store" in out["error"]
     assert "SEARCH_DIRECT_AUTH_SECRET" not in raw
 
 
