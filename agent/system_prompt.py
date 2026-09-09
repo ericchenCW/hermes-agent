@@ -971,7 +971,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # inside the reused prefix, and a changed one only re-prefills from here on.
     # (No effect for single-block cache_control backends, where the whole
     # system message is one cache unit regardless of internal order.)
+    # Volatile parts that Hermes itself authors (guidance headers, the
+    # skills index framing, the provider block, the runtime footer) are
+    # scrubbed with the stable tier when an identity is configured.  The
+    # rest of this tier -- memory entries, USER.md, plugin sections -- is
+    # user/plugin content and is never rewritten.  Indices, not a second
+    # list, so ordering stays byte-identical to the unconfigured build.
+    _scrubbable_volatile: List[int] = []
     if skills_prompt:
+        _scrubbable_volatile.append(len(volatile_parts))
         volatile_parts.append(skills_prompt)
 
     if agent._memory_store:
@@ -998,6 +1006,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             try:
                 _ext_mem_block = agent._memory_manager.build_system_prompt()
                 if _ext_mem_block:
+                    _scrubbable_volatile.append(len(volatile_parts))
                     volatile_parts.append(_ext_mem_block)
             except Exception:
                 pass
@@ -1073,6 +1082,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
+    _scrubbable_volatile.append(len(volatile_parts))
     volatile_parts.append(timestamp_line)
 
     _stable = "\n\n".join(p.strip() for p in stable_parts if p and p.strip())
@@ -1085,6 +1095,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # user-authored, so they are never rewritten.
         _stable = scrub_vendor_names(_stable, _identity)
         _stable = f"{_identity_prefix}\n\n{_stable}" if _stable else _identity_prefix
+        # Same pass over the Hermes-authored blocks of the volatile tier.
+        # The stable tier is not the only place the vendor name reaches the
+        # model: the skills-index framing, the external-memory provider
+        # block and the runtime footer are all Hermes prose too, and a
+        # white-labeled deployment leaking "Hermes" from any of them is the
+        # same bug.  Caller-supplied text (``system_message``), context
+        # files, memory entries, USER.md and plugin sections stay verbatim.
+        for _i in _scrubbable_volatile:
+            if 0 <= _i < len(volatile_parts) and volatile_parts[_i]:
+                volatile_parts[_i] = scrub_vendor_names(volatile_parts[_i], _identity)
     return {
         "stable":   _stable,
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
