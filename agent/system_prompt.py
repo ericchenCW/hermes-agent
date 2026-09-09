@@ -12,13 +12,18 @@ Three tiers are joined with ``\\n\\n``:
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
   guidance, computer-use guidance, nous subscription block, tool-use
   enforcement guidance + per-model operational guidance,
-  alibaba model-name workaround, environment hints, coding guidance,
-  platform hints.
+  alibaba model-name workaround, coding guidance, platform hints.
 * ``context``  — caller-supplied ``system_message`` plus context files
   (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``,
   plus the session's coding-workspace snapshot.
 * ``volatile`` — skills index, memory snapshot, USER.md profile, external
-  memory provider block, timestamp/session/model/provider line.
+  memory provider block, environment hints (host/cwd or remote backend),
+  timestamp/session/model/provider line.
+
+Session-varying facts (working directory, date, session id, model /
+provider / platform) all live in the volatile tail, so two sessions of the
+same deployment share a byte-identical prefix up to that tail even when the
+embedder hands each session its own working directory.
 
 Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 """
@@ -458,7 +463,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         session-stable guidance, context files, and caller-supplied
         system_message.
       * ``volatile`` — skills index, memory snapshot, user profile,
-        external memory provider block, timestamp line.
+        external memory provider block, environment hints (they carry the
+        per-session working directory), timestamp line.
 
     Joined into a single string by :func:`build_system_prompt` and
     cached on ``agent._cached_system_prompt`` for the lifetime of the
@@ -723,10 +729,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
-    # Stable for the lifetime of the process.
+    # Stable for the lifetime of the PROCESS, but NOT across sessions: the
+    # host block carries "Current working directory: <cwd>", and an embedder
+    # that gives every session its own scratch dir (Haro hands each session a
+    # fresh ``/out/<uuid>``) makes this the earliest per-session byte in the
+    # prompt. Left in the stable tier it truncated the cross-session prefix
+    # cache at ~60% of the prompt, taking every guidance block after it with
+    # it. Rendered verbatim in the volatile tail instead (next to the
+    # session/model/provider footer it belongs with) — the block text is
+    # unchanged, only its position moves, so the ``User home directory:`` →
+    # ``Current working directory:`` adjacency that
+    # ``conversation_loop._stored_prompt_still_valid`` anchors on survives.
     _env_hints = _r.build_environment_hints()
-    if _env_hints:
-        stable_parts.append(_env_hints)
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). Keep the operating brief in
@@ -1017,6 +1031,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts.extend(
         _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
     )
+
+    # Environment hints (host OS / home / cwd, or the remote-backend block),
+    # rendered here rather than in the stable tier — see the build site above.
+    # Hermes-authored prose (the remote-backend text names the vendor), so it
+    # is scrubbed alongside the other built-in volatile blocks.
+    if _env_hints:
+        _scrubbable_volatile.append(len(volatile_parts))
+        volatile_parts.append(_env_hints)
 
     from hermes_time import get_timezone as _hermes_tz, now as _hermes_now
     now = _hermes_now()

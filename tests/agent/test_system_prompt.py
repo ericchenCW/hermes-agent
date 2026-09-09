@@ -719,3 +719,113 @@ class TestConversationStartedTwoLine:
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
 
+
+
+class TestCrossSessionPrefixStability:
+    """Two sessions of the same deployment must share a long byte-identical prefix.
+
+    Embedders (Haro) hand every session its own scratch working directory
+    (``/out/<uuid>``). That path reaches the prompt through
+    ``build_environment_hints()``'s host block; while that block sat in the
+    stable tier it was the earliest per-session byte in the prompt and cut
+    the upstream prefix cache at ~60% of the prompt. The block now renders
+    in the volatile tail, so everything ahead of it is reusable.
+    """
+
+    SEED = "Knowledge-contract seed for this deployment. " * 40
+
+    def _prompt_for(self, session_id, cwd):
+        agent = _make_agent(
+            skip_context_files=True,
+            valid_tool_names=["read_file", "terminal", "skills_list", "skill_view"],
+            _task_completion_guidance=True,
+            _parallel_tool_call_guidance=True,
+            _execution_guidance=False,
+            _bot_mode_protocol=False,
+            _memory_enabled=False,
+            _user_profile_enabled=False,
+            model="auto",
+            provider="custom",
+            platform="haro",
+            pass_session_id=True,
+            session_id=session_id,
+            context_compressor=None,
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value="You are an agent. Persona.\n" * 20),
+            patch("run_agent.build_skills_system_prompt",
+                  return_value="# Skills index\n- foo: bar\n" * 30),
+            patch("agent.prompt_builder.resolve_agent_cwd", return_value=cwd),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            parts = build_system_prompt_parts(agent, system_message=self.SEED)
+        return "\n\n".join(
+            p for p in (parts["stable"], parts["context"], parts["volatile"]) if p
+        )
+
+    def _two_prompts(self, monkeypatch, tmp_path):
+        one = tmp_path / "out" / "11111111111111111111111111111111"
+        two = tmp_path / "out" / "22222222222222222222222222222222"
+        one.mkdir(parents=True)
+        two.mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(one))
+        a = self._prompt_for("sess-aaaa", str(one))
+        monkeypatch.setenv("TERMINAL_CWD", str(two))
+        b = self._prompt_for("sess-bbbb", str(two))
+        return a, b
+
+    @staticmethod
+    def _common_prefix_len(a, b):
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    def test_common_prefix_at_least_90_percent(self, monkeypatch, tmp_path):
+        a, b = self._two_prompts(monkeypatch, tmp_path)
+        ratio = self._common_prefix_len(a, b) / max(len(a), len(b))
+        assert ratio >= 0.90, f"cross-session common prefix only {ratio:.2%}"
+
+    def test_session_varying_lines_live_in_the_final_tenth(self, monkeypatch, tmp_path):
+        a, _ = self._two_prompts(monkeypatch, tmp_path)
+        tail_start = int(len(a) * 0.90)
+        for label in (
+            "Current working directory:",
+            "Conversation started:",
+            "Session ID:",
+            "Model:",
+            "Provider:",
+            "Platform:",
+        ):
+            idx = a.find(label)
+            assert idx >= 0, f"{label} missing from the prompt"
+            assert idx >= tail_start, (
+                f"{label} at {idx / len(a):.2%} of the prompt, expected the final 10%"
+            )
+
+    def test_host_block_kept_verbatim_and_adjacent(self, monkeypatch, tmp_path):
+        """The block moves as a unit — conversation_loop anchors cwd on the
+        ``User home directory:`` line directly above it."""
+        a, _ = self._two_prompts(monkeypatch, tmp_path)
+        lines = a.splitlines()
+        idx = next(i for i, ln in enumerate(lines) if ln.startswith("User home directory:"))
+        assert any(
+            ln.startswith("Current working directory:")
+            for ln in lines[idx + 1: idx + 4]
+        )
+
+    def test_only_the_env_block_moved(self, monkeypatch, tmp_path):
+        """Ordering-only change: removing the env-hints block from the build
+        leaves exactly the paragraph set the rest of the prompt always had."""
+        a, _ = self._two_prompts(monkeypatch, tmp_path)
+        with_env = set(a.split("\n\n"))
+        env_blocks = [p for p in with_env if p.startswith("Host: ")]
+        assert len(env_blocks) == 1
+        assert "Current working directory:" in env_blocks[0]
+
+        one = tmp_path / "out" / "11111111111111111111111111111111"
+        monkeypatch.setenv("TERMINAL_CWD", str(one))
+        with patch("run_agent.build_environment_hints", return_value=""):
+            b = self._prompt_for("sess-aaaa", str(one))
+        assert with_env - set(env_blocks) == set(b.split("\n\n"))
