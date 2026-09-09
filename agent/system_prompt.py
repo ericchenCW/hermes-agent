@@ -734,7 +734,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if environment_hints:
         # Embedder hints are prose too; reserve the delimiter for the renderer.
         environment_hints = environment_hints.replace(_pb.RUNTIME_ENVIRONMENT_HEADING, "> " + _pb.RUNTIME_ENVIRONMENT_HEADING)
-        volatile_parts.append(f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}")
+        _env_block = f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}"
+        # idcsre patch: the host block ("Current working directory: …") and the remote-backend text
+        # are Hermes-authored prose, so they are scrubbed alongside the other built-in volatile
+        # blocks when an operator identity is configured.
+        volatile_parts.append(_vscrub(_env_block) if _vscrub else _env_block)
     _stable = _join_tier(stable_parts)
     if _identity is not None:
         # idcsre patch — last pass over the BUILT-IN guidance tier only: surface hints and posture
