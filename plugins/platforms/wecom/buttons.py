@@ -47,6 +47,10 @@ BUTTON_STYLE = 4               # same style for every option (1 = primary blue r
 # text_notice cards must carry a card_action (errcode 42045 otherwise); the URL only matters if
 # someone taps the "已选择" notice after a click.
 BUTTON_CARD_ACTION_URL = os.environ.get("WECOM_CARD_ACTION_URL", "https://work.weixin.qq.com/")
+# Explicit (non-DSL) cards pushed through the ``platform_send`` verb: the caller
+# hands over a structured spec, so nothing is parsed out of the reply text.
+CARD_DESC_MAX = 76             # WeCom main_title.desc limit
+CARD_TASK_ID_PREFIX = "card-"
 BUTTON_PARTIAL_LINE_RE = re.compile(r"(?:^|\n)[ \t]*(?:\*\*)?BUTTONS(?![A-Za-z0-9])[^\n]*\Z", re.I)
 
 
@@ -198,7 +202,76 @@ class WeComButtonsMixin:
             logger.warning("[%s] Button card delivery failed for chat %s: %s", self.name, chat_id, exc)
             return False
 
-    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str, user_id: str = "") -> None:
+    def _build_explicit_card(self, chat_id: str, card: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Structured spec → WeCom ``button_interaction`` template card.
+
+        Unlike :meth:`_build_button_card` nothing is parsed out of reply text and
+        the caller's keys ride through untouched (they are the caller's own
+        capability tokens — the adapter neither decodes nor logs them). The card
+        is registered so a later click can recover its title/url for the ack
+        rewrite; the registry is the same bounded/TTL-swept dict.
+        """
+        task_id = f"{CARD_TASK_ID_PREFIX}{uuid.uuid4().hex[:24]}"
+        title = str(card.get("title") or BUTTON_DEFAULT_TITLE)[:BUTTON_TITLE_MAX]
+        main_title: Dict[str, Any] = {"title": title}
+        if desc := str(card.get("desc") or "").strip():
+            main_title["desc"] = desc[:CARD_DESC_MAX]
+        buttons = []
+        for entry in card.get("buttons") or []:
+            style = entry.get("style")
+            buttons.append({
+                "text": str(entry.get("text") or "")[:BUTTON_LABEL_MAX],
+                "style": style if isinstance(style, int) and not isinstance(style, bool) else BUTTON_STYLE,
+                "key": str(entry.get("key") or ""),
+            })
+        built = {
+            "card_type": "button_interaction",
+            "main_title": main_title,
+            "task_id": task_id,
+            "button_list": buttons[:BUTTON_MAX],
+        }
+        self._sweep_button_cards()
+        self._pending_button_cards[task_id] = {
+            "chat_id": chat_id, "title": title, "options": [], "keys": [],
+            "url": str(card.get("url") or ""), "ts": time.monotonic(),
+            "consumed": False, "owner": "", "explicit": True,
+        }
+        return task_id, built
+
+    async def send_card(self, chat_id: str, card: Dict[str, Any], fallback_text: str = ""):
+        """Push one explicit interactive card to a DM (``platform_send`` card path).
+
+        Proactive ``aibot_send_msg`` only: P1 serves single chats, where a
+        proactive send is allowed (groups require a passive reply on a live
+        req_id, which an external scheduler does not have). A card failure falls
+        back to ``fallback_text`` as an ordinary message so the notification is
+        never lost; the fallback never re-parses a BUTTONS directive.
+        """
+        from gateway.platforms.base import SendResult
+
+        if not chat_id:
+            return SendResult(success=False, error="chat_id is required")
+        return await self._enqueue_chat_send(chat_id, lambda: self._send_card_inner(chat_id, card, fallback_text), is_control=True)
+
+    async def _send_card_inner(self, chat_id: str, card: Dict[str, Any], fallback_text: str):
+        from gateway.platforms.base import SendResult
+
+        task_id = ""
+        try:
+            task_id, built = self._build_explicit_card(chat_id, card)
+            response = await self._send_request(APP_CMD_SEND, {"chatid": chat_id, "msgtype": "template_card", "template_card": built})
+            self._raise_for_wecom_error(response, "send card (proactive)")
+            logger.info("[%s] Card sent task=%s buttons=%d", self.name, task_id, len(built["button_list"]))
+            return SendResult(success=True, message_id=self._payload_req_id(response) or task_id, raw_response=response)
+        except Exception as exc:
+            logger.warning("[%s] Card delivery failed for chat %s: %s", self.name, chat_id, exc)
+            self._pending_button_cards.pop(task_id, None)
+            if not (fallback_text or "").strip():
+                return SendResult(success=False, error=f"card delivery failed: {exc}")
+            logger.info("[%s] Falling back to plain text for chat %s", self.name, chat_id)
+            return await self._send_inner(chat_id, fallback_text, parse_directives=False)
+
+    async def _send_card_update(self, req_id: str, task_id: str, title: str, chosen_text: str, user_id: str = "", url: str = "") -> None:
         """Acknowledge a click by rewriting the card (must land within 5 s).
 
         Field notes (2026-09-03): ``update_button`` is rejected by the AI-bot channel (40058);
@@ -208,7 +281,7 @@ class WeComButtonsMixin:
             "card_type": "text_notice",
             "main_title": {"title": title[:BUTTON_TITLE_MAX]},
             "sub_title_text": chosen_text,
-            "card_action": {"type": 1, "url": BUTTON_CARD_ACTION_URL},
+            "card_action": {"type": 1, "url": url or BUTTON_CARD_ACTION_URL},
             "task_id": task_id,
         }
         attempts = [{"response_type": "update_template_card", "template_card": card}]

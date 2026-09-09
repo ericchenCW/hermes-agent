@@ -680,12 +680,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, WeComButtonsMixin, ChatSen
         is_control = metadata.pop("is_approval_prompt", False)
         # Approval *confirmations* must not consume the req_id the stream consumer still needs.
         force_proactive = bool(metadata.pop("force_proactive_send", False))
-        return await self._enqueue_chat_send(chat_id, lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive), is_control=is_control)
+        # ``platform_send`` delivers verbatim text: a BUTTONS[...] line in a body
+        # pushed by an external scheduler must NOT become a card behind its back.
+        parse_directives = not bool(metadata.pop("no_button_directive", False))
+        return await self._enqueue_chat_send(chat_id, lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive, parse_directives=parse_directives), is_control=is_control)
 
-    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False) -> SendResult:
-        """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
+    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False, parse_directives: bool = True) -> SendResult:
+        """Send under the per-chat queue; force_proactive skips passive reply except in groups.
+
+        ``parse_directives=False`` (the ``platform_send`` path) delivers the body
+        verbatim — no BUTTONS[...] card is derived from it."""
         # idcsre patch: a trailing BUTTONS[...] line becomes a template card, not visible text.
-        content, button_spec = self._extract_button_directive(content)
+        content, button_spec = self._extract_button_directive(content) if parse_directives else (content, None)
         content = self._drop_empty_image_tags(content)
         card_req_id = None
         if not (content or "").replace("\u200b", "").strip() and not button_spec:
