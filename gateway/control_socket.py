@@ -5,13 +5,20 @@ boundary. POSIX: ``$HERMES_HOME/gateway.sock`` (or a temp-dir socket + ``gateway
 file when the home path exceeds ``sun_path``); Windows: named pipe ``\\\\.\\pipe\\hermes-gateway-<hash>``.
 Wire contract: ONE request per connection — one JSON line in, one out, then the server closes.
 Consumers PREFER the socket and fall back to the state-file/scan layer when it doesn't answer.
+Action verbs wired by the gateway runner: ``pause-for-update`` (drain and exit for an update) and
+``platform_send`` (send one text message to a chat through a live platform adapter — external
+schedulers such as Haro's cron jobs cannot open their own platform connection, since a second WeCom
+WS kicks the gateway offline, so the gateway performs the send on their behalf and answers
+synchronously).
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -33,6 +40,28 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+
+# ---------------------------------------------------------------------------
+# platform_send verb (outbound push for external schedulers)
+# ---------------------------------------------------------------------------
+#
+# Haro's scheduled jobs run OUTSIDE the gateway process but must deliver their
+# result into a live IM session. Only the process holding the platform
+# connection may send (a second process opening its own WeCom WS kicks the
+# gateway offline), so the gateway exposes the send as a control verb: the
+# caller hands over {platform, chat_id, text} and blocks for the outcome.
+#
+# Error codes are constants so the contract can be tuned in one place.
+PLATFORM_SEND_VERB = "platform_send"
+PLATFORM_SEND_MAX_TEXT_CHARS = 4000
+PLATFORM_SEND_DEFAULT_TIMEOUT = 20.0
+PLATFORM_SEND_TIMEOUT_ENV = "HERMES_PLATFORM_SEND_TIMEOUT"
+
+PLATFORM_SEND_ERR_BAD_REQUEST = "bad_request"
+PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND = "platform_not_found"
+PLATFORM_SEND_ERR_ADAPTER_NOT_READY = "adapter_not_ready"
+PLATFORM_SEND_ERR_SEND_FAILED = "send_failed"
+PLATFORM_SEND_ERR_TIMEOUT = "timeout"
 
 
 def _home_hash(home: Path) -> str:
@@ -117,6 +146,193 @@ def build_status_payload() -> dict[str, Any]:
     return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
+
+# ---------------------------------------------------------------------------
+# Verb results that also answer at the top level of the response frame
+# ---------------------------------------------------------------------------
+
+class FlatResult(dict):
+    """A verb result whose keys are ALSO hoisted to the response frame.
+
+    The v1 envelope (``{"ok": true, "result": {...}}``) reports whether the
+    verb *dispatched*, which is the wrong signal for verbs that perform an
+    action that can fail (``platform_send``): a caller checking the top-level
+    ``ok`` would read a failed send as a success. Handlers returning a
+    ``FlatResult`` opt into a frame where the result's own ``ok`` becomes the
+    frame's ``ok`` and the remaining keys sit alongside it — while ``result``
+    is still populated, so both readings agree. Plain-dict handlers
+    (``identify``, ``status``, ``pause-for-update``) are untouched.
+    """
+
+
+def _invoke_verb_handler(
+    handler: Callable[..., dict[str, Any]], request: dict[str, Any]
+) -> Any:
+    """Call ``handler``, passing the raw request only if it accepts one.
+
+    v1 handlers are zero-argument (the verb carries no parameters).
+    Parameterised verbs such as ``platform_send`` declare a single positional
+    parameter and receive the decoded request dict.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters
+    except (TypeError, ValueError):  # builtins / C callables
+        return handler()
+    for param in parameters.values():
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        ):
+            return handler(request)
+    return handler()
+
+
+# ---------------------------------------------------------------------------
+# platform_send handler
+# ---------------------------------------------------------------------------
+
+def _platform_send_timeout(explicit: Optional[float] = None) -> float:
+    """Send budget: explicit argument, else ``$HERMES_PLATFORM_SEND_TIMEOUT``."""
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get(PLATFORM_SEND_TIMEOUT_ENV)
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            logger.debug("Ignoring malformed %s=%r", PLATFORM_SEND_TIMEOUT_ENV, raw)
+    return PLATFORM_SEND_DEFAULT_TIMEOUT
+
+
+def _platform_send_failure(code: str, message: str) -> FlatResult:
+    return FlatResult({"ok": False, "error": code, "message": message})
+
+
+def build_platform_send_handler(
+    get_adapter: Callable[[str], Any],
+    *,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+    timeout: Optional[float] = None,
+) -> Callable[[dict[str, Any]], FlatResult]:
+    """Build the ``platform_send`` verb handler.
+
+    ``get_adapter(platform)`` returns the live adapter for a platform name, or
+    None when the gateway does not serve it. ``loop`` is the gateway's event
+    loop — the handler itself runs on the control socket's executor thread, so
+    the adapter's ``send`` coroutine is marshalled back onto that loop with
+    ``asyncio.run_coroutine_threadsafe`` and awaited synchronously (the same
+    thread→loop bridge ``pause-for-update`` uses, but result-carrying).
+
+    The text is delivered verbatim: no templating, no command interpretation.
+    Exactly one INFO line is logged per call, carrying the platform, chat id,
+    text LENGTH and outcome — never the message body.
+    """
+
+    def _handler(request: dict[str, Any]) -> FlatResult:
+        platform = request.get("platform")
+        chat_id = request.get("chat_id")
+        text = request.get("text")
+
+        if not isinstance(platform, str) or not platform.strip():
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_BAD_REQUEST, "platform is required"
+            )
+        platform = platform.strip().lower()
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_BAD_REQUEST, "chat_id is required"
+            )
+        chat_id = chat_id.strip()
+        if not isinstance(text, str) or not text.strip():
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_BAD_REQUEST, "text is required and must be non-empty"
+            )
+        if len(text) > PLATFORM_SEND_MAX_TEXT_CHARS:
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_BAD_REQUEST,
+                f"text exceeds {PLATFORM_SEND_MAX_TEXT_CHARS} characters "
+                f"(got {len(text)})",
+            )
+
+        def _log(outcome: str) -> None:
+            logger.info(
+                "platform_send platform=%s chat_id=%s text_len=%d result=%s",
+                platform, chat_id, len(text), outcome,
+            )
+
+        try:
+            adapter = get_adapter(platform)
+        except Exception as exc:
+            adapter = None
+            logger.debug("platform_send adapter lookup failed: %s", exc)
+        if adapter is None:
+            _log(PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND,
+                f"no live adapter for platform {platform!r}",
+            )
+        if not bool(getattr(adapter, "is_connected", True)):
+            _log(PLATFORM_SEND_ERR_ADAPTER_NOT_READY)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_ADAPTER_NOT_READY,
+                f"adapter for {platform!r} is not connected",
+            )
+
+        target_loop = loop or getattr(adapter, "_loop", None)
+        if target_loop is None or target_loop.is_closed():
+            _log(PLATFORM_SEND_ERR_ADAPTER_NOT_READY)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_ADAPTER_NOT_READY,
+                "gateway event loop is not running",
+            )
+
+        budget = _platform_send_timeout(timeout)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send(chat_id, text), target_loop
+            )
+        except Exception as exc:
+            _log(PLATFORM_SEND_ERR_SEND_FAILED)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_SEND_FAILED, f"{type(exc).__name__}: {exc}"
+            )
+
+        try:
+            result = future.result(timeout=budget)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            _log(PLATFORM_SEND_ERR_TIMEOUT)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_TIMEOUT,
+                f"adapter send did not complete within {budget}s",
+            )
+        except Exception as exc:
+            _log(PLATFORM_SEND_ERR_SEND_FAILED)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_SEND_FAILED, f"{type(exc).__name__}: {exc}"
+            )
+
+        if getattr(result, "success", True) is False:
+            _log(PLATFORM_SEND_ERR_SEND_FAILED)
+            return _platform_send_failure(
+                PLATFORM_SEND_ERR_SEND_FAILED,
+                str(getattr(result, "error", None) or "adapter reported failure"),
+            )
+
+        message_id = getattr(result, "message_id", None)
+        message_id = str(message_id) if message_id is not None else None
+        _log("ok")
+        return FlatResult({"ok": True, "message_id": message_id})
+
+    return _handler
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
 
 class GatewayControlServer:
     """Gateway-owned control socket server (identify/status, v1): ``start()`` after the PID-file claim,
@@ -210,7 +426,19 @@ class GatewayControlServer:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
                                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
             else:
-                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
+                result = _invoke_verb_handler(handler, request)
+                response = {
+                    "ok": True,
+                    "protocol": CONTROL_PROTOCOL_VERSION,
+                    "result": result,
+                }
+                if isinstance(result, FlatResult):
+                    # Action verbs report their own outcome at the top level
+                    # (see FlatResult) so a caller reading ``ok`` sees the
+                    # action's result, not merely that the verb dispatched.
+                    response.update(result)
+                    response["ok"] = bool(result.get("ok"))
+                    response["result"] = dict(result)
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
@@ -340,3 +568,70 @@ def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIM
     Step 2 of the socket migration (#92091).
     """
     return query_gateway_control(home, "pause-for-update", timeout=timeout)
+
+
+def platform_send(
+    home: Path,
+    platform: str,
+    chat_id: str,
+    text: str,
+    *,
+    timeout: Optional[float] = None,
+) -> dict[str, Any]:
+    """Ask the gateway serving ``home`` to send ``text`` to ``chat_id``.
+
+    Returns the verb's own answer — ``{"ok": True, "message_id": ...}`` or
+    ``{"ok": False, "error": <code>, "message": <reason>}``. Unlike
+    :func:`query_gateway_control` this never collapses a failure to None: an
+    unreachable gateway is itself reported as ``platform_not_found``.
+
+    The client budget is the gateway's send budget plus a small margin, so a
+    gateway-side ``timeout`` answer arrives instead of the socket read dying
+    first.
+    """
+    budget = _platform_send_timeout(timeout)
+    request = (
+        json.dumps(
+            {
+                "verb": PLATFORM_SEND_VERB,
+                "id": 1,
+                "protocol": CONTROL_PROTOCOL_VERSION,
+                "platform": platform,
+                "chat_id": chat_id,
+                "text": text,
+            }
+        ).encode("utf-8")
+        + b"\n"
+    )
+    try:
+        if _IS_WINDOWS:
+            raw = _query_windows_pipe(Path(home), request, budget + 5.0)
+        else:
+            raw = _query_unix_socket(Path(home), request, budget + 5.0)
+    except Exception as exc:
+        return _platform_send_failure(
+            PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND, f"{type(exc).__name__}: {exc}"
+        )
+    if not raw:
+        return _platform_send_failure(
+            PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND,
+            "no gateway answered the control socket",
+        )
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return _platform_send_failure(
+            PLATFORM_SEND_ERR_SEND_FAILED, f"malformed control answer: {exc}"
+        )
+    if not isinstance(response, dict):
+        return _platform_send_failure(
+            PLATFORM_SEND_ERR_SEND_FAILED, "malformed control answer"
+        )
+    result = response.get("result")
+    if isinstance(result, dict) and "ok" in result:
+        return dict(result)
+    # Gateway too old to know the verb (answers ok:false / unknown verb).
+    return _platform_send_failure(
+        PLATFORM_SEND_ERR_PLATFORM_NOT_FOUND,
+        str(response.get("error") or "gateway does not support platform_send"),
+    )

@@ -5032,8 +5032,37 @@ async def _start_gateway_start_control_socket(runner):
                 "pausing": accepted, "already_stopping": not accepted,
                 "pid": os.getpid(), "drain_timeout": _drain}
 
+        # platform_send: an external scheduler (Haro's cron jobs) hands the
+        # gateway {platform, chat_id, text} and blocks for the outcome. Only
+        # this process may send — a second process opening its own platform
+        # connection kicks the gateway's WS offline — so the send is a control
+        # verb rather than a standalone client. The handler runs on the
+        # socket's executor thread and marshals the adapter coroutine back
+        # onto this loop (same thread→loop bridge as pause-for-update, but
+        # result-carrying via run_coroutine_threadsafe).
+        from gateway.control_socket import (
+            PLATFORM_SEND_VERB,
+            build_platform_send_handler,
+        )
+
+        def _live_adapter_for_platform(name: str):
+            from gateway.config import Platform
+
+            try:
+                platform = Platform(name)
+            except ValueError:
+                return None
+            if platform is None:
+                return None
+            return runner.adapters.get(platform)
+
+        _platform_send_handler = build_platform_send_handler(
+            _live_adapter_for_platform, loop=_main_loop
+        )
+
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler})
+            verb_handlers={"pause-for-update": _pause_for_update_handler,
+                           PLATFORM_SEND_VERB: _platform_send_handler})
         if not await _control_server.start():
             _control_server = None
         else:
