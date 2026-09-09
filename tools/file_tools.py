@@ -1664,24 +1664,42 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
-        # ── Device path guard ─────────────────────────────────────────
-        # Block paths that would hang the process (infinite output,
-        # blocking on input).  Pure path check — no I/O.
-        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
-        if _is_blocked_device(path, base_dir=device_base):
-            return tool_error(
-                f"Cannot read '{path}': this is a device file that would "
-                "block or produce infinite output."
-            )
-
+        # ── Resolve path first ─────────────────────────────────────────
+        # Every guard below (read allowlist/denylist, device-path,
+        # special-file stat, binary-extension, ...) needs a single
+        # already-resolved absolute path to check against. Resolving once,
+        # up front, also means the read guard below runs before ANY stat,
+        # symlink-follow, or special-file probe touches the filesystem —
+        # see the read-guard comment for why that ordering matters.
+        # ``_resolve_path_for_task`` does not raise for /proc-style paths
+        # (Path.resolve() is non-strict); an unexpected exception here still
+        # falls through to this function's outer ``except Exception`` below,
+        # so no guard is silently skipped.
         _resolved = _resolve_path_for_task(path, task_id)
 
         # ── Read allowlist / denylist guard ───────────────────────────
         # HERMES_READ_SAFE_ROOTS (+ always-on denylist). Runs BEFORE any
-        # stat/open so the refusal cannot leak path existence or file type.
+        # stat/open/device/special-file check so the refusal cannot leak
+        # path existence or file type, and so a denylisted path (e.g.
+        # /proc/*/environ) is always reported as path_not_allowed and
+        # audited to readguard.jsonl — never short-circuited by a guard
+        # that returns its own ad hoc error first (see #4427 follow-up:
+        # the device-path guard below used to run BEFORE this one and stole
+        # /proc/*/environ refusals away from the audit trail).
         _path_denied = _read_path_denied_response(str(_resolved), tool="read_file")
         if _path_denied:
             return _path_denied
+
+        # ── Device path guard ─────────────────────────────────────────
+        # Block paths that would hang the process (infinite output,
+        # blocking on input). Pure path check — no I/O. Operates on the
+        # already-resolved absolute path, so no base_dir is needed and
+        # symlink-chasing starts from the same place the read guard judged.
+        if _is_blocked_device(str(_resolved)):
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         # ── Per-turn knowledge-base read quota ────────────────────────
         # Bulk export is refused by the terminal guard, so the remaining
