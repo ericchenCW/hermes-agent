@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 # Fixed operator-approved replacement for a convicted reasoning leak.
 REDACTION_TEXT = "抱歉，我这次的回答生成异常，已中止。请重新发一次问题。"
+# …and for a reply caught reproducing fingerprinted text (agent/leak_fingerprints.py).
+FINGERPRINT_REDACTION_TEXT = "抱歉，这条回复包含不适合外发的内容，已拦截。"
 
 # Only the opening of the reply is judged: a leak announces itself immediately
 # (the model resumes the sentence its reasoning was cut off in), and scanning a
@@ -285,6 +287,8 @@ class StreamLeakGuard:
         self._usage_seen = False
         self._audited = False
         self._hold_logged = False
+        self.redaction_text = REDACTION_TEXT
+        self._fingerprints = _make_fingerprint_scanner()
 
     # ── inputs ─────────────────────────────────────────────────────────
     def on_content_delta(self, text: str) -> GuardOutcome:
@@ -294,6 +298,8 @@ class StreamLeakGuard:
         self.content += text
         if self.convicted:
             return GuardOutcome()  # the turn is already forfeit — drop silently
+        if self._fingerprint_tripped(lambda scanner: scanner.feed(text)):
+            return GuardOutcome(convicted=True)
         if self._released:
             return GuardOutcome(emit=text)
         self._held.append(text)
@@ -340,15 +346,49 @@ class StreamLeakGuard:
         """End of stream: flush or convict, and audit an R2-only hit."""
         if self.convicted:
             return GuardOutcome()
+        if self._fingerprint_tripped(lambda scanner: scanner.flush()):
+            return GuardOutcome(convicted=True)
         outcome = self._decide(final=True) if self._held else GuardOutcome()
         if not self.convicted:
             self._audit_r2_only()
         return outcome
 
+    # ── fingerprint gate (shares the replacement / audit path) ─────────
+    def _fingerprint_tripped(self, probe) -> bool:
+        """Run ``probe`` against the fingerprint scanner and convict on a hit.
+
+        Fail-open on any error: an unreadable digest must never mute a gateway.
+        """
+        scanner = self._fingerprints
+        if scanner is None:
+            return False
+        try:
+            if not probe(scanner):
+                return False
+        except Exception:
+            logger.debug("fingerprint scan failed", exc_info=True)
+            return False
+        self.convicted = True
+        self.rules = ["fingerprint"]
+        self.redaction_text = FINGERPRINT_REDACTION_TEXT
+        self._held = []
+        self._audited = True
+        logger.warning(
+            "Reply guard: outbound fingerprint hit (hits=%d session=%s platform=%s "
+            "original_len=%d) — replacing the turn.",
+            scanner.hit_count, self.session, self.platform, len(self.content),
+        )
+        record_audit(
+            platform=self.platform or None, session=self.session or None,
+            subject=self.subject or None, rule="fingerprint",
+            hit_count=scanner.hit_count, original_len=len(self.content),
+        )
+        return True
+
     # ── final response ─────────────────────────────────────────────────
     def final_text(self, original: Optional[str]) -> Optional[str]:
         """The text the turn should actually end with."""
-        return REDACTION_TEXT if self.convicted else original
+        return self.redaction_text if self.convicted else original
 
     # ── decisions ──────────────────────────────────────────────────────
     def _release(self) -> GuardOutcome:
@@ -400,6 +440,18 @@ class StreamLeakGuard:
             reasoning_tokens=self.reasoning_tokens, budget=self.budget,
             original_len=len(self.content), redacted=False,
         )
+
+
+def _make_fingerprint_scanner():
+    """A scanner bound to the current digest, or None when there is none."""
+    try:
+        from agent.leak_fingerprints import FingerprintScanner, store
+
+        fingerprints = store()
+        return None if fingerprints.empty else FingerprintScanner(fingerprints)
+    except Exception:
+        logger.debug("fingerprint store unavailable", exc_info=True)
+        return None
 
 
 def make_stream_leak_guard(agent: Any) -> Optional[StreamLeakGuard]:
