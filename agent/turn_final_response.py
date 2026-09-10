@@ -155,8 +155,14 @@ def finish_text_response(
     codex_ack_continuations = 0
 
     if truncated_response_parts:
-        final_response = _join_truncated_parts([*truncated_response_parts, final_response])
-        truncated_response_parts = []
+        # idcsre patch: a leak-redacted continuation must NOT be stitched onto the
+        # fragments it replaces — the earlier half is exactly the reasoning spill the
+        # guard convicted, and joining would re-deliver it under a reassuring tail.
+        if getattr(response, "_leak_redacted", None):
+            truncated_response_parts = []
+        else:
+            final_response = _join_truncated_parts([*truncated_response_parts, final_response])
+            truncated_response_parts = []
         length_continue_retries = 0
         # The continuation recovered, so the fragments stay in the transcript.
         for _frag in messages:

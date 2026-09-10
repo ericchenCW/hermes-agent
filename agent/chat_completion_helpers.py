@@ -37,6 +37,7 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.leak_guard import make_stream_leak_guard
 from agent.message_sanitization import (_sanitize_surrogates, _repair_tool_call_arguments)
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.repetition_guard import (
@@ -2606,7 +2607,26 @@ class _StreamingCall(StreamingWaitMonitor):
             self.first_delta_fired["done"] = True
             self._quiet(self.on_first_delta)
 
+    # idcsre patch — reply-guard state for this attempt (see agent/leak_guard.py).
+    # Class-level default so the anthropic_messages path (which shares _emit_text but
+    # runs no chat_completions guard) sees an inert attribute.
+    _leak_guard = None
+
     def _emit_text(self, text: str) -> None:
+        """Push one content delta downstream, subject to the reply guard.
+
+        idcsre patch: the guard may HOLD the text (a suspected reasoning leak whose
+        verdict still needs ``usage``) or drop it outright (already convicted). Held
+        text is replayed through :meth:`_emit_text_raw` once the verdict lands."""
+        guard = self._leak_guard
+        if guard is not None:
+            text = guard.on_content_delta(text).emit
+            if not text:
+                return
+        self._emit_text_raw(text)
+
+    def _emit_text_raw(self, text: str) -> None:
+        """Unguarded delta emit — only for text the guard has already cleared."""
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
         self.deltas_were_sent["yes"] = True
@@ -2763,6 +2783,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # ever runs; qwen3-style models can spend 16k tokens on one repeated paragraph.
         _rep_guard_on = stream_repetition_guard_enabled()
         _rep_guard_state = {"aborted": False, "kind": "", "reasoning_chars": 0, "content_chars": 0}
+        # idcsre patch — reasoning-leak guard for THIS attempt (a retry gets a fresh one).
+        _leak_guard = self._leak_guard = make_stream_leak_guard(self.agent)
         pending_text_parts: list[str] = []
         tool_calls = _ToolCallAccumulator()
         tool_calls_acc = tool_calls.acc
@@ -2783,6 +2805,16 @@ class _StreamingCall(StreamingWaitMonitor):
             pending_text_parts.clear()
             for text in pending_parts:
                 (self._route_suppressed_text if tool_calls_acc else self._emit_text)(text)
+
+        def _feed_leak_usage(usage: Any) -> None:
+            """idcsre patch: usage rides the LAST chunk, and it carries R2 (the reasoning
+            budget was spent to the cap). Hand it to the guard so text it is holding is
+            either released or convicted before the stream ends."""
+            if _leak_guard is None or usage is None:
+                return
+            outcome = _leak_guard.on_usage(usage)
+            if outcome.emit:
+                self._emit_text_raw(outcome.emit)
 
         def _rep_guard_tripped(kind: str, parts: list, delta_len: int) -> bool:
             """idcsre patch — True when the accumulated ``kind`` stream is looping verbatim.
@@ -2865,6 +2897,7 @@ class _StreamingCall(StreamingWaitMonitor):
             if not chunk.choices:
                 usage, finish_reason = self._choiceless_chunk(chunk, finish_reason)
                 usage_obj = usage or usage_obj
+                _feed_leak_usage(usage)
                 continue
 
             choice = chunk.choices[0]
@@ -2874,6 +2907,7 @@ class _StreamingCall(StreamingWaitMonitor):
             finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
+                _feed_leak_usage(chunk.usage)
 
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
@@ -2925,6 +2959,22 @@ class _StreamingCall(StreamingWaitMonitor):
         tool_calls.materialize()
         self._close_managed_stream()
 
+        # idcsre patch — reply guard verdict. On conviction the WHOLE turn is replaced:
+        # the accumulated content becomes the fixed notice (which the gateway's
+        # adopt_final_response pushes as the WeCom finish frame, overwriting the bubble)
+        # and finish_reason is forced to "stop" so the length-continuation path can never
+        # stitch a leaked fragment into the delivered answer.
+        _leak_convicted = False
+        if _leak_guard is not None:
+            _leak_outcome = _leak_guard.finish()
+            if _leak_outcome.emit:
+                self._emit_text_raw(_leak_outcome.emit)
+            if _leak_guard.convicted:
+                _leak_convicted = True
+                content_parts[:] = [_leak_guard.final_text(None) or ""]
+                finish_reason = "stop"
+                _rep_guard_state["aborted"] = False
+
         if _rep_guard_state["aborted"]:
             # idcsre patch: report it as an output-length truncation so the existing
             # finish_reason == "length" handling in the turn loop owns the turn; the marker stamped
@@ -2941,6 +2991,11 @@ class _StreamingCall(StreamingWaitMonitor):
         if _rep_guard_state["aborted"]:
             with contextlib.suppress(Exception):
                 _response._repetition_aborted = _rep_guard_state["kind"] or True
+        if _leak_convicted:
+            # Marker for the truncation / final-response chain: this turn is already a
+            # deliberate replacement, never a fragment to continue or re-judge.
+            with contextlib.suppress(Exception):
+                _response._leak_redacted = "+".join(_leak_guard.rules)
         return _response
 
     def _adopt_final_response(self, final_response):
