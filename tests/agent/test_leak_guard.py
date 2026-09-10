@@ -107,18 +107,37 @@ def audit_log(tmp_path, monkeypatch):
     return _lines
 
 
-def _replay(content: str, *, budget, reasoning_tokens, chunk_size: int = 200):
+class _Clock:
+    """A monotonic clock the test drives by hand (the guard's 2s screening timer)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _replay(content: str, *, budget, reasoning_tokens, chunk_size: int = 200, clock=None):
     """Drive a full stream: content deltas, then the trailing usage chunk.
 
     Returns ``(guard, emitted_text)`` where ``emitted_text`` is exactly what the
-    adapter would have pushed to the user.
+    adapter would have pushed to the user. ``guard.frames`` (attached here) is
+    the list of NON-EMPTY outbound deltas, i.e. what the user's bubble was
+    repainted with and how many times.
     """
-    guard = lg.StreamLeakGuard(budget=budget, platform="wecom", session="s-test", subject="CaoDi")
+    guard = lg.StreamLeakGuard(
+        budget=budget, platform="wecom", session="s-test", subject="CaoDi",
+        clock=clock or _Clock(),
+    )
     emitted = []
     for chunk in _chunks(content, chunk_size):
         emitted.append(guard.on_content_delta(chunk).emit)
     emitted.append(guard.on_usage(_usage(reasoning_tokens)).emit)
     emitted.append(guard.finish().emit)
+    guard.frames = [part for part in emitted if part]
     return guard, "".join(emitted)
 
 
@@ -177,9 +196,28 @@ def test_normal_chinese_reply_streams_through_unheld(audit_log):
     guard, emitted = _replay(NORMAL_CHINESE_REPLY, budget=2500, reasoning_tokens=800)
 
     assert guard.convicted is False
-    assert emitted == NORMAL_CHINESE_REPLY  # every delta went out live
+    assert emitted == NORMAL_CHINESE_REPLY
+    # Stage 1 held the first 300 chars, then screening cleared the reply and every
+    # later delta went out on its own frame — this is live streaming, not a dump.
+    assert len(guard.frames) > 1
+    assert len(guard.frames[0]) < lg.SCREEN_MIN_CHARS + 200
     assert guard.final_text(NORMAL_CHINESE_REPLY) == NORMAL_CHINESE_REPLY
     assert audit_log() == []
+
+
+def test_screening_closes_on_the_two_second_timer(audit_log):
+    """A slow trickle must not stay held forever: the monotonic 2s timer closes
+    the window even when 300 characters never arrive."""
+    clock = _Clock()
+    guard = lg.StreamLeakGuard(budget=2500, platform="wecom", session="s", subject="u",
+                               clock=clock)
+    assert guard.on_content_delta("在主机上确认 bkmonitor：").emit == ""  # inside the window
+    clock.advance(1.9)
+    assert guard.on_content_delta("先看进程。").emit == ""  # still inside
+    clock.advance(0.2)  # 2.1s since the first delta
+    flushed = guard.on_content_delta("再看日志。").emit
+    assert flushed == "在主机上确认 bkmonitor：先看进程。再看日志。"
+    assert guard.on_content_delta("没有 ERROR 就正常。").emit == "没有 ERROR 就正常。"
 
 
 # ── 4. R3 alone never convicts ─────────────────────────────────────────
@@ -188,14 +226,22 @@ def test_normal_chinese_reply_streams_through_unheld(audit_log):
 def test_english_document_opening_with_let_me_is_released(audit_log):
     """A user asking for an English runbook gets a reply opening "Let me …".
 
-    R1 and R3 both fire, but the reasoning budget was barely touched, so R2
-    acquits and the buffered text is flushed in full.
+    Screening suspects it (R3 fires on "Let me"), so the reply is held to the end
+    of the stream — but the reasoning budget was barely touched, so R2 acquits and
+    the whole buffer is flushed in one delta, with a single audit line.
     """
     guard, emitted = _replay(ENGLISH_DOC_REPLY, budget=2500, reasoning_tokens=120)
 
     assert guard.convicted is False
     assert emitted == ENGLISH_DOC_REPLY
-    assert audit_log() == []
+    assert guard.screen_rules == ["R3"]
+    assert guard.frames == [ENGLISH_DOC_REPLY]  # one flush at the end, nothing lost
+    events = audit_log()
+    assert len(events) == 1
+    assert events[0]["event"] == "reply.audited"
+    assert events[0]["rule"] == "R3"
+    assert events[0]["redacted"] is False
+    assert "Let me draft" not in json.dumps(events[0], ensure_ascii=False)
 
 
 # ── 5. R2 alone is audit-only ──────────────────────────────────────────
@@ -208,6 +254,7 @@ def test_budget_exhausted_but_well_formed_reply_is_only_audited(audit_log):
 
     assert guard.convicted is False
     assert emitted == NORMAL_CHINESE_REPLY
+    assert len(guard.frames) > 1  # it streamed, frame by frame
     events = audit_log()
     assert len(events) == 1
     assert events[0]["event"] == "reply.audited"
@@ -215,17 +262,76 @@ def test_budget_exhausted_but_well_formed_reply_is_only_audited(audit_log):
     assert events[0]["redacted"] is False
 
 
+def test_r2_only_audit_carries_a_body_free_sample(audit_log):
+    """Screening clean + R2 at the stream end: the reply is delivered untouched and
+    the audit keeps a SHAPE summary of its first 300 chars for later tuning."""
+    guard, emitted = _replay(NORMAL_CHINESE_REPLY, budget=2500, reasoning_tokens=2499)
+
+    assert emitted == NORMAL_CHINESE_REPLY
+    event = audit_log()[0]
+    assert event["suspect"] == lg.RULE_REASONING_LEAK_SUSPECT
+    sample = event["sample"]
+    assert sample["chars"] == lg.SAMPLE_WINDOW
+    assert sample["first_char_class"] == "cjk"
+    assert sample["starts_lower_latin"] is False
+    assert sample["r1"] is False and sample["r3"] is False and sample["r4"] is False
+    assert sample["lines"] > 1
+    assert sample["cjk_ratio"] > 0.3
+    # A Chinese ops answer is still latin-heavy (commands, paths): the ratios are
+    # tuning inputs, not a language verdict.
+    assert 0.0 < sample["latin_ratio"] < 0.5
+    # Not one character of the reply is in the audit line.
+    dumped = json.dumps(event, ensure_ascii=False)
+    assert "bkmonitor" not in dumped and "在主机上" not in dumped
+    assert set(sample) == {
+        "chars", "lines", "first_char_class", "starts_lower_latin",
+        "r1", "r3", "r4", "latin_ratio", "cjk_ratio",
+    }
+
+
+def test_r2_only_sample_flags_a_leaky_shape_that_screening_let_through(audit_log):
+    """The tuning case the sample exists for: a reply that screened clean because
+    its first 2 seconds looked fine, whose window nevertheless carries the tells."""
+    clock = _Clock()
+    guard = lg.StreamLeakGuard(budget=2500, platform="wecom", session="s", subject="u",
+                               clock=clock)
+    guard.on_content_delta("好的。\n")     # screening sees only this…
+    clock.advance(2.1)
+    guard.on_content_delta("确认一下。\n")  # …window closes here, clean
+    assert guard.screen_rules == []
+    guard.on_content_delta("Wait, the prompt says: be terse.\n")  # R3 arrives late
+    guard.on_usage(_usage(2499))
+    guard.finish()
+
+    assert guard.convicted is False
+    sample = audit_log()[0]["sample"]
+    assert sample["r3"] is True  # the operator can see why the rules missed it
+    assert "Wait" not in json.dumps(sample, ensure_ascii=False)
+
+
 # ── 6. no budget knowledge → no conviction ─────────────────────────────
 
 
 def test_without_a_budget_the_leak_text_is_not_convicted(audit_log):
-    """R2 is a necessary condition, so an unknown budget can only fail open —
-    and the guard must not even hold, since no evidence can ever arrive."""
+    """R2 is a necessary condition, so an unknown budget can only fail open.
+
+    Screening still runs — it needs no usage — but a suspicion it raises cannot be
+    held any longer than that: no evidence can ever arrive, so the buffer is
+    released at once and the operator gets an audit line instead of a conviction.
+    """
     guard, emitted = _replay(CAODI_CONTENT_OPENING * 3, budget=None, reasoning_tokens=2499)
 
     assert guard.convicted is False
     assert emitted == CAODI_CONTENT_OPENING * 3
-    assert audit_log() == []
+    assert guard.screen_rules  # suspected all the same
+    assert len(guard.frames) > 1  # released at the end of screening, then live
+    events = audit_log()
+    assert len(events) == 1
+    assert events[0]["event"] == "reply.audited"
+    assert events[0]["redacted"] is False
+    assert "R1" in events[0]["rule"]
+    assert "budget" not in events[0]
+    assert "Be direct" not in json.dumps(events[0], ensure_ascii=False)
 
 
 # ── rule table unit cover ──────────────────────────────────────────────
@@ -364,6 +470,7 @@ def test_streaming_emit_path_is_gated_by_the_guard():
 
 
 def test_streaming_emit_path_passes_a_normal_reply_through():
+    """A clean reply is held for the screening window only, then streams live."""
     from agent.chat_completion_helpers import _StreamingCall
 
     sent: list[str] = []
@@ -371,15 +478,23 @@ def test_streaming_emit_path_passes_a_normal_reply_through():
         _fire_stream_delta=sent.append, platform="wecom", session_id="s", chat_id="CaoDi",
         request_overrides={"extra_body": {"thinking_token_budget": 2500}},
     )
+    clock = _Clock()
     call = _StreamingCall.__new__(_StreamingCall)
     call.agent = agent
     call.deltas_were_sent = {"yes": False}
     call.first_delta_fired = {"done": True}
     call.on_first_delta = None
-    call._leak_guard = lg.make_stream_leak_guard(agent)
+    call._leak_guard = lg.StreamLeakGuard(budget=2500, platform="wecom", session="s",
+                                          subject="CaoDi", clock=clock)
 
     call._emit_text("你好，我来帮你查 bkmonitor。")
-    assert sent == ["你好，我来帮你查 bkmonitor。"]
+    assert sent == []  # inside the screening window
+    assert call.deltas_were_sent["yes"] is False
+    clock.advance(2.1)
+    call._emit_text("先看进程。")
+    assert sent == ["你好，我来帮你查 bkmonitor。先看进程。"]
+    call._emit_text("再看日志。")
+    assert sent[-1] == "再看日志。"  # live, frame by frame from here on
     assert call.deltas_were_sent["yes"] is True
 
 
@@ -432,6 +547,29 @@ def test_a_convicted_reasoning_leak_is_reported(audit_log, haro):
     # The body never carries the reply itself.
     assert "Be direct" not in json.dumps(body, ensure_ascii=False)
     assert "content" not in body and "text" not in body
+
+
+def test_an_r2_only_hit_is_reported_as_a_suspect_with_its_sample(audit_log, haro):
+    """Nothing was redacted, so Haro hears ``reasoning_leak_suspect`` — plus the
+    shape summary it needs to tune the rules, and not a byte of the reply."""
+    guard, emitted = _replay(NORMAL_CHINESE_REPLY, budget=2500, reasoning_tokens=2499)
+    assert guard.convicted is False
+    assert emitted == NORMAL_CHINESE_REPLY
+
+    assert len(haro) == 1
+    body = haro[0]["body"]
+    assert body["rule"] == lg.RULE_REASONING_LEAK_SUSPECT
+    assert body["reasoningTokens"] == 2499 and body["budget"] == 2500
+    assert body["sample"]["chars"] == lg.SAMPLE_WINDOW
+    assert body["sample"]["r1"] is False
+    assert "bkmonitor" not in json.dumps(body, ensure_ascii=False)
+
+
+def test_a_conviction_report_carries_no_sample(audit_log, haro):
+    guard, _ = _replay(CAODI_CONTENT_OPENING * 30, budget=2500, reasoning_tokens=2499)
+    assert guard.convicted is True
+    assert haro[0]["body"]["rule"] == lg.RULE_REASONING_LEAK
+    assert "sample" not in haro[0]["body"]
 
 
 def test_a_fingerprint_conviction_is_reported_as_prompt_leak(audit_log, haro, tmp_path):

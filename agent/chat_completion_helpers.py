@@ -2616,9 +2616,10 @@ class _StreamingCall(StreamingWaitMonitor):
     def _emit_text(self, text: str) -> None:
         """Push one content delta downstream, subject to the reply guard.
 
-        idcsre patch: the guard may HOLD the text (a suspected reasoning leak whose
-        verdict still needs ``usage``) or drop it outright (already convicted). Held
-        text is replayed through :meth:`_emit_text_raw` once the verdict lands."""
+        idcsre patch: the guard may HOLD the text — during the short screening window
+        every reply pays (300 chars / 2s), or afterwards while a suspected reasoning
+        leak waits for ``usage`` — or drop it outright (already convicted). Held text
+        is flushed through :meth:`_emit_text_raw` in one delta once it clears."""
         guard = self._leak_guard
         if guard is not None:
             text = guard.on_content_delta(text).emit

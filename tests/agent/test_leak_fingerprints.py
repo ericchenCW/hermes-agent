@@ -370,11 +370,13 @@ def test_guard_replaces_a_fingerprinted_reply_and_audits_it(home):
 def test_guard_leaves_an_innocent_reply_alone_with_fingerprints_loaded(home):
     _install(home)
     guard = lg.StreamLeakGuard(budget=2500, platform="wecom", session="s", subject="u")
+    # Shorter than the 300-char screening window, so the whole reply is flushed
+    # in one delta when usage closes it — not withheld, just not incremental.
     emitted = "".join(guard.on_content_delta(chunk).emit
                       for chunk in [INNOCENT_REPLY[:40], INNOCENT_REPLY[40:]])
-    guard.on_usage(SimpleNamespace(
-        completion_tokens_details=SimpleNamespace(reasoning_tokens=600)))
-    guard.finish()
+    emitted += guard.on_usage(SimpleNamespace(
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=600))).emit
+    emitted += guard.finish().emit
 
     assert guard.convicted is False
     assert emitted == INNOCENT_REPLY

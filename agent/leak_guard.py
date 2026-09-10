@@ -24,21 +24,35 @@ may still be a fine answer).  It is the CONJUNCTION:
 only** (a budget-exhausted but well-formed answer must still reach the user).
 
 Because ``usage`` normally arrives only on the LAST streaming chunk, the guard
-buffers instead of guessing: once R1/R3/R4 fire on the accumulated prefix, the
-outbound frames are HELD.  Usage then either convicts (nothing was leaked) or
-acquits (the buffer is flushed in one delta).
+cannot judge R2 while the reply is being written.  It therefore buffers in TWO
+stages instead of guessing:
 
-The hold deliberately runs to the END of the stream rather than expiring at
-``HOLD_MAX_CHARS`` / ``HOLD_MAX_SECONDS``.  Those bounds were the original
-design, but on the real incident text they defeat the guard: the system-prompt
-lines sit in the FIRST 120 characters, so any cap-expiry flush ships exactly
-the bytes the guard exists to stop.  The caps are kept as an observability
-threshold — crossing one logs the streaming-smoothness cost once — while the
-suspicion itself is only ever resolved by evidence.  What a suspected reply
-loses is incremental rendering, never the reply: on acquittal the whole buffer
-is emitted at once and the turn finishes normally.  Holding is skipped entirely
-when the thinking budget is unknown, since R2 can then never fire and a hold
-could not end in a conviction.
+  1. **Screening.**  Every reply — leak or not — is held until the accumulated
+     ``content`` reaches ``SCREEN_MIN_CHARS`` (300) or ``SCREEN_MAX_SECONDS``
+     (2s, monotonic, measured from the first delta), whichever comes first.
+     Usage arriving early closes the window too, and so does the end of the
+     stream.  R1/R3/R4 are then evaluated once on what has accumulated; no
+     usage is needed for that.  The cost is bounded and paid by every reply:
+     at most 300 characters or 2 seconds of deferred rendering.
+  2. **Verdict.**  *Clean* → the held text is flushed in one delta and every
+     later delta streams live, frame by frame.  *Suspected* → the hold runs to
+     the END of the stream, where usage settles it: ``R2 && (R1||R3||R4)``
+     convicts (nothing ever left), no R2 acquits (the whole buffer is flushed
+     and one ``reply.audited`` line is written).  When the budget is unknown a
+     suspicion is released immediately — R2 can never fire, so holding would
+     only cost latency — and is likewise audited, never convicted.
+
+The screening window is deliberately short enough that the incident text is
+caught by it (the system-prompt lines sit in the FIRST 120 characters, well
+inside 300) and long enough that a legitimate opening is recognisable.
+``HOLD_MAX_CHARS`` / ``HOLD_MAX_SECONDS`` remain observability thresholds for
+stage 2: crossing one logs the streaming-smoothness cost of a suspicion once,
+and never releases the buffer.
+
+A reply that passed screening but ends on R2 alone is **audited only** — the
+user keeps it — and the audit line carries a body-free ``sample``: the shape
+summary of its first 300 characters (see :func:`prefix_sample`), which is what
+later threshold tuning gets to look at instead of the text itself.
 
 Overriding the FINAL response text is what actually protects the user on
 WeCom: ``gateway/stream_consumer.adopt_final_response`` replaces the
@@ -68,9 +82,13 @@ GUARD_TOKEN_ENV = "HARO_RUNTIME_TOKEN"
 GUARD_REPORT_PATH = "/api/assistant/runtime-api/guard/redacted"
 GUARD_REPORT_TIMEOUT_SECONDS = 3.0
 
-# The two rule names Haro's endpoint accepts (400 guard_report_invalid otherwise).
+# The rule names Haro's endpoint accepts (400 guard_report_invalid otherwise).
 RULE_REASONING_LEAK = "reasoning_leak"
 RULE_PROMPT_LEAK = "prompt_leak"
+# Audit-only signal: R2 fired at the end of a reply that passed screening, so
+# nothing was redacted. Reported so the operator can tune the shape rules from
+# the accompanying body-free ``sample``.
+RULE_REASONING_LEAK_SUSPECT = "reasoning_leak_suspect"
 
 # Fixed operator-approved replacement for a convicted reasoning leak.
 REDACTION_TEXT = "抱歉，我这次的回答生成异常，已中止。请重新发一次问题。"
@@ -84,9 +102,16 @@ PREFIX_WINDOW = 400
 # vLLM stops one token short of the cap (2499 observed against a 2500 budget);
 # other servers stop exactly at it. Four tokens of slack covers both.
 BUDGET_SLACK = 4
-# Observability thresholds for the "suspected, waiting for usage" hold: crossing
-# one logs how much live streaming the suspicion is costing (see module docstring
-# for why they do not release the buffer).
+# Stage 1 — the screening window every reply pays: hold until this many
+# characters have accumulated or this long has passed since the first delta
+# (monotonic clock), then judge the shape once.
+SCREEN_MIN_CHARS = 300
+SCREEN_MAX_SECONDS = 2.0
+# The window whose SHAPE (never its text) is summarised into an audit sample.
+SAMPLE_WINDOW = 300
+# Observability thresholds for the stage-2 "suspected, waiting for usage" hold:
+# crossing one logs how much live streaming the suspicion is costing (see module
+# docstring for why they do not release the buffer).
 HOLD_MAX_CHARS = 2000
 HOLD_MAX_SECONDS = 3.0
 
@@ -158,6 +183,54 @@ def evaluate_prefix(content: Optional[str]) -> list[str]:
     if _R4_RE.search(prefix):
         rules.append("R4")
     return rules
+
+
+def _char_class(ch: str) -> str:
+    """A coarse category for the reply's first non-space character."""
+    if not ch:
+        return "empty"
+    if "a" <= ch <= "z":
+        return "lower_latin"
+    if "A" <= ch <= "Z":
+        return "upper_latin"
+    if ch.isdigit():
+        return "digit"
+    if "一" <= ch <= "鿿":
+        return "cjk"
+    if ch in _R1_DANGLING_CLOSERS:
+        return "closer"
+    if not ch.isalnum():
+        return "punct"
+    return "other"
+
+
+def prefix_sample(content: Optional[str]) -> dict:
+    """A body-free shape summary of the reply's first ``SAMPLE_WINDOW`` chars.
+
+    This is the ONLY thing an audit line is allowed to say about a reply that
+    was not redacted: counts, ratios and rule booleans, never a character of the
+    text. It exists so the R1/R3/R4 table can be tuned against the replies that
+    ended on R2 alone, without the audit log becoming a copy of the leak it is
+    supposed to keep off the wire.
+    """
+    text = content[:SAMPLE_WINDOW] if isinstance(content, str) else ""
+    stripped = text.lstrip()
+    first = stripped[0] if stripped else ""
+    rules = evaluate_prefix(text)
+    latin = sum(1 for ch in text if ("a" <= ch <= "z") or ("A" <= ch <= "Z"))
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    total = len(text)
+    return {
+        "chars": total,
+        "lines": (text.count("\n") + 1) if total else 0,
+        "first_char_class": _char_class(first),
+        "starts_lower_latin": bool(first and "a" <= first <= "z"),
+        "r1": "R1" in rules,
+        "r3": "R3" in rules,
+        "r4": "R4" in rules,
+        "latin_ratio": round(latin / total, 3) if total else 0.0,
+        "cjk_ratio": round(cjk / total, 3) if total else 0.0,
+    }
 
 
 def reasoning_exhausted(reasoning_tokens: Optional[int], budget: Optional[int]) -> bool:
@@ -311,8 +384,13 @@ def build_guard_report(
     reasoning_tokens: Optional[int] = None,
     budget: Optional[int] = None,
     row_id: str = "",
+    sample: Optional[dict] = None,
 ) -> dict:
-    """The report body. Carries lengths and identifiers only — never the reply."""
+    """The report body. Carries lengths and identifiers only — never the reply.
+
+    ``sample`` (only sent with ``reasoning_leak_suspect``) is the body-free
+    shape summary from :func:`prefix_sample`.
+    """
     identity = guard_identity(session, subject, platform)
     body = {
         "sessionId": identity["session"],
@@ -324,6 +402,7 @@ def build_guard_report(
         "channel": identity["platform"],
         "rowId": str(row_id or ""),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sample": sample,
     }
     return {k: v for k, v in body.items() if v is not None and v != ""}
 
@@ -409,6 +488,8 @@ class StreamLeakGuard:
         subject: str = "",
         row_id: str = "",
         clock: Callable[[], float] = time.monotonic,
+        screen_min_chars: int = SCREEN_MIN_CHARS,
+        screen_max_seconds: float = SCREEN_MAX_SECONDS,
         hold_max_chars: int = HOLD_MAX_CHARS,
         hold_max_seconds: float = HOLD_MAX_SECONDS,
     ) -> None:
@@ -418,6 +499,8 @@ class StreamLeakGuard:
         self.subject = subject
         self.row_id = row_id
         self._clock = clock
+        self._screen_min_chars = screen_min_chars
+        self._screen_max_seconds = screen_max_seconds
         self._hold_max_chars = hold_max_chars
         self._hold_max_seconds = hold_max_seconds
 
@@ -425,8 +508,11 @@ class StreamLeakGuard:
         self.reasoning_tokens: Optional[int] = None
         self.convicted = False
         self.rules: list[str] = []
+        #: R1/R3/R4 as judged once, at the end of the screening window.
+        self.screen_rules: list[str] = []
+        self._screened = False
         self._held: list[str] = []
-        self._hold_started: Optional[float] = None
+        self._first_delta_at: Optional[float] = None
         self._released = False
         self._usage_seen = False
         self._audited = False
@@ -447,16 +533,47 @@ class StreamLeakGuard:
         if self._released:
             return GuardOutcome(emit=text)
         self._held.append(text)
-        if self._hold_started is None:
-            self._hold_started = self._clock()
-        if not evaluate_prefix(self.content):
-            return self._release()  # opening looks like a real reply
-        if self.budget is None:
-            # R2 can never fire without a budget, so a hold could not end in a
-            # conviction — holding would only cost latency.
-            return self._release()
-        if self._usage_seen:
-            return self._decide()  # usage already in hand: judge immediately
+        if self._first_delta_at is None:
+            self._first_delta_at = self._clock()
+        return self._pump()
+
+    # ── stage 1: the screening window ──────────────────────────────────
+    def _screen_window_closed(self, *, final: bool = False) -> bool:
+        """Has enough of the reply accumulated to judge its shape?
+
+        ``final`` (end of stream) and a usage chunk both close the window early:
+        in either case nothing more is coming that screening could wait for.
+        """
+        if final or self._usage_seen:
+            return True
+        if len(self.content) >= self._screen_min_chars:
+            return True
+        started = self._first_delta_at
+        if started is None:
+            return False
+        return (self._clock() - started) >= self._screen_max_seconds
+
+    def _pump(self, *, final: bool = False) -> GuardOutcome:
+        """Advance the state machine and say what may go out right now."""
+        if self.convicted or self._released:
+            return GuardOutcome()
+        if not self._screened:
+            if not self._screen_window_closed(final=final):
+                return GuardOutcome()  # still inside the 300-char / 2s window
+            self._screened = True
+            self.screen_rules = evaluate_prefix(self.content)
+            if not self.screen_rules:
+                return self._release()  # opening looks like a real reply
+            if self.budget is None:
+                # R2 can never fire without a budget, so a hold could not end in
+                # a conviction — holding would only cost latency. Audited at
+                # ``finish``; never convicted.
+                return self._release()
+        # stage 2: suspected — the hold runs until usage settles it.
+        if reasoning_exhausted(self.reasoning_tokens, self.budget):
+            return self._convict(evaluate_prefix(self.content) or self.screen_rules)
+        if self._usage_seen or final:
+            return self._release()  # acquitted: R1/R3/R4 alone never convict
         self._log_hold_cost()
         return GuardOutcome()
 
@@ -465,7 +582,7 @@ class StreamLeakGuard:
         if self._hold_logged:
             return
         held_chars = sum(len(part) for part in self._held)
-        elapsed = self._clock() - (self._hold_started or self._clock())
+        elapsed = self._clock() - (self._first_delta_at or self._clock())
         if held_chars < self._hold_max_chars and elapsed < self._hold_max_seconds:
             return
         self._hold_logged = True
@@ -473,7 +590,7 @@ class StreamLeakGuard:
             "Reply guard: holding a suspected reasoning leak (rules=%s held_chars=%d "
             "held_seconds=%.1f session=%s) until usage settles it; live streaming is "
             "paused for this reply.",
-            "+".join(evaluate_prefix(self.content)), held_chars, elapsed, self.session,
+            "+".join(self.screen_rules), held_chars, elapsed, self.session,
         )
 
     def on_usage(self, usage: Any) -> GuardOutcome:
@@ -484,17 +601,17 @@ class StreamLeakGuard:
             self._usage_seen = True
         if self.convicted or self._released or not self._held:
             return GuardOutcome()
-        return self._decide()
+        return self._pump()
 
     def finish(self) -> GuardOutcome:
-        """End of stream: flush or convict, and audit an R2-only hit."""
+        """End of stream: flush or convict, then write the closing audit line."""
         if self.convicted:
             return GuardOutcome()
         if self._fingerprint_tripped(lambda scanner: scanner.flush()):
             return GuardOutcome(convicted=True)
-        outcome = self._decide(final=True) if self._held else GuardOutcome()
+        outcome = self._pump(final=True)
         if not self.convicted:
-            self._audit_r2_only()
+            self._audit_final()
         return outcome
 
     # ── fingerprint gate (shares the replacement / audit path) ─────────
@@ -531,14 +648,16 @@ class StreamLeakGuard:
         return True
 
     # ── reporting ──────────────────────────────────────────────────────
-    def _report(self, rule: str) -> None:
-        """Tell Haro a turn was replaced. Best effort, body-free, off the hot path."""
+    def _report(self, rule: str, *, sample: Optional[dict] = None) -> None:
+        """Tell Haro about a replaced (or merely suspected) turn.
+
+        Best effort, body-free, off the hot path."""
         try:
             report_redaction(build_guard_report(
                 rule=rule, original_len=len(self.content), session=self.session,
                 subject=self.subject, platform=self.platform,
                 reasoning_tokens=self.reasoning_tokens, budget=self.budget,
-                row_id=self.row_id,
+                row_id=self.row_id, sample=sample,
             ))
         except Exception:  # noqa: BLE001 - the replacement is what protects the user
             logger.debug("reply guard report failed", exc_info=True)
@@ -553,18 +672,6 @@ class StreamLeakGuard:
         self._released = True
         pending, self._held = "".join(self._held), []
         return GuardOutcome(emit=pending)
-
-    def _decide(self, *, final: bool = False) -> GuardOutcome:
-        """Judge the held buffer. ``final`` = the stream is over, so an unresolved
-        suspicion has to be resolved NOW, and with no R2 evidence that means release."""
-        rules = evaluate_prefix(self.content)
-        if not rules:
-            return self._release()
-        if not reasoning_exhausted(self.reasoning_tokens, self.budget):
-            if self._usage_seen or final:
-                return self._release()  # acquitted: R1/R3/R4 alone never convict
-            return GuardOutcome()  # still waiting on usage
-        return self._convict(rules)
 
     def _convict(self, rules: list[str]) -> GuardOutcome:
         self.convicted = True
@@ -586,19 +693,49 @@ class StreamLeakGuard:
         self._report(RULE_REASONING_LEAK)
         return GuardOutcome(convicted=True)
 
-    def _audit_r2_only(self) -> None:
-        """R2 with a well-formed reply: audit-only, the user still gets it."""
+    def _audit_final(self) -> None:
+        """The closing audit line for a reply that was NOT redacted.
+
+        Two shapes reach it, and neither withholds anything from the user:
+
+        * screening suspected the opening but the evidence never came (no R2, or
+          no budget at all) — the buffer was flushed, and the operator gets one
+          line saying which rules fired;
+        * screening was clean and R2 fired at the very end — ``reasoning_leak_suspect``:
+          the reply went out frame by frame, and the line carries the body-free
+          ``sample`` that the shape rules will be re-tuned against.
+        """
         if self._audited or not self.content.strip():
             return
-        if not reasoning_exhausted(self.reasoning_tokens, self.budget):
+        exhausted = reasoning_exhausted(self.reasoning_tokens, self.budget)
+        if self.screen_rules:
+            self._audited = True
+            record_audit(
+                event="reply.audited", platform=self.platform or None,
+                session=self.session or None, subject=self.subject or None,
+                rule="+".join(self.screen_rules),
+                reasoning_tokens=self.reasoning_tokens, budget=self.budget,
+                original_len=len(self.content), redacted=False,
+            )
+            return
+        if not exhausted:
             return
         self._audited = True
+        sample = prefix_sample(self.content)
+        logger.warning(
+            "Reply guard: reasoning budget exhausted on a reply that passed screening "
+            "(session=%s platform=%s original_len=%d sample=%s) — audited only, the "
+            "reply stands.",
+            self.session, self.platform, len(self.content), sample,
+        )
         record_audit(
             event="reply.audited", platform=self.platform or None,
             session=self.session or None, subject=self.subject or None, rule="R2",
+            suspect=RULE_REASONING_LEAK_SUSPECT, sample=sample,
             reasoning_tokens=self.reasoning_tokens, budget=self.budget,
             original_len=len(self.content), redacted=False,
         )
+        self._report(RULE_REASONING_LEAK_SUSPECT, sample=sample)
 
 
 def _make_fingerprint_scanner():
