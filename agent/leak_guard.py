@@ -52,12 +52,25 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import Any, Callable, NamedTuple, Optional
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ── Haro runtime API: redaction report ─────────────────────────────────
+# Same env names as plugins/platforms/wecom/iac_approval.py — one operator
+# configuration for every call the runtime makes back to Haro.
+GUARD_API_URL_ENV = "HARO_API_URL"
+GUARD_TOKEN_ENV = "HARO_RUNTIME_TOKEN"
+GUARD_REPORT_PATH = "/api/assistant/runtime-api/guard/redacted"
+GUARD_REPORT_TIMEOUT_SECONDS = 3.0
+
+# The two rule names Haro's endpoint accepts (400 guard_report_invalid otherwise).
+RULE_REASONING_LEAK = "reasoning_leak"
+RULE_PROMPT_LEAK = "prompt_leak"
 
 # Fixed operator-approved replacement for a convicted reasoning leak.
 REDACTION_TEXT = "抱歉，我这次的回答生成异常，已中止。请重新发一次问题。"
@@ -251,6 +264,135 @@ def record_audit(**fields: Any) -> None:
         logger.debug("reply guard audit write failed", exc_info=True)
 
 
+def guard_report_url() -> Optional[str]:
+    """``$HARO_API_URL`` + the redaction path, or None when unconfigured."""
+    base = (os.environ.get(GUARD_API_URL_ENV) or "").strip().rstrip("/")
+    if not base:
+        return None
+    return base + GUARD_REPORT_PATH
+
+
+def guard_identity(
+    session: str = "", subject: str = "", platform: str = ""
+) -> dict:
+    """``{session, subject, platform}`` for the report.
+
+    The guard's own per-request fields win; anything missing falls back to the
+    gateway session context via ``agent.file_safety.get_readguard_identity()``
+    — the same source the read guard's audit lines use.
+    """
+    resolved = {
+        "session": (session or "").strip(),
+        "subject": (subject or "").strip(),
+        "platform": (platform or "").strip(),
+    }
+    if all(resolved.values()):
+        return resolved
+    try:
+        from agent.file_safety import get_readguard_identity
+
+        fallback = get_readguard_identity()
+    except Exception:  # noqa: BLE001 - reporting must never break the turn
+        fallback = {}
+    for key in resolved:
+        if not resolved[key]:
+            value = str(fallback.get(key) or "").strip()
+            resolved[key] = "" if value == "unknown" else value
+    return resolved
+
+
+def build_guard_report(
+    *,
+    rule: str,
+    original_len: int,
+    session: str = "",
+    subject: str = "",
+    platform: str = "",
+    reasoning_tokens: Optional[int] = None,
+    budget: Optional[int] = None,
+    row_id: str = "",
+) -> dict:
+    """The report body. Carries lengths and identifiers only — never the reply."""
+    identity = guard_identity(session, subject, platform)
+    body = {
+        "sessionId": identity["session"],
+        "externalUser": identity["subject"],
+        "rule": rule,
+        "originalLen": int(original_len),
+        "reasoningTokens": reasoning_tokens,
+        "budget": budget,
+        "channel": identity["platform"],
+        "rowId": str(row_id or ""),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return {k: v for k, v in body.items() if v is not None and v != ""}
+
+
+def post_guard_report(body: dict) -> bool:
+    """POST one report to Haro. Returns True on 2xx; never raises.
+
+    A failure is a WARN and nothing else: the redaction has already happened
+    locally and the user is protected whether or not Haro hears about it.
+    """
+    url = guard_report_url()
+    token = (os.environ.get(GUARD_TOKEN_ENV) or "").strip()
+    if not url or not token:
+        return False
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    try:
+        try:
+            import httpx
+
+            response = httpx.post(
+                url, content=payload, headers=headers,
+                timeout=GUARD_REPORT_TIMEOUT_SECONDS,
+            )
+            status = int(response.status_code)
+        except ImportError:  # pragma: no cover - httpx is a hard dep in prod
+            import urllib.request
+
+            request = urllib.request.Request(
+                url, data=payload, headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(
+                request, timeout=GUARD_REPORT_TIMEOUT_SECONDS
+            ) as response:
+                status = int(response.status)
+        if 200 <= status < 300:
+            return True
+        logger.warning(
+            "Reply guard: Haro rejected the redaction report (status=%s rule=%s).",
+            status, body.get("rule"),
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning(
+            "Reply guard: redaction report to Haro failed (%s: %s) — the local "
+            "replacement stands.", type(exc).__name__, exc,
+        )
+        return False
+
+
+def report_redaction(body: dict, *, blocking: bool = False) -> None:
+    """Fire-and-forget the report on a daemon thread (``blocking`` for tests)."""
+    if not guard_report_url() or not (os.environ.get(GUARD_TOKEN_ENV) or "").strip():
+        return  # unconfigured deployment: reporting is simply off
+    if blocking:
+        post_guard_report(body)
+        return
+    try:
+        threading.Thread(
+            target=post_guard_report, args=(body,),
+            name="replyguard-report", daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001 - thread exhaustion must not break the turn
+        logger.debug("reply guard report thread failed to start", exc_info=True)
+
+
 class StreamLeakGuard:
     """Per-request state machine gating outbound content frames.
 
@@ -265,6 +407,7 @@ class StreamLeakGuard:
         platform: str = "",
         session: str = "",
         subject: str = "",
+        row_id: str = "",
         clock: Callable[[], float] = time.monotonic,
         hold_max_chars: int = HOLD_MAX_CHARS,
         hold_max_seconds: float = HOLD_MAX_SECONDS,
@@ -273,6 +416,7 @@ class StreamLeakGuard:
         self.platform = platform
         self.session = session
         self.subject = subject
+        self.row_id = row_id
         self._clock = clock
         self._hold_max_chars = hold_max_chars
         self._hold_max_seconds = hold_max_seconds
@@ -383,7 +527,21 @@ class StreamLeakGuard:
             subject=self.subject or None, rule="fingerprint",
             hit_count=scanner.hit_count, original_len=len(self.content),
         )
+        self._report(RULE_PROMPT_LEAK)
         return True
+
+    # ── reporting ──────────────────────────────────────────────────────
+    def _report(self, rule: str) -> None:
+        """Tell Haro a turn was replaced. Best effort, body-free, off the hot path."""
+        try:
+            report_redaction(build_guard_report(
+                rule=rule, original_len=len(self.content), session=self.session,
+                subject=self.subject, platform=self.platform,
+                reasoning_tokens=self.reasoning_tokens, budget=self.budget,
+                row_id=self.row_id,
+            ))
+        except Exception:  # noqa: BLE001 - the replacement is what protects the user
+            logger.debug("reply guard report failed", exc_info=True)
 
     # ── final response ─────────────────────────────────────────────────
     def final_text(self, original: Optional[str]) -> Optional[str]:
@@ -425,6 +583,7 @@ class StreamLeakGuard:
             reasoning_tokens=self.reasoning_tokens, budget=self.budget,
             original_len=len(self.content),
         )
+        self._report(RULE_REASONING_LEAK)
         return GuardOutcome(convicted=True)
 
     def _audit_r2_only(self) -> None:
@@ -454,6 +613,23 @@ def _make_fingerprint_scanner():
         return None
 
 
+def resolve_row_id(agent: Any) -> str:
+    """The hermes message row id of the turn being answered, best effort.
+
+    ``_row_id`` is stamped on a persisted transcript message
+    (``agent/session_persistence.py``); the most recent one identifies the turn
+    Haro should attach the report to. Missing is fine — the field is optional.
+    """
+    try:
+        messages = getattr(agent, "messages", None) or []
+        for message in reversed(list(messages)[-8:]):
+            if isinstance(message, dict) and isinstance(message.get("_row_id"), int):
+                return str(message["_row_id"])
+    except Exception:  # noqa: BLE001 - an optional field never breaks a turn
+        pass
+    return ""
+
+
 def make_stream_leak_guard(agent: Any) -> Optional[StreamLeakGuard]:
     """A guard for ``agent``'s current request, or None when disabled."""
     if not guard_enabled():
@@ -464,6 +640,7 @@ def make_stream_leak_guard(agent: Any) -> Optional[StreamLeakGuard]:
             platform=str(getattr(agent, "platform", "") or ""),
             session=str(getattr(agent, "session_id", "") or ""),
             subject=str(getattr(agent, "chat_id", "") or getattr(agent, "user_id", "") or ""),
+            row_id=resolve_row_id(agent),
         )
     except Exception:
         logger.debug("reply guard construction failed", exc_info=True)

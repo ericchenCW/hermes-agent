@@ -1,0 +1,168 @@
+{
+  "_comment": "跨语言对拍向量：Haro Go 侧生成器必须逐字节复现 lineHash/ngrams。见 agent/leak_fingerprints.py。",
+  "normalize": "nfkc+trim+collapse-ws+ascii-lower",
+  "line": {
+    "hash": "sha256-16",
+    "minRunes": 12
+  },
+  "ngram": {
+    "n": 8,
+    "unit": "rune",
+    "hash": "fnv1a-64"
+  },
+  "cases": [
+    {
+      "name": "chinese",
+      "note": "纯中文夹英文标识符，长于 12 rune，登记行指纹",
+      "raw": "在主机上确认 bkmonitor 采集进程是否正常运行",
+      "normalized": "在主机上确认 bkmonitor 采集进程是否正常运行",
+      "runes": 27,
+      "lineHash": "2a980317fcf6f0d6b447032d65272fae",
+      "ngrams": [
+        "a14f8c14713179dd",
+        "ed75b16b170f6cb3",
+        "112e6474e89650b9",
+        "f0866c699db6a774",
+        "5fc636155efe8a9a",
+        "51074028f254e125",
+        "2f5c86153998c1eb",
+        "fa69917bc3d803f6",
+        "8809d8d80f035acc",
+        "799789ab255bd03b",
+        "f5bad01683b46cb5",
+        "ba4b6080266014ae",
+        "778082dadf0617f8",
+        "9bd38ae5aa8f14d5",
+        "8350374dad29c3e6",
+        "6af45852d649b574",
+        "535486f5251a0b36",
+        "3b9b298c7ae5145b",
+        "21385717981c67d9",
+        "95db105c74ae60ca"
+      ]
+    },
+    {
+      "name": "mixed",
+      "note": "中英混合 + 大写 ASCII 折叠",
+      "raw": "Be direct. 不要复述问题，直接给出结论。",
+      "normalized": "be direct. 不要复述问题,直接给出结论。",
+      "runes": 25,
+      "lineHash": "569f8c32f398c65ca38a1f4311a6e0f8",
+      "ngrams": [
+        "3352d13b1248f00f",
+        "ad4e21ea58e60281",
+        "7ca9c6f96c7963c8",
+        "e781174b4886a902",
+        "2d4a53a3c5c54aa7",
+        "c90475230073dfe9",
+        "e731eb85481053e7",
+        "e4ba42e57f946283",
+        "2c28d63898336d38",
+        "115883400c16115b",
+        "cbde72619a70c629",
+        "bc75340956e514bf",
+        "ba66e436e12aa6a7",
+        "0d08e8fdd4f7aa4b",
+        "ec7d4627a4518749",
+        "d0adb000dcca2199",
+        "a26a06ebeaadeb97",
+        "2563e9d4c09d7ecd"
+      ]
+    },
+    {
+      "name": "fullwidth",
+      "note": "全角字母/表意空格：NFKC + trim + 连续空白折一格",
+      "raw": "　Ｈａｒｏ　运维助手　　接入企业微信　",
+      "normalized": "haro 运维助手 接入企业微信",
+      "runes": 16,
+      "lineHash": "86c41965be6ac02fb1afd3ae8d0e9439",
+      "ngrams": [
+        "e79f69efae49873a",
+        "146ce6ecf3164272",
+        "f801f5597abce0eb",
+        "80929d6d2e4ff88a",
+        "25a878038cf14b24",
+        "e2a1d916342d9615",
+        "51a170bdf7d7bdd0",
+        "6d2ce720d3b05053",
+        "e14f6d506cb7035d"
+      ]
+    },
+    {
+      "name": "crlf_upper",
+      "note": "CRLF 归一 + 仅 A-Z 转小写",
+      "raw": "WECOM_SECRET: DO-NOT-ECHO-THIS\r\n",
+      "normalized": "wecom_secret: do-not-echo-this",
+      "runes": 30,
+      "lineHash": "0e60e274460cd5df3fe8a8aa45b82246",
+      "ngrams": [
+        "e89c10ffc7532083",
+        "b7dfe00b6d9e7267",
+        "bf8a1ea6c73d98b2",
+        "96199819f2e14bb2",
+        "fc4758c110654e11",
+        "22484cfb9fb421d4",
+        "95c48cdb6ab05983",
+        "5cf8facc2a426002",
+        "e99aab52942c101e",
+        "1862d7fb1357bbd2",
+        "65ad88e04eafa384",
+        "78d2b682155acf4c",
+        "8180d4f2bebefac2",
+        "b8fad3a7dbc05565",
+        "5d1f6fdf9b152732",
+        "918072550faf6c65",
+        "6bf4ca202b8b5380",
+        "b55fdcfc604f7e44",
+        "f54634ac2e1a229f",
+        "d9d9dd93cca56a22",
+        "00d5b928ded022f0",
+        "b32e8d7aeb2337c2",
+        "a2ced5c43eb2446a"
+      ]
+    },
+    {
+      "name": "short_line",
+      "note": "5 rune：不登记行指纹，也不足 8 rune 无 gram",
+      "raw": "步骤如下：",
+      "normalized": "步骤如下:",
+      "runes": 5,
+      "lineHash": null,
+      "ngrams": []
+    },
+    {
+      "name": "exactly_eight",
+      "note": "恰 8 rune：只有一个 gram，仍不登记行指纹",
+      "raw": "ok fine.",
+      "normalized": "ok fine.",
+      "runes": 8,
+      "lineHash": null,
+      "ngrams": [
+        "ff7431cf82dfc551"
+      ]
+    },
+    {
+      "name": "cyrillic_untouched",
+      "note": "非 ASCII 大写不折叠（不能用 str.lower）",
+      "raw": "ПРИВЕТ Haro 运维 ЗДЕСЬ",
+      "normalized": "ПРИВЕТ haro 运维 ЗДЕСЬ",
+      "runes": 20,
+      "lineHash": "a0f5b8b881f678dff3ebbbaeb65de7f9",
+      "ngrams": [
+        "945daad49af4583f",
+        "d91dcaf4b5b5a545",
+        "0213adfd498821bd",
+        "b30ee988650f03c6",
+        "699816800e80b5ac",
+        "e341533032aa48c2",
+        "f84fdbc07e13077a",
+        "34a1720dc6681868",
+        "fa338e8b031ec5a7",
+        "91d578b31fd9c042",
+        "4dae130780c803c9",
+        "49c2e3f572742e05",
+        "86a736d2107330f3"
+      ]
+    }
+  ]
+}

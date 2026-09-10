@@ -94,6 +94,9 @@ def audit_log(tmp_path, monkeypatch):
     """Point the guard's audit sink at a temp HERMES_HOME and read it back."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_THINK_BUDGET_HINT", raising=False)
+    # Reporting is off unless a test opts in — no stray HTTP from the suite.
+    monkeypatch.delenv("HARO_API_URL", raising=False)
+    monkeypatch.delenv("HARO_RUNTIME_TOKEN", raising=False)
 
     def _lines():
         path = tmp_path / "logs" / "replyguard.jsonl"
@@ -378,3 +381,146 @@ def test_streaming_emit_path_passes_a_normal_reply_through():
     call._emit_text("你好，我来帮你查 bkmonitor。")
     assert sent == ["你好，我来帮你查 bkmonitor。"]
     assert call.deltas_were_sent["yes"] is True
+
+
+# ── 9. reporting a conviction to Haro ──────────────────────────────────
+
+
+class _FakeResponse:
+    def __init__(self, status_code=204):
+        self.status_code = status_code
+
+
+@pytest.fixture()
+def haro(monkeypatch):
+    """Configure the runtime API and capture what would be POSTed."""
+    monkeypatch.setenv("HARO_API_URL", "https://haro.example.com/")
+    monkeypatch.setenv("HARO_RUNTIME_TOKEN", "runtime-token-xyz")
+    calls = []
+
+    def _post(url, *, content=None, headers=None, timeout=None, **kwargs):
+        calls.append({"url": url, "body": json.loads(content.decode("utf-8")),
+                      "headers": headers, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr("httpx.post", _post)
+    # Synchronous in tests: the production path is a daemon thread.
+    monkeypatch.setattr(lg, "report_redaction",
+                        lambda body, blocking=False: lg.post_guard_report(body))
+    return calls
+
+
+def test_a_convicted_reasoning_leak_is_reported(audit_log, haro):
+    guard, _ = _replay(CAODI_CONTENT_OPENING, budget=2500, reasoning_tokens=2499)
+    assert guard.convicted is True
+
+    assert len(haro) == 1
+    call = haro[0]
+    assert call["url"] == "https://haro.example.com/api/assistant/runtime-api/guard/redacted"
+    assert call["headers"]["Authorization"] == "Bearer runtime-token-xyz"
+    assert call["headers"]["Content-Type"] == "application/json"
+    assert call["timeout"] == lg.GUARD_REPORT_TIMEOUT_SECONDS
+    body = call["body"]
+    assert body["rule"] == "reasoning_leak"
+    assert body["sessionId"] == "s-test"
+    assert body["externalUser"] == "CaoDi"
+    assert body["channel"] == "wecom"
+    assert body["originalLen"] == len(CAODI_CONTENT_OPENING)
+    assert body["reasoningTokens"] == 2499
+    assert body["budget"] == 2500
+    assert body["at"].endswith("Z")
+    # The body never carries the reply itself.
+    assert "Be direct" not in json.dumps(body, ensure_ascii=False)
+    assert "content" not in body and "text" not in body
+
+
+def test_a_fingerprint_conviction_is_reported_as_prompt_leak(audit_log, haro, tmp_path):
+    from agent import leak_fingerprints as fp
+
+    fp._STORE.__init__()
+    digest = fp.build_fingerprints(
+        [("system_prompt", "wecom_secret: s3cr3t-do-not-echo-this-token\n")], bot_id="b")
+    path = tmp_path / "guard" / "prompt-fingerprints.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(digest), encoding="utf-8")
+
+    guard = lg.StreamLeakGuard(budget=2500, platform="wecom", session="s-fp",
+                               subject="CaoDi", row_id="4711")
+    outcome = guard.on_content_delta("wecom_secret: s3cr3t-do-not-echo-this-token\n")
+    assert outcome.convicted is True
+
+    assert len(haro) == 1
+    body = haro[0]["body"]
+    assert body["rule"] == "prompt_leak"
+    assert body["rowId"] == "4711"
+    assert body["sessionId"] == "s-fp"
+    assert "s3cr3t" not in json.dumps(body, ensure_ascii=False)
+    fp._STORE.__init__()
+
+
+def test_report_failure_never_breaks_the_replacement(audit_log, monkeypatch):
+    monkeypatch.setenv("HARO_API_URL", "https://haro.example.com")
+    monkeypatch.setenv("HARO_RUNTIME_TOKEN", "t")
+
+    def _boom(*args, **kwargs):
+        raise TimeoutError("read timeout")
+
+    monkeypatch.setattr("httpx.post", _boom)
+    monkeypatch.setattr(lg, "report_redaction",
+                        lambda body, blocking=False: lg.post_guard_report(body))
+
+    guard, emitted = _replay(CAODI_CONTENT_OPENING, budget=2500, reasoning_tokens=2499)
+    assert guard.convicted is True
+    assert emitted == ""
+    assert guard.final_text("x") == lg.REDACTION_TEXT
+    assert audit_log()[0]["rule"].startswith("R2")
+
+
+def test_a_rejected_report_is_only_warned_about(audit_log, monkeypatch, caplog):
+    monkeypatch.setenv("HARO_API_URL", "https://haro.example.com")
+    monkeypatch.setenv("HARO_RUNTIME_TOKEN", "t")
+    monkeypatch.setattr("httpx.post", lambda *a, **k: _FakeResponse(400))
+    assert lg.post_guard_report({"rule": "prompt_leak"}) is False
+
+
+def test_reporting_is_skipped_when_unconfigured(audit_log, monkeypatch):
+    calls = []
+    monkeypatch.setattr("httpx.post", lambda *a, **k: calls.append(a) or _FakeResponse())
+    guard, _ = _replay(CAODI_CONTENT_OPENING, budget=2500, reasoning_tokens=2499)
+    assert guard.convicted is True
+    assert calls == []
+    assert lg.guard_report_url() is None
+
+
+def test_reporting_is_skipped_without_a_token(monkeypatch):
+    monkeypatch.setenv("HARO_API_URL", "https://haro.example.com")
+    monkeypatch.delenv("HARO_RUNTIME_TOKEN", raising=False)
+    calls = []
+    monkeypatch.setattr("httpx.post", lambda *a, **k: calls.append(a) or _FakeResponse())
+    lg.report_redaction({"rule": "prompt_leak"}, blocking=True)
+    assert calls == []
+
+
+def test_identity_falls_back_to_the_session_context(monkeypatch):
+    monkeypatch.setattr("agent.file_safety.get_readguard_identity",
+                        lambda: {"session": "s-ctx", "subject": "u-ctx", "platform": "haro"})
+    body = lg.build_guard_report(rule="prompt_leak", original_len=12)
+    assert body["sessionId"] == "s-ctx"
+    assert body["externalUser"] == "u-ctx"
+    assert body["channel"] == "haro"
+
+
+def test_unknown_identity_fields_are_omitted(monkeypatch):
+    monkeypatch.setattr("agent.file_safety.get_readguard_identity",
+                        lambda: {"session": "unknown", "subject": "unknown", "platform": "unknown"})
+    body = lg.build_guard_report(rule="reasoning_leak", original_len=3, budget=2500)
+    assert "sessionId" not in body and "externalUser" not in body and "channel" not in body
+    assert body["budget"] == 2500
+
+
+def test_row_id_comes_from_the_latest_persisted_message():
+    agent = SimpleNamespace(messages=[{"role": "user", "_row_id": 41},
+                                      {"role": "assistant", "_row_id": 42}])
+    assert lg.resolve_row_id(agent) == "42"
+    assert lg.resolve_row_id(SimpleNamespace()) == ""
+    assert lg.resolve_row_id(SimpleNamespace(messages=[{"role": "user"}])) == ""
