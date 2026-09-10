@@ -33,6 +33,7 @@ from agent.file_safety import (
     check_kb_read_quota,
     classify_read_path_denial,
     get_command_export_denial,
+    get_command_read_denial,
     get_kb_roots,
     get_read_path_denial,
     get_readguard_log_path,
@@ -592,3 +593,195 @@ class TestKbReadQuota:
             assert check_kb_read_quota(str(doc)) is None
         finally:
             clear_session_vars(tokens)
+
+
+# ---------------------------------------------------------------------------
+# 5. Exec paths are not read paths
+#
+# Round 3 regression (spark, both images): `message_agent` delivered fine
+# (assistant_bot_messages said `delivered`) but the tool answered
+# "Delivery to <label> failed to start: path_not_allowed" — the local
+# notification child, spawned by Hermes itself via
+# ``terminal_tool(..., _host_local=True)``, runs
+# ``/opt/hermes/.venv/bin/python …`` and the guard read the interpreter's
+# absolute path as a file the model wanted to read.
+#
+# Two rules, both narrow:
+#   * a ``_host_local`` call is control-plane, not model input — guards off;
+#   * an ``argv[0]`` under a ``bin``/``sbin``/``libexec`` directory is an
+#     *exec* path. Exec only: the same path named as a read operand
+#     (``cat``, ``read_file``) is still refused.
+# ---------------------------------------------------------------------------
+
+
+class TestExecPathExemption:
+    @pytest.fixture
+    def interpreter(self, tmp_path: Path) -> Path:
+        """An interpreter location outside every allowlist root."""
+        venv_bin = tmp_path / "opt-hermes" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        python = venv_bin / "python"
+        python.write_text("#!/bin/sh\nexit 0\n")
+        python.chmod(0o755)
+        return python
+
+    # ① control-plane children are exempt outright
+    def test_host_local_child_is_not_read_denied(
+        self, deployment, interpreter, monkeypatch
+    ):
+        from tools import terminal_tool
+
+        seen = {}
+
+        def _fake_spawn(**kwargs):
+            seen.update(kwargs)
+            return json.dumps({"session_id": "proc-1", "status": "running"})
+
+        monkeypatch.setattr(terminal_tool, "spawn_background_process", _fake_spawn)
+        raw = terminal_tool.terminal_tool(
+            command=f'{interpreter} -c "print(1)"',
+            background=True,
+            _host_local=True,
+        )
+        payload = json.loads(raw)
+        assert payload.get("error") != READ_PATH_DENIED_CODE
+        assert payload.get("session_id") == "proc-1"
+
+    def test_host_local_exemption_is_not_audited(
+        self, deployment, interpreter, monkeypatch
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.setattr(
+            terminal_tool,
+            "spawn_background_process",
+            lambda **kw: json.dumps({"session_id": "proc-1"}),
+        )
+        terminal_tool.terminal_tool(
+            command=f'{interpreter} -c "print(1)"',
+            background=True,
+            _host_local=True,
+        )
+        assert _log_lines(deployment["home"]) == []
+
+    def test_host_local_skips_the_export_guard_too(
+        self, deployment, interpreter, monkeypatch
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.setattr(
+            terminal_tool,
+            "spawn_background_process",
+            lambda **kw: json.dumps({"session_id": "proc-1"}),
+        )
+        raw = terminal_tool.terminal_tool(
+            command=f"cp -r {deployment['kb']}/canway-it-support {deployment['out']}/",
+            background=True,
+            _host_local=True,
+        )
+        assert json.loads(raw).get("error") != KB_EXPORT_DENIED_CODE
+
+    # ② the same command from the model side: argv[0] is an exec path
+    def test_model_side_interpreter_argv0_not_denied(self, deployment, interpreter):
+        command = f'{interpreter} -c "print(1)"'
+        assert get_command_read_denial(command, str(deployment["kb"])) is None
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{py} -c "print(1)"',
+            "{py} -m json.tool",
+            "sudo {py} -c 'print(1)'",
+            "nohup {py} -c 'print(1)'",
+            "FOO=bar {py} -c 'print(1)'",
+        ],
+    )
+    def test_exec_shapes_not_denied(self, deployment, interpreter, template):
+        command = template.format(py=interpreter)
+        assert get_command_read_denial(command, str(deployment["kb"])) is None, command
+
+    @pytest.mark.parametrize("prog", ["/usr/bin/env", "/bin/sh", "/usr/sbin/chroot"])
+    def test_system_exec_locations_not_denied(self, deployment, prog):
+        assert get_command_read_denial(f"{prog} true", str(deployment["kb"])) is None
+
+    def test_terminal_tool_model_side_accepts_interpreter(
+        self, deployment, interpreter, monkeypatch
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.setattr(
+            terminal_tool,
+            "spawn_background_process",
+            lambda **kw: json.dumps({"session_id": "proc-2"}),
+        )
+        raw = terminal_tool.terminal_tool(
+            command=f'{interpreter} -c "print(1)"', background=True
+        )
+        assert json.loads(raw).get("error") != READ_PATH_DENIED_CODE
+
+    # ③ exec-only: the very same path as a READ operand stays refused
+    def test_reading_the_interpreter_is_still_denied(self, deployment, interpreter):
+        assert get_command_read_denial(
+            f"cat {interpreter}", str(deployment["kb"])
+        ) == DENIAL
+
+    @pytest.mark.parametrize("reader", ["cat", "head -n 1", "xxd", "strings"])
+    def test_read_commands_over_an_exec_path_denied(
+        self, deployment, interpreter, reader
+    ):
+        command = f"{reader} {interpreter}"
+        assert get_command_read_denial(command, str(deployment["kb"])) == DENIAL, command
+
+    def test_read_file_tool_still_denies_the_interpreter(self, deployment, interpreter):
+        assert get_read_path_denial(str(interpreter)) == DENIAL
+
+    def test_interpreter_as_exec_and_read_in_one_command_denied(
+        self, deployment, interpreter
+    ):
+        command = f"{interpreter} -c 'print(1)' && cat {interpreter}"
+        assert get_command_read_denial(command, str(deployment["kb"])) == DENIAL
+
+    # ④ script/data operands are unaffected
+    def test_denied_script_operand_still_denied(self, deployment, interpreter):
+        assert get_command_read_denial(
+            f"{interpreter} /etc/passwd", str(deployment["kb"])
+        ) == DENIAL
+        assert get_command_read_denial("python3 /etc/passwd", str(deployment["kb"])) == DENIAL
+
+    def test_embedded_path_inside_interpreter_code_still_denied(self, deployment, interpreter):
+        assert get_command_read_denial(
+            f"""{interpreter} -c 'print(open("/etc/passwd").read())'""",
+            str(deployment["kb"]),
+        ) == DENIAL
+
+    def test_non_bin_absolute_argv0_still_checked(self, deployment):
+        """Only bin/sbin/libexec locations are vouched for; fail closed elsewhere."""
+        assert get_command_read_denial("/etc/passwd --run", str(deployment["kb"])) == DENIAL
+
+    def test_traversal_argv0_still_checked(self, deployment, tmp_path):
+        command = "../../opt-hermes/.venv/bin/python -c 'print(1)'"
+        assert get_command_read_denial(command, str(deployment["kb"])) == DENIAL
+
+    # ⑤ end-to-end: the delivery spawn no longer reports path_not_allowed
+    def test_message_agent_delivery_spawn_starts(
+        self, deployment, interpreter, monkeypatch
+    ):
+        from tools import bot_mode_dm, terminal_tool
+
+        monkeypatch.setattr(
+            terminal_tool,
+            "spawn_background_process",
+            lambda **kw: json.dumps({"session_id": "proc-9", "status": "running"}),
+        )
+        monkeypatch.setattr(bot_mode_dm.sys, "executable", str(interpreter))
+        dm_file = str(deployment["out"] / "dm.json")
+        command = bot_mode_dm._delivery_command(
+            ["--to", "chat"], dm_file, stdin_file=False
+        )
+        assert str(interpreter) in command
+        out = json.loads(
+            bot_mode_dm._spawn_delivery(command, "Bot Chat", task_id=None, agent=None)
+        )
+        assert "path_not_allowed" not in json.dumps(out, ensure_ascii=False)
+        assert out.get("status") == "sent"
+        assert out.get("process_id") == "proc-9"

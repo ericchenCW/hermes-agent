@@ -1214,6 +1214,13 @@ def terminal_tool(
         # applied to path operands parsed out of the command — otherwise `cat
         # /opt/data/config.yaml` walks straight around the file-tool guard. Runs BEFORE the
         # approval guards; the refusal is uniform and content-free.
+        #
+        # ``_host_local`` children are exempt: those commands are composed by
+        # Hermes itself (the message_agent delivery runner and friends), never
+        # by the model, and their argv carries the interpreter's absolute path
+        # — which the guard would otherwise read as an out-of-allowlist read
+        # operand and refuse. An exemption here logs nothing: no refusal
+        # happened, so there is nothing to audit.
         from agent.file_safety import (
             get_command_export_denial,
             get_command_read_denial_detail,
@@ -1225,7 +1232,10 @@ def terminal_tool(
             default_cwd=cwd,
             session_key=session_key,
         )
-        _cmd_denial = get_command_read_denial_detail(command, _read_guard_cwd)
+        _cmd_denial = (
+            None if _host_local
+            else get_command_read_denial_detail(command, _read_guard_cwd)
+        )
         if _cmd_denial:
             logger.warning(
                 "Blocked out-of-allowlist read path (command: %s)",
@@ -1246,7 +1256,10 @@ def terminal_tool(
         # Reading knowledge files one at a time is the job; handing a chat
         # user the whole corpus as an archive is not. tar/zip/7z/cp -r/rsync/
         # find -exec cp/shutil.copytree over a knowledge directory are refused.
-        _export_denial = get_command_export_denial(command, _read_guard_cwd)
+        _export_denial = (
+            None if _host_local
+            else get_command_export_denial(command, _read_guard_cwd)
+        )
         if _export_denial:
             logger.warning(
                 "Blocked knowledge-base bulk export (command: %s)",

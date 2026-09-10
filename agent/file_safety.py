@@ -846,6 +846,89 @@ _SEGMENT_SPLIT_RE = _re.compile(r"&&|\|\||\$\(|[;\n|&()`]")
 
 _ENV_ASSIGN_TOKEN_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+#: Interpreters whose ``-c`` / ``-e`` / ``-m`` operand is *code or a module
+#: name*, never a file path. The operand is still swept for absolute paths
+#: embedded inside it (``python -c 'open("/etc/passwd")'`` stays refused) —
+#: only the "the whole operand is a path" reading is dropped.
+_INTERPRETER_COMMANDS = frozenset({
+    "python", "python3", "perl", "ruby", "node", "php", "sh", "bash", "zsh",
+})
+
+#: Flags after which an interpreter's operand is code / a module name.
+_INTERPRETER_CODE_FLAGS = frozenset({"-c", "-e", "-m", "--command", "--eval"})
+
+#: Directory basenames that hold executables. An ``argv[0]`` living directly
+#: inside one is an *exec* path, not a path being read.
+_EXEC_DIR_BASENAMES = frozenset({"bin", "sbin", "libexec"})
+
+
+def is_exec_path_token(token: str) -> bool:
+    """True when *token* names a program to run rather than a file to read.
+
+    Only meaningful in ``argv[0]`` position. A bare command name (``python3``,
+    ``cat``) qualifies, and so does an absolute path sitting directly inside a
+    ``bin`` / ``sbin`` / ``libexec`` directory — ``/usr/bin/env``, ``/bin/sh``,
+    ``/opt/hermes/.venv/bin/python``. Nothing else does: ``..`` traversals and
+    any other absolute path invoked as a command (``/etc/passwd``) keep going
+    through the ordinary read check, so the guard still fails closed on shapes
+    it cannot vouch for.
+
+    The exemption covers **exec only**. The very same path named as a read
+    operand (``cat /opt/hermes/.venv/bin/python``, ``read_file``) is untouched
+    by this function and stays refused.
+    """
+    if not token or not isinstance(token, str):
+        return False
+    if "://" in token:
+        return False
+    normalized = token.replace("\\", "/")
+    if ".." in normalized.split("/"):
+        return False
+    if "/" not in normalized and not normalized.startswith("~"):
+        # A bare name resolved through $PATH — not a path operand at all.
+        return True
+    if not normalized.startswith("/"):
+        return False
+    parent = os.path.basename(os.path.dirname(normalized))
+    return parent in _EXEC_DIR_BASENAMES
+
+
+def _strip_command_prefixes(argv: list[str]) -> list[str]:
+    """Drop leading ``FOO=bar`` assignments and wrapper commands (``sudo``…)."""
+    while argv and (
+        _ENV_ASSIGN_TOKEN_RE.match(argv[0])
+        or os.path.basename(argv[0]) in _COMMAND_PREFIXES
+    ):
+        argv = argv[1:]
+    return argv
+
+
+def _exec_path_tokens(command: str) -> set[str]:
+    """The ``argv[0]`` tokens of *command*'s segments that are exec paths.
+
+    Used to keep the whole-string baseline sweep from flagging an interpreter
+    location (``/opt/hermes/.venv/bin/python -c …``) as a path being read. The
+    per-segment operand pass is unaffected, so the same string appearing as an
+    operand elsewhere in the command is still checked.
+    """
+    tokens: set[str] = set()
+    for segment in _SEGMENT_SPLIT_RE.split(command or ""):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            argv = _shlex.split(segment, posix=True)
+        except ValueError:
+            argv = [tok.strip("'\"") for tok in segment.split()]
+        # A wrapper spelled as a path (``/usr/bin/env FOO=1 prog``) is an exec
+        # location too, so record it before it is stripped.
+        stripped = _strip_command_prefixes(argv)
+        for token in argv[: len(argv) - len(stripped)] + stripped[:1]:
+            if is_exec_path_token(token):
+                tokens.add(token)
+    return tokens
+
+
 #: Absolute paths embedded INSIDE another token — ``python -c 'open("/opt/…")'``,
 #: ``awk '{…}' /etc/x``, a heredoc body, an unparsed quoted blob. The
 #: lookbehind stops ``s/foo/bar/`` (sed script) and ``http://…`` from matching,
@@ -874,6 +957,12 @@ def _command_path_candidates(command: str) -> list[str]:
     """Extract path-ish operands from a shell command string."""
     candidates: list[str] = []
 
+    # Exec positions are not read positions: the interpreter/executable a
+    # command runs (``/opt/hermes/.venv/bin/python -c …``) is exempted from the
+    # baseline sweep below. Naming the same file as an *operand* still goes
+    # through the per-command pass unchanged.
+    exec_tokens = _exec_path_tokens(command)
+
     # Baseline pass over the raw string: any multi-segment absolute path
     # mentioned ANYWHERE in the command is checked, whatever the shell
     # structure around it. This is what catches shapes the tokenizer cannot
@@ -882,7 +971,10 @@ def _command_path_candidates(command: str) -> list[str]:
     # left to the per-command pass so an incidental mention in a commit
     # message or a comment does not fail the whole command closed.
     for token in (command or "").split():
-        for found in _embedded_paths(token.strip("'\"")):
+        stripped = token.strip("'\"")
+        if stripped in exec_tokens:
+            continue
+        for found in _embedded_paths(stripped):
             if found.count("/") >= 2:
                 candidates.append(found)
 
@@ -898,30 +990,41 @@ def _command_path_candidates(command: str) -> list[str]:
             # path or a traversal.
             for token in segment.split():
                 token = token.strip("'\"")
+                if token in exec_tokens:
+                    continue
                 if _looks_absolute_or_escape(token):
                     candidates.append(token)
                 candidates.extend(_embedded_paths(token))
             continue
         # Strip leading env assignments and wrapper commands.
-        while argv and (
-            _ENV_ASSIGN_TOKEN_RE.match(argv[0])
-            or os.path.basename(argv[0]) in _COMMAND_PREFIXES
-        ):
-            argv = argv[1:]
+        argv = _strip_command_prefixes(argv)
         if not argv:
             continue
         name = os.path.basename(argv[0])
         rest = argv[1:]
         is_read_cmd = name in _READ_COMMANDS
+        is_interpreter = name in _INTERPRETER_COMMANDS
         skip_first_operand = (
             is_read_cmd
             and name in _SCRIPT_FIRST_COMMANDS
             and not any(flag in _PATTERN_FLAGS for flag in rest)
         )
         seen_operand = False
+        previous = ""
         for token in rest:
             if not token or token == "-":
+                previous = token
                 continue
+            # ``python -c '<code>'`` / ``python -m <module>``: the operand is
+            # code, not a file. Absolute paths *inside* it are still swept
+            # (see _embedded_paths below), only the whole-operand-is-a-path
+            # reading is dropped.
+            if is_interpreter and previous in _INTERPRETER_CODE_FLAGS:
+                candidates.extend(_embedded_paths(token))
+                previous = token
+                seen_operand = True
+                continue
+            previous = token
             # An absolute path hiding inside a bigger token (a ``python -c``
             # program, an ``awk`` body, a quoted blob) is checked no matter
             # which command it belongs to.
