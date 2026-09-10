@@ -290,3 +290,91 @@ def test_length_truncation_logs_one_diagnostic_line(caplog):
     assert "has_tool_calls=False" in line
     assert "attempt=0/4" in line
     assert "action=thinking_exhausted" in line
+
+
+# ── 5. normalized-line loop guard (2026-09-10 WeCom degeneration) ──────
+
+# The shape the model actually degenerated into: one short acknowledgement,
+# re-quoted and re-framed on every pass. Byte-exact probes miss it because the
+# framing changes; normalization collapses the variants.
+_CAODI_LOOP_BLOCK = (
+    '"收到。随时待命。"\n'
+    "I'll output \"收到。随时待命。\"\n"
+    "It's fine.\n"
+    'Wait, "随时待命" is a bit "military".\n'
+    '"收到。随时待命。"\n'
+    "I'll output it.\n"
+    "It's fine.\n"
+    'Wait, "随时待命" is a bit "dramatic".\n'
+)
+
+
+def test_normalized_line_loop_trips_early_on_the_wecom_degeneration():
+    """The verbatim tail probe needed 17152 characters on this text; the
+    normalized-line probe must catch it inside 4000."""
+    detector = rg.NormalizedLineLoopDetector()
+    consumed = 0
+    for _ in range(40):
+        chunk = _CAODI_LOOP_BLOCK
+        consumed += len(chunk)
+        if detector.feed(chunk):
+            break
+    assert detector.tripped is True
+    assert consumed <= 4000, f"tripped only after {consumed} characters"
+
+
+def test_normalized_line_loop_survives_arbitrary_delta_boundaries():
+    """Streaming splits lines anywhere; the detector buffers the partial tail."""
+    text = _CAODI_LOOP_BLOCK * 6
+    detector = rg.NormalizedLineLoopDetector()
+    tripped = any(detector.feed(text[i : i + 7]) for i in range(0, len(text), 7))
+    assert tripped is True
+
+
+def test_normalized_line_loop_ignores_a_structured_list():
+    """A real answer repeats STRUCTURE, not content — normalized lines stay distinct."""
+    rows = "\n".join(
+        f"| {host} | {ip} | {state} |"
+        for host, ip, state in [
+            ("bkm-node-a", "10.10.24.11", "running"), ("bkm-node-b", "10.10.24.12", "running"),
+            ("bkm-node-c", "10.10.24.13", "stopped"), ("bkm-node-d", "10.10.24.14", "running"),
+            ("gse-proxy-a", "10.10.25.21", "running"), ("gse-proxy-b", "10.10.25.22", "running"),
+            ("job-exec-a", "10.10.26.31", "running"), ("job-exec-b", "10.10.26.32", "degraded"),
+        ]
+    )
+    assert rg.normalized_line_loop_detected(rows + "\n") is False
+
+
+def test_normalized_line_loop_ignores_a_numbered_runbook():
+    steps = "\n".join(
+        f"{n}. {action}" for n, action in enumerate(
+            ["摘除负载均衡", "停止采集器", "备份配置目录", "升级 rpm 包", "回填配置",
+             "启动采集器", "确认心跳恢复", "重新挂回负载均衡", "观察 10 分钟指标",
+             "关闭变更单"], 1)
+    )
+    assert rg.normalized_line_loop_detected(steps + "\n") is False
+
+
+def test_normalized_line_loop_ignores_short_repeated_markers():
+    """Fence markers and bare list bullets recur legitimately."""
+    text = "".join(f"```\nsystemctl status svc-{i}\n```\n" for i in range(6)) + ("- 是\n" * 6)
+    assert rg.normalized_line_loop_detected(text) is False
+
+
+def test_normalize_line_collapses_punctuation_and_digits():
+    assert rg.normalize_line('  "收到。随时待命。" ') == rg.normalize_line("收到，随时待命")
+    assert rg.normalize_line("Step 1: restart") == rg.normalize_line("step 1 restart!!")
+    # Digits are part of the identity: a numbered checklist must stay distinct.
+    assert rg.normalize_line("第 1 项检查通过") != rg.normalize_line("第 2 项检查通过")
+
+
+def test_normalized_line_loop_needs_four_occurrences():
+    assert rg.normalized_line_loop_detected("同一句话。\n" * 3) is False
+    assert rg.normalized_line_loop_detected("同一句话。\n" * 4) is True
+
+
+def test_normalized_line_loop_window_forgets_old_lines():
+    """Three hits spread beyond the 40-line window must not accumulate."""
+    filler = "\n".join(f"第 {i} 项检查通过" for i in range(1, 39))
+    text = "\n".join([("重复的一行" + "\n" + filler) * 4])
+    assert rg.normalized_line_loop_detected(text) is False

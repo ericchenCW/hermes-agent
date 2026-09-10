@@ -43,6 +43,7 @@ from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.repetition_guard import (
     STREAM_CHECK_INTERVAL as _REP_CHECK_INTERVAL,
     STREAM_TAIL_WINDOW as _REP_TAIL_WINDOW,
+    NormalizedLineLoopDetector,
     stream_repetition_guard_enabled,
     tail_repetition_detected,
 )
@@ -2816,13 +2817,24 @@ class _StreamingCall(StreamingWaitMonitor):
             if outcome.emit:
                 self._emit_text_raw(outcome.emit)
 
-        def _rep_guard_tripped(kind: str, parts: list, delta_len: int) -> bool:
-            """idcsre patch — True when the accumulated ``kind`` stream is looping verbatim.
+        _line_loops = {"reasoning": NormalizedLineLoopDetector(), "content": NormalizedLineLoopDetector()}
 
-            Checked at most once per ``_REP_CHECK_INTERVAL`` accumulated characters so the
-            streaming hot path stays cheap."""
+        def _rep_guard_tripped(kind: str, parts: list, delta: str) -> bool:
+            """idcsre patch — True when the accumulated ``kind`` stream is looping.
+
+            Two probes. The normalized-line fast path sees every delta (it is O(delta)
+            and catches a short sentence repeating under cosmetic variation, which the
+            verbatim probe below only notices ~17k characters in). The verbatim tail
+            probe still runs, at most once per ``_REP_CHECK_INTERVAL`` accumulated
+            characters, for loops that do not align to lines."""
             if not _rep_guard_on:
                 return False
+            delta_len = len(delta)
+            try:
+                if _line_loops[kind].feed(delta):
+                    return _rep_guard_abort(kind, "normalized line")
+            except Exception:
+                logger.debug("normalized-line loop probe failed", exc_info=True)
             key = f"{kind}_chars"
             pending = _rep_guard_state[key] + delta_len
             if pending < _REP_CHECK_INTERVAL:
@@ -2844,12 +2856,17 @@ class _StreamingCall(StreamingWaitMonitor):
                     return False
             except Exception:
                 return False
+            return _rep_guard_abort(kind, "verbatim tail")
+
+        def _rep_guard_abort(kind: str, probe: str) -> bool:
+            """Close the stream and mark the attempt as a repetition abort."""
             _rep_guard_state["aborted"] = True
             _rep_guard_state["kind"] = kind
             logger.warning(
-                "Repetition guard tripped on %s stream (session=%s model=%s); aborting the request "
-                "instead of burning the output budget. Set HERMES_REPETITION_GUARD=0 to disable.",
-                kind, getattr(self.agent, "session_id", None), getattr(self.agent, "model", None),
+                "Repetition guard tripped on %s stream via the %s probe (session=%s model=%s); "
+                "aborting the request instead of burning the output budget. "
+                "Set HERMES_REPETITION_GUARD=0 to disable.",
+                kind, probe, getattr(self.agent, "session_id", None), getattr(self.agent, "model", None),
             )
             try:
                 self._close_managed_stream()
@@ -2916,7 +2933,7 @@ class _StreamingCall(StreamingWaitMonitor):
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 self._emit_reasoning(reasoning_text)
-                if _rep_guard_tripped("reasoning", reasoning_parts, len(reasoning_text)):
+                if _rep_guard_tripped("reasoning", reasoning_parts, reasoning_text):
                     break
 
             # Text (list-of-blocks deltas flattened once); possible echoed SSE is
@@ -2925,7 +2942,7 @@ class _StreamingCall(StreamingWaitMonitor):
             if delta_content:
                 content_parts.append(delta_content)
                 if not tool_calls_acc and _rep_guard_tripped(
-                    "content", content_parts, len(delta_content)
+                    "content", content_parts, delta_content
                 ):
                     _flush_pending_stream_text()
                     break

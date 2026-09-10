@@ -10,7 +10,8 @@ conservative: only LONG verbatim repeats (60+ chars) covering a majority of the 
 from __future__ import annotations
 
 import math
-from collections import Counter
+import re as _re
+from collections import Counter, deque
 
 # Below this length the check doesn't run: short truncations trivially
 # contain repeated tokens and are legitimately continued.
@@ -118,3 +119,100 @@ def tail_repetition_detected(
     if not probe.strip():
         return False
     return tail.count(probe) >= min_repeats
+
+
+# ── Normalized-line loop guard (SRE fork, 2026-09-10) ──────────────────
+# ``tail_repetition_detected`` needs a VERBATIM 120-char repeat, which the
+# 2026-09-10 WeCom degeneration only produced after 17152 characters: the model
+# looped on one short sentence, re-punctuating and re-quoting it each time
+# (``"收到。随时待命。"`` / ``I'll output "收到。随时待命。"`` / ``It's fine.``),
+# so the byte-exact probe kept missing.  Normalizing away whitespace,
+# punctuation and digits collapses those variants onto one key and trips the
+# guard at 3388 characters instead — before the model can burn 16k tokens.
+#
+# Deliberately narrow: FOUR occurrences of the same normalized line inside a
+# forty-line window.  A genuine list or table repeats structure, not content,
+# so its normalized lines stay distinct; a heading legitimately recurring three
+# times in forty lines is still under the bar.
+
+# Sliding window, in non-empty normalized lines.
+LINE_LOOP_WINDOW = 40
+# Occurrences of one normalized line inside that window that trip the guard.
+LINE_LOOP_MIN_REPEATS = 4
+# Normalized lines below this length are ignored: "1." / "是" / "```" recur
+# legitimately in any structured answer.
+LINE_LOOP_MIN_CHARS = 2
+
+_LINE_NOISE_RE = _re.compile(r"\s+")
+_LINE_PUNCT_RE = _re.compile(r"[^\w]+", _re.UNICODE)
+
+
+def normalize_line(line: str) -> str:
+    """Collapse a line onto its content identity.
+
+    Drops whitespace and punctuation (CJK included, since ``\\w`` keeps Han
+    characters but not ``。「」``) and lowercases the rest, so ``收到。`` and
+    ``"收到。"`` differ only where the words differ.
+
+    Digits are deliberately KEPT.  Stripping them collapses ``第 1 项检查通过``
+    … ``第 38 项检查通过`` — an ordinary numbered checklist — onto a single key
+    and trips the guard on a perfectly good answer.
+    """
+    if not isinstance(line, str):
+        return ""
+    return _LINE_PUNCT_RE.sub("", _LINE_NOISE_RE.sub("", line)).lower()
+
+
+class NormalizedLineLoopDetector:
+    """Streaming detector for a line repeating itself under cosmetic variation.
+
+    Feed raw content deltas; ``feed`` returns True the first time one normalized
+    line reaches ``min_repeats`` occurrences inside the trailing window.  State
+    is O(window): a deque of normalized lines plus the unterminated tail.
+    """
+
+    def __init__(self, *, window: int = LINE_LOOP_WINDOW, min_repeats: int = LINE_LOOP_MIN_REPEATS,
+                 min_chars: int = LINE_LOOP_MIN_CHARS) -> None:
+        self._window = deque(maxlen=window)
+        self._counts: Counter = Counter()
+        self._min_repeats = min_repeats
+        self._min_chars = min_chars
+        self._pending = ""
+        self.tripped = False
+
+    def feed(self, text: str) -> bool:
+        """Consume one delta; True once the loop is unmistakable (latching)."""
+        if self.tripped:
+            return True
+        if not isinstance(text, str) or not text:
+            return False
+        self._pending += text
+        if "\n" not in self._pending:
+            return False
+        *complete, self._pending = self._pending.split("\n")
+        for line in complete:
+            if self._observe(line):
+                return True
+        return False
+
+    def _observe(self, line: str) -> bool:
+        key = normalize_line(line)
+        if len(key) < self._min_chars:
+            return False
+        if len(self._window) == self._window.maxlen:
+            evicted = self._window[0]
+            self._counts[evicted] -= 1
+            if self._counts[evicted] <= 0:
+                del self._counts[evicted]
+        self._window.append(key)
+        self._counts[key] += 1
+        if self._counts[key] >= self._min_repeats:
+            self.tripped = True
+            return True
+        return False
+
+
+def normalized_line_loop_detected(text: str, **kwargs) -> bool:
+    """Post-hoc form of :class:`NormalizedLineLoopDetector` over whole ``text``."""
+    detector = NormalizedLineLoopDetector(**kwargs)
+    return detector.feed(text if isinstance(text, str) else "") or detector.feed("\n")
