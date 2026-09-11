@@ -197,7 +197,7 @@ def window_is_convicting(window: str) -> bool:
 def is_low_entropy_line(normalized_line: str) -> bool:
     """True when a whole normalized line is just a path / URL / identifier.
 
-    ``/knowledge/xingye-it-support/guides/access/vpn-user-guide.md`` on a line of
+    ``/knowledge/hoshino-it-support/guides/access/vpn-user-guide.md`` on a line of
     its own is a citation, not the system prompt leaking.
     """
     if not normalized_line:

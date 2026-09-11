@@ -422,16 +422,16 @@ def test_guard_leaves_an_innocent_reply_alone_with_fingerprints_loaded(home):
 
 SKILL_LIKE_PROMPT = (
     "技能说明：先用 kb_search 工具检索知识库，命中之后再用 read_file 读取原文。\n"
-    "所有资料都放在 /knowledge/xingye-it-support/ 下面，例如 "
-    "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md 与 "
-    "/knowledge/xingye-it-support/reference/internal-platform-urls.md。\n"
+    "所有资料都放在 /knowledge/hoshino-it-support/ 下面，例如 "
+    "/knowledge/hoshino-it-support/guides/access/vpn-user-guide.md 与 "
+    "/knowledge/hoshino-it-support/reference/internal-platform-urls.md。\n"
     "回答末尾必须列出实际依据的来源路径，一行一个，不要编造。\n"
 )
 #: The exact replies the 2026-09-11 regression lost (`fp-analysis.log`).
-CITED_PATH_REPLY = "依据：/knowledge/xingye-it-support/guides/access/vpn-user-guide.md"
+CITED_PATH_REPLY = "依据：/knowledge/hoshino-it-support/guides/access/vpn-user-guide.md"
 KB_SEARCH_REPLY = "我用 kb_search 检索了「门禁卡怎么办理」，命中 3 条。"
 READ_FILE_REPLY = (
-    "我读了 /knowledge/xingye-it-support/reference/internal-platform-urls.md 这篇文档。"
+    "我读了 /knowledge/hoshino-it-support/reference/internal-platform-urls.md 这篇文档。"
 )
 #: …and a line of the prompt's Chinese prose, which must still convict.
 SKILL_CHINESE_LINE = "回答末尾必须列出实际依据的来源路径，一行一个，不要编造。"
@@ -445,7 +445,7 @@ def test_low_entropy_window_rule():
     assert fp.is_low_entropy_window("用 kb_se") is False
     # A whole line that is nothing but a path is not looked up either.
     assert fp.is_low_entropy_line(
-        "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md") is True
+        "/knowledge/hoshino-it-support/guides/access/vpn-user-guide.md") is True
     assert fp.is_low_entropy_line("依据: /knowledge/x.md") is False
 
 
@@ -1006,7 +1006,7 @@ def test_v2_digest_format_declares_version_two():
     assert fp.ngram_hash("/knowled") not in digest["ngrams"]
     assert fp.ngram_hash("kb_searc") not in digest["ngrams"]
     assert fp.line_hash(
-        "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md"
+        "/knowledge/hoshino-it-support/guides/access/vpn-user-guide.md"
     ) not in digest["lines"]
     # …and the Chinese prose it exists to protect is still there.
     assert fp.line_hash(fp.normalize_lines(SKILL_CHINESE_LINE)[0]) in digest["lines"]
