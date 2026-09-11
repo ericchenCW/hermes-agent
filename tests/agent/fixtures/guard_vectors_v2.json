@@ -255,7 +255,7 @@
     {
       "name": "mixed_document",
       "note": "综合文档：围栏 / 路径行 / 短英文行 / 长英文行 / 中文正文各一",
-      "raw": "回答末尾必须列出实际依据的来源路径，一行一个。\n* /knowledge/canway-it-support/guides/access/vpn-user-guide.md\nUse kb_search first.\nThis is a longer english sentence about it\n```json\n{\"a\": 1}\n这一行也在围栏内要剔\n```\n1. 先检索再回答\n",
+      "raw": "回答末尾必须列出实际依据的来源路径，一行一个。\n* /knowledge/hoshino-it-support/guides/access/vpn-user-guide.md\nUse kb_search first.\nThis is a longer english sentence about it\n```json\n{\"a\": 1}\n这一行也在围栏内要剔\n```\n1. 先检索再回答\n",
       "normalized_lines": [
         "回答末尾必须列出实际依据的来源路径,一行一个。",
         "this is a longer english sentence about it",
@@ -263,7 +263,7 @@
       ],
       "dropped_lines": [
         {
-          "line": "* /knowledge/canway-it-support/guides/access/vpn-user-guide.md",
+          "line": "* /knowledge/hoshino-it-support/guides/access/vpn-user-guide.md",
           "reason": "ascii_ident"
         },
         {
