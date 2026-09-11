@@ -281,6 +281,41 @@ def reasoning_retry_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+#: Haro writes its per-bot routing hints into the OpenAI-standard ``user`` field,
+#: e.g. ``haro;bot=b8ba5f7a;think=budget:6000`` (or ``think=inherit``).  Only the
+#: ``haro;`` prefix is ours to rewrite — any other deployment's ``user`` value is
+#: an opaque identifier and must be left alone.
+_HARO_USER_PREFIX = "haro;"
+
+
+def _haro_user_thinking_off(value):
+    """Rewrite a Haro ``user`` routing string so it asks thinkcap for ``think=off``.
+
+    Returns the new value, or ``None`` when there is nothing to change (not a
+    string, not a ``haro;`` value, or already ``think=off``).
+
+    This is the switch that actually REACHES vLLM on the production path
+    hermes → bifrost → thinkcap → vLLM: bifrost drops request fields it does not
+    know (``thinking_token_budget``, ``chat_template_kwargs``), so those knobs
+    never leave the gateway.  ``user`` is a standard OpenAI field, so it survives,
+    and thinkcap's ``parse_user_field`` reads ``think=<off|inherit|budget:N>`` out
+    of it — ``off`` being the value that strips the budget and injects
+    ``chat_template_kwargs.enable_thinking=false`` downstream.
+    """
+    if not isinstance(value, str) or not value.startswith(_HARO_USER_PREFIX):
+        return None
+    segments = value.split(";")
+    found = False
+    for i, seg in enumerate(segments):
+        if seg.strip().startswith("think="):
+            segments[i] = "think=off"
+            found = True
+    if not found:
+        segments.append("think=off")
+    new_value = ";".join(segments)
+    return new_value if new_value != value else None
+
+
 def apply_thinking_off(api_kwargs):
     """``(kwargs_copy, [switch names])`` with every thinking knob the request
     already carries turned off — or ``None`` when it carries none.
@@ -301,7 +336,15 @@ def apply_thinking_off(api_kwargs):
     * ``extra_body.think``                      → ``False`` (Ollama)
     * ``extra_body.thinking``                   → ``{"type": "disabled"}`` / ``False``
     * ``extra_body.reasoning``                  → ``enabled=False, effort="none"``
+    * ``extra_body.user`` / top-level ``user``  → ``think=off`` segment (Haro→thinkcap)
     * top-level ``reasoning_effort``            → ``"low"``
+
+    The ``user`` rewrite is the one that matters on Haro's production path
+    (hermes → bifrost → thinkcap → vLLM): bifrost DROPS unknown fields, so
+    ``thinking_token_budget`` / ``chat_template_kwargs`` never reach the model,
+    while ``user`` — a standard OpenAI field — does, and thinkcap turns its
+    ``think=off`` segment into a real template-level thinking switch.  The other
+    knobs are kept because flipping them costs nothing on routes that do read them.
 
     ``reasoning_effort`` is lowered rather than set to ``"none"``: ``"low"`` is
     accepted by every route that accepts the field at all, and this retry must
@@ -341,6 +384,15 @@ def apply_thinking_off(api_kwargs):
             extra["reasoning"].update({"enabled": False, "effort": "none"})
             extra["reasoning"].pop("max_tokens", None)
             switches.append("extra_body.reasoning=disabled")
+        new_user = _haro_user_thinking_off(extra.get("user"))
+        if new_user is not None:
+            extra["user"] = new_user
+            switches.append("user.think=off")
+    new_top_user = _haro_user_thinking_off(out.get("user"))
+    if new_top_user is not None:
+        out["user"] = new_top_user
+        if "user.think=off" not in switches:
+            switches.append("user.think=off")
     if out.get("reasoning_effort") not in (None, "", "low", "none", "minimal"):
         out["reasoning_effort"] = "low"
         switches.append("reasoning_effort=low")

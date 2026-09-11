@@ -265,6 +265,37 @@ class TestApplyThinkingOff:
         assert rg.apply_thinking_off({"reasoning_effort": "low"}) is None
         assert rg.apply_thinking_off(None) is None
 
+    @pytest.mark.parametrize("value, expected", [
+        # bifrost drops thinking_token_budget / chat_template_kwargs; `user` is the
+        # standard field that survives to thinkcap, so this is the real switch.
+        ("haro;bot=b8ba5f7a;think=budget:6000", "haro;bot=b8ba5f7a;think=off"),
+        ("haro;bot=b8ba5f7a;think=inherit", "haro;bot=b8ba5f7a;think=off"),
+        ("haro;bot=b8ba5f7a", "haro;bot=b8ba5f7a;think=off"),
+    ])
+    def test_haro_user_field_is_switched_to_think_off(self, value, expected):
+        out, switches = rg.apply_thinking_off({"extra_body": {"user": value}})
+        assert out["extra_body"]["user"] == expected
+        assert "user.think=off" in switches
+
+    @pytest.mark.parametrize("value, expected", [
+        ("haro;bot=b8ba5f7a;think=budget:6000", "haro;bot=b8ba5f7a;think=off"),
+        ("haro;bot=b8ba5f7a;think=inherit", "haro;bot=b8ba5f7a;think=off"),
+        ("haro;bot=b8ba5f7a", "haro;bot=b8ba5f7a;think=off"),
+    ])
+    def test_top_level_user_field_is_switched_too(self, value, expected):
+        out, switches = rg.apply_thinking_off({"user": value})
+        assert out["user"] == expected
+        assert switches == ["user.think=off"]
+
+    def test_non_haro_user_field_is_left_alone(self):
+        # Another deployment's `user` is an opaque identifier — rewriting it would
+        # corrupt whatever routing/quota it carries.
+        assert rg.apply_thinking_off({"user": "u-12345"}) is None
+        assert rg.apply_thinking_off({"extra_body": {"user": "u-12345"}}) is None
+
+    def test_user_already_off_is_not_counted_as_a_switch(self):
+        assert rg.apply_thinking_off({"user": "haro;bot=b8ba5f7a;think=off"}) is None
+
     def test_the_env_switch_gates_the_retry(self, monkeypatch):
         assert rg.reasoning_retry_enabled() is True
         for off in ("0", "false", "no", "off"):
