@@ -252,3 +252,148 @@ def normalized_line_loop_detected(text: str, **kwargs) -> bool:
     """Post-hoc form of :class:`NormalizedLineLoopDetector` over whole ``text``."""
     detector = NormalizedLineLoopDetector(**kwargs)
     return detector.feed(text if isinstance(text, str) else "") or detector.feed("\n")
+
+
+# ── Reasoning-loop retry (SRE fork, 2026-09-11) ────────────────────────
+# A loop inside the REASONING stream is not evidence that the model cannot
+# answer: 2026-09-11 saw four aborted turns in one WeCom session and a stable
+# 3/3 abort on 「写 50 字英文自我介绍」 — a request the same model answers fine
+# with thinking off.  Master verdict B: on a reasoning-stream trip, stop
+# consuming the stream (cancel it upstream) and re-issue the SAME request once
+# with thinking switched off, instead of ending the turn.  The CONTENT stream
+# keeps aborting — a loop in the delivered answer is not fixable by a retry.
+#
+# Scheme A (chosen): resend with the request's own thinking switch flipped off.
+# Scheme B — discard the reasoning and continue the SAME stream by prefilling
+# ``</think>`` — was rejected: the fork's wire is OpenAI chat-completions via
+# bifrost, which exposes no prefill/continuation of an in-flight assistant turn,
+# so it would mean injecting a fake assistant message and hoping the template
+# glues it back — unreproducible across providers and silently corrupting the
+# stored transcript.  A is one clean extra request on a path that already cost
+# the user the whole turn.
+
+
+def reasoning_retry_enabled() -> bool:
+    """False when ``HERMES_REPETITION_REASONING_RETRY`` is set to a falsey value."""
+    import os
+
+    raw = os.environ.get("HERMES_REPETITION_REASONING_RETRY", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+#: Haro writes its per-bot routing hints into the OpenAI-standard ``user`` field,
+#: e.g. ``haro;bot=b8ba5f7a;think=budget:6000`` (or ``think=inherit``).  Only the
+#: ``haro;`` prefix is ours to rewrite — any other deployment's ``user`` value is
+#: an opaque identifier and must be left alone.
+_HARO_USER_PREFIX = "haro;"
+
+
+def _haro_user_thinking_off(value):
+    """Rewrite a Haro ``user`` routing string so it asks thinkcap for ``think=off``.
+
+    Returns the new value, or ``None`` when there is nothing to change (not a
+    string, not a ``haro;`` value, or already ``think=off``).
+
+    This is the switch that actually REACHES vLLM on the production path
+    hermes → bifrost → thinkcap → vLLM: bifrost drops request fields it does not
+    know (``thinking_token_budget``, ``chat_template_kwargs``), so those knobs
+    never leave the gateway.  ``user`` is a standard OpenAI field, so it survives,
+    and thinkcap's ``parse_user_field`` reads ``think=<off|inherit|budget:N>`` out
+    of it — ``off`` being the value that strips the budget and injects
+    ``chat_template_kwargs.enable_thinking=false`` downstream.
+    """
+    if not isinstance(value, str) or not value.startswith(_HARO_USER_PREFIX):
+        return None
+    segments = value.split(";")
+    found = False
+    for i, seg in enumerate(segments):
+        if seg.strip().startswith("think="):
+            segments[i] = "think=off"
+            found = True
+    if not found:
+        segments.append("think=off")
+    new_value = ";".join(segments)
+    return new_value if new_value != value else None
+
+
+def apply_thinking_off(api_kwargs):
+    """``(kwargs_copy, [switch names])`` with every thinking knob the request
+    already carries turned off — or ``None`` when it carries none.
+
+    Deliberately only touches knobs ALREADY present on the wire.  Inventing a
+    provider-specific field (``extra_body.enable_thinking`` on OpenAI, say) buys
+    a 400 on the retry, which is strictly worse than the abort notice it was
+    meant to replace.  The one inference made is within the vLLM family: a
+    request carrying ``thinking_token_budget`` is talking to a vLLM/Qwen route,
+    where ``chat_template_kwargs.enable_thinking`` is the switch that actually
+    stops the template from opening a ``<think>`` block, so both are set.
+
+    Known knobs, in the shapes this fork's providers use:
+
+    * ``extra_body.thinking_token_budget``      → ``0``   (vLLM Qwen, Haro's path)
+    * ``extra_body.chat_template_kwargs.enable_thinking`` → ``False`` (vLLM)
+    * ``extra_body.enable_thinking``            → ``False`` (custom OpenAI-compat)
+    * ``extra_body.think``                      → ``False`` (Ollama)
+    * ``extra_body.thinking``                   → ``{"type": "disabled"}`` / ``False``
+    * ``extra_body.reasoning``                  → ``enabled=False, effort="none"``
+    * ``extra_body.user`` / top-level ``user``  → ``think=off`` segment (Haro→thinkcap)
+    * top-level ``reasoning_effort``            → ``"low"``
+
+    The ``user`` rewrite is the one that matters on Haro's production path
+    (hermes → bifrost → thinkcap → vLLM): bifrost DROPS unknown fields, so
+    ``thinking_token_budget`` / ``chat_template_kwargs`` never reach the model,
+    while ``user`` — a standard OpenAI field — does, and thinkcap turns its
+    ``think=off`` segment into a real template-level thinking switch.  The other
+    knobs are kept because flipping them costs nothing on routes that do read them.
+
+    ``reasoning_effort`` is lowered rather than set to ``"none"``: ``"low"`` is
+    accepted by every route that accepts the field at all, and this retry must
+    not itself become a 400.
+    """
+    import copy
+
+    if not isinstance(api_kwargs, dict):
+        return None
+    out = copy.deepcopy(api_kwargs)
+    switches: list[str] = []
+    extra = out.get("extra_body")
+    if isinstance(extra, dict):
+        if "thinking_token_budget" in extra:
+            extra["thinking_token_budget"] = 0
+            switches.append("extra_body.thinking_token_budget=0")
+            ctk = extra.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = extra["chat_template_kwargs"] = {}
+            if ctk.get("enable_thinking") is not False:
+                ctk["enable_thinking"] = False
+                switches.append("extra_body.chat_template_kwargs.enable_thinking=False")
+        elif isinstance(extra.get("chat_template_kwargs"), dict) and \
+                "enable_thinking" in extra["chat_template_kwargs"]:
+            extra["chat_template_kwargs"]["enable_thinking"] = False
+            switches.append("extra_body.chat_template_kwargs.enable_thinking=False")
+        if "enable_thinking" in extra:
+            extra["enable_thinking"] = False
+            switches.append("extra_body.enable_thinking=False")
+        if "think" in extra:
+            extra["think"] = False
+            switches.append("extra_body.think=False")
+        if "thinking" in extra:
+            extra["thinking"] = {"type": "disabled"} if isinstance(extra["thinking"], dict) else False
+            switches.append("extra_body.thinking=off")
+        if isinstance(extra.get("reasoning"), dict):
+            extra["reasoning"].update({"enabled": False, "effort": "none"})
+            extra["reasoning"].pop("max_tokens", None)
+            switches.append("extra_body.reasoning=disabled")
+        new_user = _haro_user_thinking_off(extra.get("user"))
+        if new_user is not None:
+            extra["user"] = new_user
+            switches.append("user.think=off")
+    new_top_user = _haro_user_thinking_off(out.get("user"))
+    if new_top_user is not None:
+        out["user"] = new_top_user
+        if "user.think=off" not in switches:
+            switches.append("user.think=off")
+    if out.get("reasoning_effort") not in (None, "", "low", "none", "minimal"):
+        out["reasoning_effort"] = "low"
+        switches.append("reasoning_effort=low")
+    return (out, switches) if switches else None

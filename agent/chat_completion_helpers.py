@@ -44,6 +44,8 @@ from agent.repetition_guard import (
     STREAM_CHECK_INTERVAL as _REP_CHECK_INTERVAL,
     STREAM_TAIL_WINDOW as _REP_TAIL_WINDOW,
     NormalizedLineLoopDetector,
+    apply_thinking_off,
+    reasoning_retry_enabled,
     stream_repetition_guard_enabled,
     tail_repetition_detected,
 )
@@ -2541,6 +2543,9 @@ class _StreamingCall(StreamingWaitMonitor):
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
+        # idcsre patch — at most ONE thinking-off retry per call after a reasoning-stream
+        # repetition trip (see ``_retry_after_reasoning_loop``).
+        self._reasoning_retry_used = False
 
     # ── shared small helpers ────────────────────────────────────────────
 
@@ -2784,7 +2789,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # burns the whole output budget (and minutes of wall clock) before the truncation handler
         # ever runs; qwen3-style models can spend 16k tokens on one repeated paragraph.
         _rep_guard_on = stream_repetition_guard_enabled()
-        _rep_guard_state = {"aborted": False, "kind": "", "reasoning_chars": 0, "content_chars": 0,
+        _rep_guard_state = {"aborted": False, "kind": "", "probe": "", "reasoning_chars": 0, "content_chars": 0,
                             # Raw characters seen per stream — the verbatim probe's
                             # STREAM_MIN_REPLY_CHARS floor is about the whole reply, not
                             # about the trailing window handed to it.
@@ -2869,6 +2874,7 @@ class _StreamingCall(StreamingWaitMonitor):
             """Close the stream and mark the attempt as a repetition abort."""
             _rep_guard_state["aborted"] = True
             _rep_guard_state["kind"] = kind
+            _rep_guard_state["probe"] = probe
             logger.warning(
                 "Repetition guard tripped on %s stream via the %s probe (session=%s model=%s); "
                 "aborting the request instead of burning the output budget. "
@@ -2999,6 +3005,17 @@ class _StreamingCall(StreamingWaitMonitor):
                 finish_reason = "stop"
                 _rep_guard_state["aborted"] = False
 
+        # idcsre patch (master verdict B) — a loop in the REASONING stream is not a
+        # dead turn: the stream is already cancelled above, so re-ask once with thinking
+        # switched off and deliver the body.  Only when this attempt produced nothing
+        # visible yet (no content deltas, no tool call): re-streaming would duplicate it.
+        if (_rep_guard_state["aborted"] and _rep_guard_state["kind"] == "reasoning"
+                and not content_parts and not tool_calls_acc):
+            _retry_response = self._retry_after_reasoning_loop(
+                _rep_guard_state["probe"], _rep_guard_state["reasoning_total"])
+            if _retry_response is not None:
+                return _retry_response
+
         if _rep_guard_state["aborted"]:
             # idcsre patch: report it as an output-length truncation so the existing
             # finish_reason == "length" handling in the turn loop owns the turn; the marker stamped
@@ -3021,6 +3038,50 @@ class _StreamingCall(StreamingWaitMonitor):
             with contextlib.suppress(Exception):
                 _response._leak_redacted = "+".join(_leak_guard.rules)
         return _response
+
+    def _retry_after_reasoning_loop(self, probe: str, chars: int):
+        """idcsre patch — one thinking-off re-ask after a reasoning-stream loop.
+
+        Returns the retry's response, or ``None`` to keep the historical behaviour
+        (turn aborted with the repetition notice): the switch is off, the retry was
+        already spent, the request carries no thinking knob we can safely flip, or
+        the retry looped again.
+
+        The burnt first attempt is charged to ``session_api_calls`` — it really was a
+        provider request — and the retry's own response is counted by the turn loop
+        as usual.  Nothing is written to ``replyguard.jsonl``: that log belongs to the
+        outbound reply guard, and this never touches delivered text.
+        """
+        if self._reasoning_retry_used:
+            return None
+        if not reasoning_retry_enabled():
+            logger.info("Repetition guard: reasoning loop detected but HERMES_REPETITION_REASONING_RETRY "
+                        "is off; aborting the turn as before.")
+            return None
+        switched = apply_thinking_off(self.api_kwargs)
+        if switched is None:
+            logger.warning(
+                "Repetition guard: reasoning loop detected (probe=%s, chars=%s) but the request carries no "
+                "thinking switch to turn off; aborting the turn as before.", probe, chars)
+            return None
+        retry_kwargs, switches = switched
+        self._reasoning_retry_used = True
+        logger.warning(
+            "Repetition guard: reasoning loop detected (probe=%s, chars=%s) — retrying once with thinking "
+            "disabled (action=reasoning_retry switches=%s session=%s model=%s). "
+            "Set HERMES_REPETITION_REASONING_RETRY=0 to abort instead.",
+            probe, chars, ",".join(switches), getattr(self.agent, "session_id", None),
+            getattr(self.agent, "model", None))
+        with contextlib.suppress(Exception):
+            # The aborted attempt was a real provider call; the retry's response is
+            # counted by record_response_usage like any other.
+            self.agent.session_api_calls = int(getattr(self.agent, "session_api_calls", 0)) + 1
+        self.api_kwargs = retry_kwargs
+        response = self._call_chat_completions(self._start_stream_attempt())
+        looped_again = bool(getattr(response, "_repetition_aborted", False))
+        logger.warning("Repetition guard: reasoning_retry finished (action=reasoning_retry outcome=%s).",
+                       "still_looping" if looped_again else "delivered")
+        return response
 
     def _adopt_final_response(self, final_response):
         """Adapter returned a completed response for ``stream=True``: switch the
