@@ -45,6 +45,44 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
     re.MULTILINE,
 )
+def _begin_fingerprint_sources() -> None:
+    """Start a fresh whitelist collection for the outbound guard.  Never raises."""
+    try:
+        from agent.leak_fingerprints import begin_fingerprint_sources
+
+        begin_fingerprint_sources()
+    except Exception:  # noqa: BLE001 - the guard must never break a build
+        logger.debug("fingerprint source collection could not be started", exc_info=True)
+
+
+def _note_fingerprint_sources(kind: str, text: Optional[str]) -> None:
+    """Register one whitelisted static segment (``soul`` / ``answer_rules`` /
+    ``skills``) with the outbound guard.  Pass the POST-scrub bytes — the digest
+    must match what the model is actually holding.  Never raises."""
+    try:
+        from agent.leak_fingerprints import note_fingerprint_sources
+
+        note_fingerprint_sources(kind, text)
+    except Exception:  # noqa: BLE001
+        logger.debug("fingerprint source %s could not be registered", kind, exc_info=True)
+
+
+def _skills_rule_text(skills_prompt: Optional[str]) -> str:
+    """The listed/inlined SKILL.md body inside the skills index, or ``""``.
+
+    Only the ``<available_skills>`` band: the framing around it ("Before
+    replying, scan the skills below…") is upstream hermes' generic English
+    guidance, which the whitelist deliberately leaves unprotected."""
+    try:
+        from agent.leak_fingerprints import SKILLS_BLOCK_CLOSE, SKILLS_BLOCK_OPEN
+    except Exception:  # noqa: BLE001
+        return ""
+    if not skills_prompt or SKILLS_BLOCK_OPEN not in skills_prompt:
+        return ""
+    body = skills_prompt.split(SKILLS_BLOCK_OPEN, 1)[1]
+    return body.split(SKILLS_BLOCK_CLOSE, 1)[0] if SKILLS_BLOCK_CLOSE in body else body
+
+
 def _prompt_section_enabled(env_name: str) -> bool:
     """idcsre patch: operator switch for an optional built-in prompt section (default on)."""
     return os.environ.get(env_name, "1").strip().lower() not in ("0", "false", "off", "no")
@@ -657,6 +695,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     shared context file can remain in the longest common prefix across worktrees.
     Never re-rendered mid-session."""
     # Model context window scales the context-file caps; stable per conversation.
+    # idcsre patch — outbound guard (2026-09-11, P0): the self digest is built from a
+    # WHITELIST of static segments this function registers explicitly (SOUL, answer
+    # rules / identity rule line, skill bodies), never from the assembled prompt as a
+    # whole — the prompt also carries MEMORY, fact_store, the A2A roster, summaries and
+    # the runtime footer, and those exist to be said out loud.  Collection is per-build,
+    # so a segment that leaves the prompt stops being protected on the next build.
+    _begin_fingerprint_sources()
     _cc_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
@@ -673,7 +718,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # sentence must never convict a reply.  See agent/identity_config.note_active_identity.
     note_active_identity(_identity)
     _identity_prefix = build_identity_prompt(_identity) if _identity else ""
+    # idcsre patch — whitelist source #2 (answer_rules): the injected identity block.  It is
+    # never scrubbed (it must keep the literal vendor names), so it is registered verbatim; its
+    # 答复句 is dropped again on the guard side by ``strip_identity_segment`` (裁定 B).
+    _note_fingerprint_sources("answer_rules", _identity_prefix)
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len, _identity)
+    # idcsre patch — whitelist source #1 (soul): SOUL.md (Haro writes the bot's answer rules into
+    # it) or the built-in persona segment.  Registered AFTER the vendor scrub below, which is the
+    # form that reaches the model; the pre-scrub text is kept here only to be scrubbed once.
+    _soul_text = _join_tier(list(stable_parts))
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
@@ -723,8 +776,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # text (``system_message``), context files, memory entries, USER.md and plugin sections stay
     # verbatim.  Ordering is byte-identical to the unconfigured build.
     _vscrub = (lambda t: scrub_vendor_names(t, _identity)) if _identity is not None else None
+    _skills_block = _vscrub(skills_prompt) if (_vscrub and skills_prompt) else skills_prompt
+    # idcsre patch — whitelist sources #1 and #3 for the outbound guard, in the exact bytes the
+    # model receives (post-scrub).  Memory, the external-memory block, plugin sections, the
+    # timestamp line and the runtime environment block that follow are NOT registered: they are
+    # runtime state the bot is supposed to be able to talk about (2026-09-11 P0).
+    _note_fingerprint_sources("soul", _vscrub(_soul_text) if (_vscrub and _soul_text) else _soul_text)
+    _note_fingerprint_sources("skills", _skills_rule_text(_skills_block))
     volatile_parts: List[str] = [
-        _vscrub(skills_prompt) if (_vscrub and skills_prompt) else skills_prompt,
+        _skills_block,
         *_memory_parts(agent, scrub=_vscrub),
     ]
     # Plugin sections are confined to one coarse anchor in the volatile tail so

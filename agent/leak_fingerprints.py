@@ -74,16 +74,24 @@ generator functions are untouched: they are the byte-for-byte contract with the
 Go side, and a window that is never looked up can never match anyway.
 
 SECOND SOURCE: the container's own prompt.  Haro's digest only covers what Haro
-pushed — answer rules, identity, status phrases, bound skills.  The SOUL block,
-the role rules and the tool briefs are baked into the hermes image and never
-travel through Haro at all, which is precisely what a maintainer bot has to
-lose.  So :func:`register_system_prompt` runs the same algorithm over the system
-prompt the container just assembled, keeps the result in RAM (never on disk,
-neither the text nor the hashes), and :func:`combined_store` matches against the
-UNION of the two.  It is cached by the prompt's sha256, so an identity patch or
-a post-compression rebuild re-arms the gate on the new bytes and disarms it on
-the old.  ``HERMES_GUARD_SELF_FINGERPRINT=0`` turns the half off; with no Haro
-file at all, it is the only protection there is.
+pushed — answer rules, identity, status phrases, bound skills.  The SOUL block
+and the answer rules baked into the hermes image never travel through Haro at
+all, which is precisely what a maintainer bot has to lose.  So
+:func:`register_system_prompt` runs the same algorithm over the static segments
+the assembly registered, keeps the result in RAM (never on disk, neither the
+text nor the hashes), and :func:`combined_store` matches against the UNION of
+the two.  It is cached by the prompt's sha256, so an identity patch or a
+post-compression rebuild re-arms the gate on the new bytes and disarms it on the
+old.  ``HERMES_GUARD_SELF_FINGERPRINT=0`` turns the half off; with no Haro file
+at all, it is the only protection there is.
+
+WHAT THE SELF DIGEST COVERS IS A WHITELIST (2026-09-11, P0).  Fingerprinting the
+whole assembled prompt also protected the runtime bands that exist to be spoken:
+MEMORY entries the user taught the bot, the fact_store banner, the A2A roster,
+session summaries, the runtime environment block.  A real user asked the bot to
+repeat a rule they had taught it and the reply was redacted as ``source=self``.
+Only ``soul`` / ``answer_rules`` / ``skills`` are registered now — see
+:data:`SELF_SOURCE_KINDS` and :func:`note_fingerprint_sources`.
 """
 
 from __future__ import annotations
@@ -658,14 +666,20 @@ def self_fingerprints_enabled() -> bool:
 class SelfFingerprints:
     """One prompt's in-memory digest, tagged with the prompt hash it came from."""
 
-    __slots__ = ("prompt_hash", "lines", "ngrams")
+    __slots__ = ("prompt_hash", "lines", "ngrams", "sources")
 
     def __init__(
-        self, prompt_hash: str, lines: frozenset[str], ngrams: frozenset[str]
+        self,
+        prompt_hash: str,
+        lines: frozenset[str],
+        ngrams: frozenset[str],
+        sources: tuple = (),
     ) -> None:
         self.prompt_hash = prompt_hash
         self.lines = lines
         self.ngrams = ngrams
+        #: Which whitelisted kinds contributed (``("soul", "answer_rules", …)``).
+        self.sources = tuple(sources)
 
     @property
     def empty(self) -> bool:
@@ -822,16 +836,169 @@ def clear_identity_whitelist() -> None:
         globals()["_IDENTITY_WL"] = None
 
 
+# ── WHITELIST: only three kinds of prompt text are ever self-fingerprinted ──
+# 2026-09-11, P0.  Fingerprinting the WHOLE assembled prompt protected every
+# runtime block the prompt happens to carry, and those blocks exist to be said
+# out loud: the MEMORY band (rules a user taught the bot with "学习一下", names
+# and phone numbers included), the fact_store banner, the A2A roster (other
+# bots' display names), the session summary, the runtime environment footer.
+# A real user asked the bot to repeat a rule they had taught it; the bot did,
+# and the gate redacted it as ``source=self hits=4``.
+#
+# So the self digest is built from an explicit WHITELIST of static segments —
+# the ones baked into the image or pushed by Haro, i.e. the text a maintainer
+# bot must never recite:
+#
+#   * ``soul``         -- SOUL.md / the built-in persona segment;
+#   * ``answer_rules`` -- Haro's answer rules (written into config/SOUL) and the
+#                         injected identity RULE line (the 答复句 is stripped by
+#                         :func:`strip_identity_segment`, 裁定 B);
+#   * ``skills``       -- the listed/inlined SKILL.md body.
+#
+# Everything else is OUT, deliberately: memory injections, fact_store, roster,
+# session/compression summaries, the runtime environment block, and the generic
+# English tool/skill guidance of upstream hermes (Haro's digest does not cover
+# it either — reciting a generic English brief is not the leak we are defending
+# against).  The assembly sites call :func:`note_fingerprint_sources` with the
+# exact bytes they inject; :func:`register_system_prompt` then fingerprints the
+# concatenation of THOSE, never the prompt as a whole.
+SELF_SOURCE_KINDS = ("soul", "answer_rules", "skills")
+
+#: Markers used by the extraction fallback (no registration ran: a prompt
+#: restored verbatim from the session DB in a fresh process).
+SKILLS_BLOCK_OPEN = "<available_skills>"
+SKILLS_BLOCK_CLOSE = "</available_skills>"
+SOUL_BASENAME = "SOUL.md"
+
+_SOURCES_LOCK = threading.Lock()
+_SOURCES: dict[str, str] = {}
+
+
+def begin_fingerprint_sources() -> None:
+    """Start a fresh collection — called at the top of a prompt assembly.
+
+    Sources are per-build: a segment that has left the prompt (SOUL removed,
+    skills index emptied) must stop being protected on the very next build.
+    """
+    with _SOURCES_LOCK:
+        _SOURCES.clear()
+
+
+def note_fingerprint_sources(kind: str, text: Optional[str]) -> None:
+    """Register one static segment of the prompt being assembled.
+
+    ``kind`` must be one of :data:`SELF_SOURCE_KINDS`; anything else is dropped
+    (a typo must never silently widen the whitelist).  Pass the bytes that
+    actually reach the model — i.e. AFTER the vendor scrub — or the digest will
+    not match the prompt the model is holding.  Never raises.
+    """
+    try:
+        if kind not in SELF_SOURCE_KINDS:
+            logger.debug("ignoring fingerprint source of unknown kind %r", kind)
+            return
+        if not isinstance(text, str) or not text.strip():
+            return
+        with _SOURCES_LOCK:
+            _SOURCES[kind] = text
+    except Exception:  # noqa: BLE001 - the guard must never break a turn
+        logger.debug("fingerprint source registration failed", exc_info=True)
+
+
+def fingerprint_sources() -> dict:
+    """Copy of what the current build registered (``kind -> text``)."""
+    with _SOURCES_LOCK:
+        return dict(_SOURCES)
+
+
+def clear_fingerprint_sources() -> None:
+    """Drop every registered source (process teardown; tests)."""
+    begin_fingerprint_sources()
+
+
+def _soul_from_disk() -> str:
+    """``$HERMES_HOME/SOUL.md`` as text, or ``""``.  Never raises.
+
+    Only used by the extraction fallback below, and only ever intersected with
+    the prompt's own lines, so reading the wrong profile's SOUL.md can widen
+    nothing.
+    """
+    try:
+        home = os.environ.get("HERMES_HOME")
+        if not home:
+            import hermes_constants
+
+            home = str(hermes_constants.get_hermes_home())
+        path = os.path.join(home, SOUL_BASENAME)
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def extract_static_segments(text: str) -> dict:
+    """Whitelist segments recovered from an assembled prompt, by marker.
+
+    The fallback for the one path that never runs an assembly: a fresh process
+    that restores the prompt bytes verbatim from the session DB.  It EXTRACTS
+    the three whitelisted kinds rather than excluding the runtime bands, so an
+    unrecognized block is left unprotected (fail-open), never protected.
+    """
+    segments: dict = {}
+    lines = text.split("\n")
+    try:
+        from agent.identity_config import IDENTITY_RULE_PREFIX
+    except Exception:  # noqa: BLE001
+        IDENTITY_RULE_PREFIX = None
+    if IDENTITY_RULE_PREFIX:
+        rules = [line for line in lines if line.lstrip().startswith(IDENTITY_RULE_PREFIX)]
+        if rules:
+            segments["answer_rules"] = "\n".join(rules)
+    if SKILLS_BLOCK_OPEN in text and SKILLS_BLOCK_CLOSE in text:
+        body = text.split(SKILLS_BLOCK_OPEN, 1)[1].split(SKILLS_BLOCK_CLOSE, 1)[0]
+        if body.strip():
+            segments["skills"] = body
+    soul = _soul_from_disk()
+    if soul.strip():
+        segments["soul"] = soul
+    return segments
+
+
+def _whitelisted_body(text: str, sources: dict) -> str:
+    """The registered segments, restricted to lines the prompt actually carries.
+
+    Two jobs.  It keeps a stale registration (a build for another session, an
+    old SOUL.md read by the fallback) from protecting text that is NOT in front
+    of the model, and it makes the invariant checkable: the self digest is
+    always a subset of the prompt's own lines.
+    """
+    present = frozenset(normalize_lines(text))
+    kept: list[str] = []
+    for kind in SELF_SOURCE_KINDS:
+        segment = sources.get(kind)
+        if not segment:
+            continue
+        for raw in segment.split("\n"):
+            normalized = normalize_line(unicodedata.normalize("NFKC", raw))
+            kept.append(raw if (not normalized or normalized in present) else "")
+    return "\n".join(kept)
+
+
 _SELF_LOCK = threading.Lock()
 _SELF: Optional[SelfFingerprints] = None
 
 
 def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
-    """Fingerprint the assembled system prompt; cached by its sha256.
+    """Fingerprint the WHITELISTED static segments of the assembled prompt.
+
+    Cached by the sha256 of the FULL prompt (not of the static text): the
+    prompt hash turns over on every rebuild, which is exactly when the
+    registered segments are refreshed, and it keeps the memo honest when two
+    different prompts happen to share their static half.
 
     Cheap to call on every turn: an unchanged prompt costs one hash of the
-    prompt bytes and returns the cached digest.  Logs the counts and the first
-    eight hex of the prompt hash — never a byte of the prompt itself.
+    prompt bytes and returns the cached digest.  Logs the counts, the kinds
+    that contributed and the first eight hex of the prompt hash — never a byte
+    of the prompt itself.
     """
     if not self_fingerprints_enabled():
         return None
@@ -841,11 +1008,15 @@ def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
     current = _SELF
     if current is not None and current.prompt_hash == prompt_hash:
         return current
-    # The identity segment is excluded before anything is hashed: it is the text
-    # the model is ORDERED to say, so protecting it convicts obedience (red item
-    # B, 2026-09-11).  Keyed by the hash of the ORIGINAL prompt, so the memo
-    # still turns over exactly when the prompt does.
-    body = strip_identity_segment(text)
+    sources = fingerprint_sources()
+    # No assembly ran (prompt restored verbatim from the session DB in a fresh
+    # process): recover the same three kinds from the bytes by their markers.
+    if not sources:
+        sources = extract_static_segments(text)
+    # The identity segment's 答复句 is excluded before anything is hashed: it is
+    # the text the model is ORDERED to say, so protecting it convicts obedience
+    # (red item B, 2026-09-11).  The rule line around it stays (裁定 B).
+    body = strip_identity_segment(_whitelisted_body(text, sources))
     digest = SelfFingerprints(
         prompt_hash,
         # Same §6 v2 build as the generator — the two halves of the union must
@@ -853,12 +1024,14 @@ def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
         # would disagree about what counts as protected.
         frozenset(line_fingerprints(body, FORMAT_VERSION)),
         frozenset(ngram_fingerprints(body, FORMAT_VERSION)),
+        tuple(kind for kind in SELF_SOURCE_KINDS if sources.get(kind)),
     )
     with _SELF_LOCK:
         globals()["_SELF"] = digest
     logger.info(
-        "Reply guard: self fingerprints: %d lines / %d ngrams (prompt %s)",
-        len(digest.lines), len(digest.ngrams), prompt_hash[:8],
+        "Reply guard: self fingerprints: %d lines / %d ngrams sources=%s (prompt %s)",
+        len(digest.lines), len(digest.ngrams),
+        ",".join(digest.sources) or "none", prompt_hash[:8],
     )
     return digest
 
@@ -872,9 +1045,10 @@ def self_fingerprints() -> Optional[SelfFingerprints]:
 
 
 def clear_self_fingerprints() -> None:
-    """Drop the cached self digest (process teardown; tests)."""
+    """Drop the cached self digest and the registered sources (teardown; tests)."""
     with _SELF_LOCK:
         globals()["_SELF"] = None
+    clear_fingerprint_sources()
 
 
 def note_system_prompt(text: Optional[str]) -> None:

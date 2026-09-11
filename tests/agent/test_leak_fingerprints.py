@@ -544,7 +544,7 @@ def test_the_self_digest_drops_paths_and_identifiers():
 
 def test_a_self_fingerprinted_prompt_does_not_redact_a_cited_path(home):
     """End to end on the self half: the bot cites its own skill path and lives."""
-    fp.register_system_prompt(SKILL_LIKE_PROMPT)
+    _arm_self(SKILL_LIKE_PROMPT)
     guard, emitted = _replay_through_guard(CITED_PATH_REPLY + "\n")
     assert guard.convicted is False
     assert emitted == CITED_PATH_REPLY + "\n"
@@ -569,6 +569,17 @@ SOUL_BLOCK = (
 SOUL_LINE = "你是 Haro 运维助手的灵魂设定：先确认故障面，再动手，绝不擅自重启生产服务。"
 HARO_ONLY_PROMPT = "作答规则：回答保持简短，禁止把用户的问题再复述一遍给用户听。\n"
 HARO_ONLY_LINE = "作答规则：回答保持简短，禁止把用户的问题再复述一遍给用户听。"
+
+
+def _arm_self(prompt, **kinds):
+    """Register the whitelisted segments a synthetic prompt stands for, then
+    fingerprint it — the contract the real assembly follows since the 2026-09-11
+    P0 (the prompt as a whole is never fingerprinted any more).  With no ``kinds``
+    the whole text counts as the SOUL block."""
+    fp.begin_fingerprint_sources()
+    for kind, text in (kinds or {"soul": prompt}).items():
+        fp.note_fingerprint_sources(kind, text)
+    return fp.register_system_prompt(prompt)
 
 
 @pytest.fixture()
@@ -604,7 +615,7 @@ def _replay_through_guard(text):
 def test_the_self_digest_catches_a_soul_recital_with_no_haro_file(home, reports):
     """No digest was ever pushed, and the SOUL block is still protected."""
     assert fp.store().empty is True  # nothing from Haro
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
 
     guard, emitted = _replay_through_guard(f"当然可以，我的设定是这样的：\n{SOUL_LINE}\n")
     assert guard.convicted is True
@@ -621,7 +632,7 @@ def test_the_self_digest_catches_a_soul_recital_with_no_haro_file(home, reports)
 
 def test_short_prompt_lines_are_not_registered_by_the_self_digest(home):
     """「好的」/「收到」 live in the prompt too and must never arm the gate."""
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     tripped, hits = fp.scan_text("好的\n收到\n", fp.combined_store())
     assert (tripped, hits) == (False, 0)
 
@@ -629,7 +640,7 @@ def test_short_prompt_lines_are_not_registered_by_the_self_digest(home):
 def test_the_gate_matches_the_union_of_both_digests(home, reports):
     """A Haro-only line and a self-only line each convict, correctly attributed."""
     _install(home, HARO_ONLY_PROMPT)
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     combined = fp.combined_store()
     assert combined.haro_lines and combined.self_lines
     assert not (combined.haro_lines & combined.self_lines)
@@ -650,7 +661,7 @@ def test_a_reply_spanning_both_digests_is_reported_as_both(home, reports):
     the Haro line first never gets far enough to spill the SOUL one.
     """
     _install(home, HARO_ONLY_PROMPT)
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     guard = lg.StreamLeakGuard(budget=None, platform="wecom", session="s-self")
     assert guard.on_content_delta(f"{HARO_ONLY_LINE}\n{SOUL_LINE}\n").convicted is True
     assert reports[-1]["source"] == "both"
@@ -659,13 +670,13 @@ def test_a_reply_spanning_both_digests_is_reported_as_both(home, reports):
 def test_the_self_digest_follows_a_prompt_rebuild(home):
     """An identity patch / post-compression rebuild re-arms the gate on the new
     bytes and disarms it on the old ones."""
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     first = fp.self_fingerprints()
     assert fp.scan_text(SOUL_LINE, fp.combined_store())[0] is True
 
     rebuilt = "身份补丁：你现在叫「小助手」，由运维平台团队维护，不要自称 Hermes。\n"
     rebuilt_line = "身份补丁：你现在叫「小助手」，由运维平台团队维护，不要自称 Hermes。"
-    fp.register_system_prompt(rebuilt)
+    _arm_self(rebuilt)
     second = fp.self_fingerprints()
     assert second.prompt_hash != first.prompt_hash
 
@@ -675,15 +686,15 @@ def test_the_self_digest_follows_a_prompt_rebuild(home):
 
 def test_an_unchanged_prompt_is_not_refingerprinted(home):
     """Cached by sha256 — every turn may call the hook, only a change costs."""
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     first = fp.self_fingerprints()
-    assert fp.register_system_prompt(SOUL_BLOCK) is first
+    assert _arm_self(SOUL_BLOCK) is first
     assert fp.self_fingerprints() is first
 
 
 def test_the_env_switch_disables_only_the_self_half(home, monkeypatch):
     _install(home, HARO_ONLY_PROMPT)
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
 
     assert fp.self_fingerprints() is None
@@ -696,7 +707,7 @@ def test_the_env_switch_disables_only_the_self_half(home, monkeypatch):
 
 def test_an_innocent_reply_survives_both_digests(home):
     _install(home, HARO_ONLY_PROMPT)
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     guard, emitted = _replay_through_guard(INNOCENT_REPLY)
     assert guard.convicted is False
     assert emitted == INNOCENT_REPLY
@@ -704,7 +715,7 @@ def test_an_innocent_reply_survives_both_digests(home):
 
 def test_the_self_digest_never_touches_disk(home):
     """Neither the prompt nor its hashes may be written anywhere readable."""
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     digest = fp.self_fingerprints()
     written = [
         path.read_text(encoding="utf-8", errors="ignore")
@@ -725,7 +736,7 @@ def test_generating_a_10k_prompt_digest_stays_cheap(home):
     )
     assert len(prompt) >= 10000
     started = time.perf_counter()
-    fp.register_system_prompt(prompt)
+    _arm_self(prompt)
     assert (time.perf_counter() - started) < 0.25
 
 
@@ -751,8 +762,11 @@ def _prompt_agent(session_db=None, built="BUILT"):
 
 
 def test_a_fresh_build_arms_the_self_digest(home):
+    """No assembly ran here (the build is mocked), so this exercises the marker
+    fallback: SOUL.md off disk, intersected with the prompt's own lines."""
     from agent.conversation_loop import _restore_or_build_system_prompt
 
+    (home / "SOUL.md").write_text(SOUL_BLOCK, encoding="utf-8")
     _restore_or_build_system_prompt(_prompt_agent(built=SOUL_BLOCK), None, [])
     assert fp.scan_text(SOUL_LINE, fp.combined_store())[0] is True
 
@@ -762,6 +776,7 @@ def test_a_prompt_restored_from_the_session_db_arms_it_too(home):
     from unittest.mock import MagicMock
     from agent.conversation_loop import _restore_or_build_system_prompt
 
+    (home / "SOUL.md").write_text(SOUL_BLOCK, encoding="utf-8")
     db = MagicMock()
     db.get_session.return_value = {"system_prompt": SOUL_BLOCK, "api_call_count": 3}
     agent = _prompt_agent(session_db=db, built="SOMETHING ELSE ENTIRELY")
@@ -775,7 +790,7 @@ def test_a_prompt_restored_from_the_session_db_arms_it_too(home):
 def test_the_union_follows_a_haro_digest_reload(home):
     """The memoized union must not outlive either half it was built from."""
     _install(home, HARO_ONLY_PROMPT)
-    fp.register_system_prompt(SOUL_BLOCK)
+    _arm_self(SOUL_BLOCK)
     assert fp.scan_text(HARO_ONLY_LINE, fp.combined_store())[0] is True
 
     replacement = "作答规则已更新：先给结论，再给依据，不要展开无关背景信息。"
@@ -1057,7 +1072,7 @@ def test_the_store_reads_both_format_versions(home):
 
 def test_the_self_digest_is_built_with_the_v2_rules(home):
     prompt = SKILL_LIKE_PROMPT + "```\n围栏里的中文行不该进入自生成指纹集合\n```\n"
-    fp.register_system_prompt(prompt)
+    _arm_self(prompt)
     digest = fp.self_fingerprints()
     assert digest.lines == frozenset(fp.line_fingerprints(prompt, version=2))
     assert digest.ngrams == frozenset(fp.ngram_fingerprints(prompt, version=2))
@@ -1135,7 +1150,7 @@ def test_the_self_digest_excludes_only_the_identity_answer_line(home, monkeypatc
     """Build side, 裁定 B: the 答复句 line is dropped, the 规则行 is kept."""
     _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
     prompt = _identity_prompt() + "\n\n" + SOUL_BLOCK
-    digest = fp.register_system_prompt(prompt)
+    digest = _arm_self(prompt, answer_rules=_identity_prompt(), soul=SOUL_BLOCK)
     assert digest is not None
     intro_line, rule_line = _identity_prompt().split("\n")
 
@@ -1164,7 +1179,7 @@ def test_self_digest_keeps_the_rule_line_yet_the_answer_stays_clean(home, monkey
     _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
     monkeypatch.delenv(fp.SELF_FINGERPRINT_ENV, raising=False)
     prompt = _identity_prompt() + "\n\n" + SOUL_BLOCK
-    fp.register_system_prompt(prompt)
+    _arm_self(prompt, answer_rules=_identity_prompt(), soul=SOUL_BLOCK)
     rule_line = _identity_prompt().split("\n", 1)[1]
 
     # No Haro store installed: the combined store is the self digest alone.
@@ -1266,3 +1281,243 @@ def test_regression_identity_answer_needs_the_whitelist(home, monkeypatch):
     monkeypatch.delenv(fp.IDENTITY_WHITELIST_ENV, raising=False)
     fp.clear_identity_whitelist()
     assert fp.scan_text(answer, fp.store())[0] is False
+
+
+# ── P0 2026-09-11: the self digest is a WHITELIST, not a blacklist ─────
+#
+# Production, real user: the bot had been taught a handful of rules with
+# 「学习一下」 (a product-package rule, a colleague's phone number).  Asked to
+# repeat one, it did — and the gate redacted the reply as
+# ``source=self hits=4``, because the self digest was built from the WHOLE
+# assembled prompt and therefore protected the MEMORY band the user had
+# authored, the fact_store banner, the A2A roster, the runtime footer and the
+# session summaries too.  Those blocks exist to be said out loud.
+#
+# The digest is now built from three registered kinds only — SOUL, answer rules
+# (incl. the injected identity RULE line) and the skill bodies.  The synthetic
+# prompt below is shaped like the production one (fictional names/phones/URLs,
+# company hoshino) and is assembled through the REAL builder, so the assertions
+# below pin the injection points, not a hand-rolled copy of them.
+
+WL_SOUL_LINE = "你是 hoshino IT 小助理的灵魂设定：先确认故障面再动手，绝不擅自重启生产服务。"
+WL_RULES_LINE = "作答规则：先给结论再给依据，回答保持简短，禁止把用户的问题复述一遍。"
+WL_SOUL = f"{WL_SOUL_LINE}\n{WL_RULES_LINE}\n"
+WL_SKILL_LINE = "技能规则：知识库问答必须引用检索到的原文段落，禁止凭记忆编造答案。"
+WL_SKILLS_PROMPT = (
+    "## Skills\n"
+    "Before replying, scan the skills below. If a skill matches, load it first.\n"
+    "<available_skills>\n"
+    "  hoshino-kb-search:\n"
+    f"    - {WL_SKILL_LINE}\n"
+    "</available_skills>\n"
+)
+WL_MEMORY_RULE = "行为规则：申请产品包需到出包平台提交工单，不引导用户去服务台。"
+WL_MEMORY_PHONE = "上海区域网络支持：林墨白，电话 13500000001（用户上轮纠正过）。"
+WL_MEMORY_BLOCK = (
+    "══════════════════════════════════════════════\n"
+    "MEMORY (your personal notes) [42% — 900/2,200 chars]\n"
+    "══════════════════════════════════════════════\n"
+    f"{WL_MEMORY_RULE}\n§\n{WL_MEMORY_PHONE}\n"
+)
+WL_FACT_LINE = "Use fact_store to search, probe entities, or reason across the 20 stored facts."
+WL_FACT_BLOCK = f"# Holographic Memory\nActive. 20 facts stored with entity resolution.\n{WL_FACT_LINE}\n"
+WL_ROSTER_LINE = "- `@hoshino-guan-li-yuan` — on hoshino管理员 — 负责机房与网络设备的日常巡检。"
+WL_ROSTER_BLOCK = f"## Messaging other agents\nYou are `@hermes`. Your teammates:\n{WL_ROSTER_LINE}\n"
+WL_ENV_LINE = "Current working directory: /out/3221d79f-55dd-40ce-aec6-44517f3c32ba"
+WL_ENV_HINTS = f"Host: Linux (6.17.0-1031-nvidia)\nUser home directory: /opt/data\n{WL_ENV_LINE}\n"
+WL_SUMMARY_LINE = "会话摘要：用户上一轮让我记住网络负责人的联系方式，并纠正了一处笔误。"
+WL_IDENT_NAME = "IT 小助理"
+WL_IDENT_CREATOR = "hoshino 科技 Haro 平台"
+
+# What the user actually asked the bot to repeat, and what production redacted.
+WL_MEMORY_REPLY = "已记住：申请产品包需到出包平台提交工单，不引导用户去服务台。"
+WL_PHONE_REPLY = "上海区域网络支持是林墨白，电话 13500000001。"
+
+
+def _wl_agent(monkeypatch):
+    """An agent shaped like a managed wecom bot: memory band, fact_store block,
+    A2A roster, runtime footer, skills index, English tool guidance."""
+    memory_store = SimpleNamespace(
+        format_for_system_prompt=lambda kind: WL_MEMORY_BLOCK if kind == "memory" else "")
+    return SimpleNamespace(
+        load_soul_identity=True, skip_context_files=False,
+        valid_tool_names=["skills_list", "skill_view", "read_file"],
+        _task_completion_guidance=True, _parallel_tool_call_guidance=False,
+        _tool_use_enforcement=False, _execution_guidance=False, _environment_probe=False,
+        _bot_mode_protocol=True, _kanban_worker_guidance="",
+        _memory_store=memory_store, _memory_enabled=True, _user_profile_enabled=False,
+        _memory_manager=SimpleNamespace(build_system_prompt=lambda: WL_FACT_BLOCK),
+        model="", provider="", platform="haro", pass_session_id=False, session_id="s-wl",
+        _session_db=None, _cached_system_prompt=None, _cached_system_prompt_static=None,
+        _use_prompt_caching=False, _platform_hint_overrides=None,
+        _emit_status=lambda *_a, **_k: None,
+    )
+
+
+def _wl_build(monkeypatch):
+    """Assemble the synthetic prompt through the real builder and return it."""
+    from unittest.mock import patch
+    from agent.system_prompt import build_system_prompt
+
+    agent = _wl_agent(monkeypatch)
+    with (
+        patch("agent.prompt_builder.load_soul_md", return_value=WL_SOUL),
+        patch("agent.prompt_builder.build_environment_hints", return_value=WL_ENV_HINTS),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=WL_SUMMARY_LINE),
+        patch("agent.prompt_builder.build_skills_system_prompt", return_value=WL_SKILLS_PROMPT),
+        patch("agent.system_prompt._bot_mode_parts", return_value=[WL_ROSTER_BLOCK]),
+    ):
+        return build_system_prompt(agent)
+
+
+def _wl_in_digest(digest, line):
+    """``(line hash registered, any window registered)`` for one prompt line."""
+    normalized = fp.normalize_line(unicodedata.normalize("NFKC", line))
+    return (fp.line_hash(normalized) in digest.lines,
+            bool({fp.ngram_hash(w) for w in fp.line_windows(normalized)} & digest.ngrams))
+
+
+@pytest.fixture()
+def wl_prompt(home, monkeypatch):
+    """The assembled prompt, with the identity configured as in production."""
+    _reset_identity(monkeypatch, WL_IDENT_NAME, WL_IDENT_CREATOR)
+    monkeypatch.delenv("HERMES_PROMPT_STEER_NOTE", raising=False)
+    prompt = _wl_build(monkeypatch)
+    # Every block the test reasons about really is in front of the model.
+    for line in (WL_SOUL_LINE, WL_RULES_LINE, WL_SKILL_LINE, WL_MEMORY_RULE,
+                 WL_MEMORY_PHONE, WL_FACT_LINE, WL_ROSTER_LINE, WL_ENV_LINE,
+                 WL_SUMMARY_LINE):
+        assert line in prompt
+    return prompt
+
+
+def test_the_runtime_bands_never_enter_the_self_digest(wl_prompt):
+    """MEMORY, fact_store, roster, summary, runtime env, generic English guidance."""
+    digest = fp.self_fingerprints()
+    assert digest is not None
+    for line in (WL_MEMORY_RULE, WL_MEMORY_PHONE, WL_FACT_LINE, WL_ROSTER_LINE,
+                 WL_ENV_LINE, WL_SUMMARY_LINE):
+        assert _wl_in_digest(digest, line) == (False, False), line
+    # The upstream English tool guidance is out too (Haro's digest does not
+    # cover it either, and reciting a generic brief is not the leak we defend).
+    from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
+
+    for line in TASK_COMPLETION_GUIDANCE.split("\n"):
+        if len(fp.normalize_line(unicodedata.normalize("NFKC", line))) >= fp.MIN_LINE_RUNES:
+            assert _wl_in_digest(digest, line)[0] is False, line
+
+
+def test_the_three_whitelisted_kinds_do_enter_the_self_digest(wl_prompt):
+    """SOUL, answer rules, the identity RULE line and the skill body."""
+    from agent.identity_config import IDENTITY_RULE_PREFIX
+
+    digest = fp.self_fingerprints()
+    assert digest.sources == ("soul", "answer_rules", "skills")
+    # The skill line keeps its list marker in the index, so its LINE hash is the
+    # hash of the rendered line; the windows are the same either way.
+    for line in (WL_SOUL_LINE, WL_RULES_LINE, f"- {WL_SKILL_LINE}"):
+        assert _wl_in_digest(digest, line) == (True, True), line
+    rule_line = next(line for line in wl_prompt.split("\n")
+                     if line.startswith(IDENTITY_RULE_PREFIX))
+    assert _wl_in_digest(digest, rule_line) == (True, True)
+
+
+def test_repeating_a_taught_memory_rule_is_not_a_leak(wl_prompt):
+    """The P0 itself: both replies were redacted in production, 2026-09-11."""
+    for reply in (WL_MEMORY_REPLY, WL_PHONE_REPLY):
+        scanner = fp.FingerprintScanner(fp.combined_store())
+        scanner.feed(reply)
+        scanner.flush()
+        assert (scanner.tripped, scanner.hit_count) == (False, 0), reply
+
+
+def test_reciting_soul_or_the_answer_rules_still_convicts(wl_prompt):
+    for line in (WL_SOUL_LINE, WL_RULES_LINE):
+        scanner = fp.FingerprintScanner(fp.combined_store())
+        scanner.feed(f"我的设定是这样的：{line}\n")
+        scanner.flush()
+        assert scanner.tripped is True, line
+
+
+def test_the_identity_answer_is_still_clean_under_the_whitelist(wl_prompt):
+    """「你是谁？」 stays 0/0 (裁定 B), with the new build side in force."""
+    answer = f"我是 {WL_IDENT_NAME}，由 {WL_IDENT_CREATOR} 提供。"
+    assert fp.scan_text(answer, fp.combined_store()) == (False, 0)
+
+
+def test_a_rebuild_without_soul_disarms_the_soul_half(home, monkeypatch):
+    """Per-build collection: a segment that leaves the prompt stops being protected."""
+    _reset_identity(monkeypatch, WL_IDENT_NAME, WL_IDENT_CREATOR)
+    _wl_build(monkeypatch)
+    assert fp.scan_text(WL_SOUL_LINE, fp.combined_store())[0] is True
+
+    from unittest.mock import patch
+    from agent.system_prompt import build_system_prompt
+
+    with (
+        patch("agent.prompt_builder.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.build_environment_hints", return_value=WL_ENV_HINTS),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=WL_SUMMARY_LINE),
+        patch("agent.prompt_builder.build_skills_system_prompt", return_value=WL_SKILLS_PROMPT),
+        patch("agent.system_prompt._bot_mode_parts", return_value=[WL_ROSTER_BLOCK]),
+    ):
+        build_system_prompt(_wl_agent(monkeypatch))
+    assert fp.scan_text(WL_SOUL_LINE, fp.combined_store())[0] is False
+    assert fp.scan_text(WL_SKILL_LINE, fp.combined_store())[0] is True
+
+
+def test_a_stale_registration_cannot_protect_text_outside_the_prompt(home):
+    """The digest is always a subset of the prompt's own lines."""
+    fp.begin_fingerprint_sources()
+    fp.note_fingerprint_sources("soul", WL_SOUL)
+    digest = fp.register_system_prompt(f"{WL_SOUL_LINE}\n{WL_MEMORY_RULE}\n")
+    assert _wl_in_digest(digest, WL_SOUL_LINE)[0] is True
+    assert _wl_in_digest(digest, WL_RULES_LINE) == (False, False)
+
+
+def test_an_unknown_source_kind_is_refused(home):
+    """A typo must never widen the whitelist."""
+    fp.begin_fingerprint_sources()
+    fp.note_fingerprint_sources("memory", WL_MEMORY_BLOCK)
+    assert fp.fingerprint_sources() == {}
+
+
+# ── the forensic prompt from the 2026-09-11 incident ───────────────────
+#
+# Path comes from the environment (HERMES_GUARD_FORENSIC_DB) so no production
+# path is ever committed; the file holds real customer data and is never copied
+# into the repo.  Skipped when it is not present.
+
+_FORENSIC_DB = os.environ.get("HERMES_GUARD_FORENSIC_DB", "")
+
+
+@pytest.mark.skipif(not (_FORENSIC_DB and os.path.exists(_FORENSIC_DB)),
+                    reason="forensic state.db not available (set HERMES_GUARD_FORENSIC_DB)")
+def test_the_real_incident_prompt_registers_no_memory_line(home, monkeypatch):
+    """The prompt that was actually in front of the model on 2026-09-11.
+
+    Its MEMORY band is what convicted the reply; not one of its lines may reach
+    the self digest.  Run through the marker fallback (the DB holds the bytes,
+    not the assembly), which is the weakest of the two paths."""
+    import sqlite3
+
+    with sqlite3.connect(f"file:{_FORENSIC_DB}?mode=ro", uri=True) as conn:
+        rows = conn.execute("SELECT prompt FROM system_prompts").fetchall()
+    prompt = max((row[0] for row in rows if row and row[0]), key=len)
+    assert "MEMORY (your personal notes)" in prompt
+
+    fp.clear_self_fingerprints()
+    digest = fp.register_system_prompt(prompt)
+    assert digest is not None
+
+    # Every line of the MEMORY band, up to the block that follows it.
+    band = prompt.split("MEMORY (your personal notes)", 1)[1].split("\n# ", 1)[0]
+    checked = 0
+    for line in band.split("\n"):
+        normalized = fp.normalize_line(unicodedata.normalize("NFKC", line))
+        if len(normalized) < fp.MIN_LINE_RUNES:
+            continue
+        checked += 1
+        assert fp.line_hash(normalized) not in digest.lines, line[:24]
+        assert not ({fp.ngram_hash(w) for w in fp.line_windows(normalized)} & digest.ngrams), line[:24]
+    assert checked >= 10
