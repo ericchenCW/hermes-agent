@@ -97,6 +97,12 @@ def audit_log(tmp_path, monkeypatch):
     # Reporting is off unless a test opts in — no stray HTTP from the suite.
     monkeypatch.delenv("HARO_API_URL", raising=False)
     monkeypatch.delenv("HARO_RUNTIME_TOKEN", raising=False)
+    # The container-side self digest is process-wide; a sibling test's prompt
+    # must not arm the gate for this one.
+    from agent import leak_fingerprints as _fp
+
+    _fp.clear_self_fingerprints()
+    monkeypatch.delenv(_fp.SELF_FINGERPRINT_ENV, raising=False)
 
     def _lines():
         path = tmp_path / "logs" / "replyguard.jsonl"

@@ -676,6 +676,27 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
+    """Restore or build the prompt, then fingerprint whatever this turn will send.
+
+    idcsre patch — outbound guard.  The build path is fingerprinted inside
+    ``build_system_prompt``; this wrapper covers the branch that has no build at
+    all (bytes restored verbatim from the session DB in a fresh process), so the
+    single point every turn passes through ends with the guard armed against the
+    prompt actually in front of the model.  Cached by the prompt's sha256 — an
+    unchanged prompt costs one hash.  Never raises.
+    """
+    try:
+        _restore_or_build_system_prompt_inner(agent, system_message, conversation_history)
+    finally:
+        try:
+            from agent.leak_fingerprints import note_system_prompt
+
+            note_system_prompt(getattr(agent, "_cached_system_prompt", None))
+        except Exception:
+            logger.debug("self fingerprint hook skipped", exc_info=True)
+
+
+def _restore_or_build_system_prompt_inner(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first

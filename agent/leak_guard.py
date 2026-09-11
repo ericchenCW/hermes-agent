@@ -385,11 +385,16 @@ def build_guard_report(
     budget: Optional[int] = None,
     row_id: str = "",
     sample: Optional[dict] = None,
+    source: str = "",
 ) -> dict:
     """The report body. Carries lengths and identifiers only — never the reply.
 
     ``sample`` (only sent with ``reasoning_leak_suspect``) is the body-free
     shape summary from :func:`prefix_sample`.
+
+    ``source`` (only sent with ``prompt_leak``) is ``"haro"`` / ``"self"`` /
+    ``"both"`` — which digest matched.  It is an ADDITIVE optional field: a Haro
+    build that predates it simply ignores the key.
     """
     identity = guard_identity(session, subject, platform)
     body = {
@@ -403,6 +408,7 @@ def build_guard_report(
         "rowId": str(row_id or ""),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sample": sample,
+        "source": source,
     }
     return {k: v for k, v in body.items() if v is not None and v != ""}
 
@@ -634,21 +640,24 @@ class StreamLeakGuard:
         self.redaction_text = FINGERPRINT_REDACTION_TEXT
         self._held = []
         self._audited = True
+        source = getattr(scanner, "source", "") or ""
         logger.warning(
-            "Reply guard: outbound fingerprint hit (hits=%d session=%s platform=%s "
-            "original_len=%d) — replacing the turn.",
-            scanner.hit_count, self.session, self.platform, len(self.content),
+            "Reply guard: outbound fingerprint hit (hits=%d source=%s session=%s "
+            "platform=%s original_len=%d) — replacing the turn.",
+            scanner.hit_count, source or "-", self.session, self.platform,
+            len(self.content),
         )
         record_audit(
             platform=self.platform or None, session=self.session or None,
             subject=self.subject or None, rule="fingerprint",
+            source=source or None,
             hit_count=scanner.hit_count, original_len=len(self.content),
         )
-        self._report(RULE_PROMPT_LEAK)
+        self._report(RULE_PROMPT_LEAK, source=source)
         return True
 
     # ── reporting ──────────────────────────────────────────────────────
-    def _report(self, rule: str, *, sample: Optional[dict] = None) -> None:
+    def _report(self, rule: str, *, sample: Optional[dict] = None, source: str = "") -> None:
         """Tell Haro about a replaced (or merely suspected) turn.
 
         Best effort, body-free, off the hot path."""
@@ -657,7 +666,7 @@ class StreamLeakGuard:
                 rule=rule, original_len=len(self.content), session=self.session,
                 subject=self.subject, platform=self.platform,
                 reasoning_tokens=self.reasoning_tokens, budget=self.budget,
-                row_id=self.row_id, sample=sample,
+                row_id=self.row_id, sample=sample, source=source,
             ))
         except Exception:  # noqa: BLE001 - the replacement is what protects the user
             logger.debug("reply guard report failed", exc_info=True)
@@ -739,11 +748,16 @@ class StreamLeakGuard:
 
 
 def _make_fingerprint_scanner():
-    """A scanner bound to the current digest, or None when there is none."""
-    try:
-        from agent.leak_fingerprints import FingerprintScanner, store
+    """A scanner bound to the current digests, or None when there are none.
 
-        fingerprints = store()
+    The digest is the UNION of what Haro pushed and what the container
+    fingerprinted from its own assembled system prompt, so a gateway Haro never
+    pushed to still guards its SOUL block and role rules.
+    """
+    try:
+        from agent.leak_fingerprints import FingerprintScanner, combined_store
+
+        fingerprints = combined_store()
         return None if fingerprints.empty else FingerprintScanner(fingerprints)
     except Exception:
         logger.debug("fingerprint store unavailable", exc_info=True)

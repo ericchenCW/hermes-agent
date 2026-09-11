@@ -760,7 +760,16 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     # Surface context-file truncation warnings in chat, not only in logs.
     for warning in drain_truncation_warnings():
         agent._emit_status(warning)
-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    prompt = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    # idcsre patch — outbound guard: fingerprint the prompt we just assembled, in
+    # memory, so the reply guard can catch the model reciting its SOUL / role rules
+    # even where Haro has pushed no digest. Cached by the prompt's sha256, so this
+    # is a single hash on an unchanged prompt; neither the text nor the hashes are
+    # ever written to disk. See agent/leak_fingerprints.py.
+    from agent.leak_fingerprints import note_system_prompt
+
+    note_system_prompt(prompt)
+    return prompt
 
 
 def invalidate_system_prompt(agent: Any) -> None:

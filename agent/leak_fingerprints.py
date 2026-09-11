@@ -49,6 +49,18 @@ in a row do not.
 
 ``scripts/replyguard_fingerprints.py`` builds the file and is the reference
 implementation for the writer side.
+
+SECOND SOURCE: the container's own prompt.  Haro's digest only covers what Haro
+pushed — answer rules, identity, status phrases, bound skills.  The SOUL block,
+the role rules and the tool briefs are baked into the hermes image and never
+travel through Haro at all, which is precisely what a maintainer bot has to
+lose.  So :func:`register_system_prompt` runs the same algorithm over the system
+prompt the container just assembled, keeps the result in RAM (never on disk,
+neither the text nor the hashes), and :func:`combined_store` matches against the
+UNION of the two.  It is cached by the prompt's sha256, so an identity patch or
+a post-compression rebuild re-arms the gate on the new bytes and disarms it on
+the old.  ``HERMES_GUARD_SELF_FINGERPRINT=0`` turns the half off; with no Haro
+file at all, it is the only protection there is.
 """
 
 from __future__ import annotations
@@ -87,6 +99,16 @@ NGRAM_RUN_THRESHOLD = 3
 NGRAM_ADJACENT_GAP = 2
 #: One whole protected line is enough.
 LINE_HIT_THRESHOLD = 1
+
+#: Env switch for the container-side self fingerprints (default on; "0"/"false"/
+#: "no"/"off" turns them off and leaves only whatever Haro pushed).
+SELF_FINGERPRINT_ENV = "HERMES_GUARD_SELF_FINGERPRINT"
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+#: Which digest a conviction came from (optional ``source`` field of the report).
+SOURCE_HARO = "haro"
+SOURCE_SELF = "self"
+SOURCE_BOTH = "both"
 
 #: Re-normalizing an unterminated line on every delta is O(len); above this the
 #: provisional (pre-newline) check is skipped and the line is judged on flush.
@@ -141,9 +163,9 @@ def line_hash(normalized_line: str) -> str:
 def fnv1a64(data: bytes) -> int:
     """FNV-1a, 64-bit, over raw bytes."""
     digest = FNV64_OFFSET_BASIS
+    prime, mask = FNV64_PRIME, FNV64_MASK
     for byte in data:
-        digest ^= byte
-        digest = (digest * FNV64_PRIME) & FNV64_MASK
+        digest = ((digest ^ byte) * prime) & mask
     return digest
 
 
@@ -175,11 +197,12 @@ def line_fingerprints(text: str) -> list[str]:
 
 def ngram_fingerprints(text: str) -> list[str]:
     """8-gram hashes of ``text`` (deduplicated, ascending)."""
-    out: set[str] = set()
+    # Windows are deduplicated BEFORE hashing: a 10 KB prompt repeats plenty of
+    # them, and fnv1a over a window is the whole cost of generation.
+    windows: set[str] = set()
     for line in normalize_lines(text):
-        for window in line_windows(line):
-            out.add(ngram_hash(window))
-    return sorted(out)
+        windows.update(line_windows(line))
+    return sorted(ngram_hash(window) for window in windows)
 
 
 def _rfc3339_now() -> str:
@@ -255,6 +278,10 @@ class FingerprintStore:
     def empty(self) -> bool:
         return not (self.ngrams or self.lines)
 
+    def classify(self, line_hits: Iterable[str], ngram_hits: Iterable[str]) -> str:
+        """Which digest the hits came from — always Haro's, for this store."""
+        return SOURCE_HARO
+
     def _clear(self) -> None:
         self.ngrams = self.lines = frozenset()
         self.bot_id = ""
@@ -306,6 +333,160 @@ def store(path: Optional[str] = None) -> FingerprintStore:
     return _STORE.refresh(path)
 
 
+# ── container-side self fingerprints ───────────────────────────────────
+# Haro's digest covers what Haro knows it pushed (answer rules, identity, status
+# phrases, bound skills).  The bulk of what the model is actually holding — the
+# SOUL block, the role rules, the tool briefs, every operator patch baked into
+# the image — never travels through Haro at all, so no file can fingerprint it.
+# The container can: by the time a turn is sent, the assembled system prompt IS
+# in memory, and running the very same contract algorithm over it yields a
+# second digest for free.  It is kept in RAM only (neither the prompt nor the
+# hashes are ever written to disk) and is rebuilt whenever the prompt's sha256
+# changes, so an identity patch or a post-compression rebuild re-arms the gate
+# on the next turn.
+
+
+def self_fingerprints_enabled() -> bool:
+    """``HERMES_GUARD_SELF_FINGERPRINT`` — on unless explicitly switched off."""
+    raw = (os.environ.get(SELF_FINGERPRINT_ENV) or "").strip().lower()
+    return raw not in _FALSE_VALUES if raw else True
+
+
+class SelfFingerprints:
+    """One prompt's in-memory digest, tagged with the prompt hash it came from."""
+
+    __slots__ = ("prompt_hash", "lines", "ngrams")
+
+    def __init__(
+        self, prompt_hash: str, lines: frozenset[str], ngrams: frozenset[str]
+    ) -> None:
+        self.prompt_hash = prompt_hash
+        self.lines = lines
+        self.ngrams = ngrams
+
+    @property
+    def empty(self) -> bool:
+        return not (self.lines or self.ngrams)
+
+
+_SELF_LOCK = threading.Lock()
+_SELF: Optional[SelfFingerprints] = None
+
+
+def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
+    """Fingerprint the assembled system prompt; cached by its sha256.
+
+    Cheap to call on every turn: an unchanged prompt costs one hash of the
+    prompt bytes and returns the cached digest.  Logs the counts and the first
+    eight hex of the prompt hash — never a byte of the prompt itself.
+    """
+    if not self_fingerprints_enabled():
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return _SELF
+    prompt_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    current = _SELF
+    if current is not None and current.prompt_hash == prompt_hash:
+        return current
+    digest = SelfFingerprints(
+        prompt_hash,
+        frozenset(line_fingerprints(text)),
+        frozenset(ngram_fingerprints(text)),
+    )
+    with _SELF_LOCK:
+        globals()["_SELF"] = digest
+    logger.info(
+        "Reply guard: self fingerprints: %d lines / %d ngrams (prompt %s)",
+        len(digest.lines), len(digest.ngrams), prompt_hash[:8],
+    )
+    return digest
+
+
+def self_fingerprints() -> Optional[SelfFingerprints]:
+    """The cached self digest, or None when absent or switched off."""
+    digest = _SELF
+    if digest is None or digest.empty or not self_fingerprints_enabled():
+        return None
+    return digest
+
+
+def clear_self_fingerprints() -> None:
+    """Drop the cached self digest (process teardown; tests)."""
+    with _SELF_LOCK:
+        globals()["_SELF"] = None
+
+
+def note_system_prompt(text: Optional[str]) -> None:
+    """Fire-and-forget hook for the prompt assembly sites. Never raises."""
+    try:
+        register_system_prompt(text)
+    except Exception:  # noqa: BLE001 - the guard must never break a turn
+        logger.debug("self fingerprint registration failed", exc_info=True)
+
+
+class CombinedFingerprints:
+    """Union of Haro's pushed digest and the container's self digest.
+
+    Either half may be absent: a gateway that Haro has not pushed to still gets
+    the self digest (basic protection out of the box), and switching the self
+    digest off leaves exactly the previous Haro-only behaviour.
+    """
+
+    def __init__(
+        self,
+        haro: Optional[FingerprintStore] = None,
+        own: Optional[SelfFingerprints] = None,
+    ) -> None:
+        self.bot_id = haro.bot_id if haro is not None else ""
+        self.prompt_hash = own.prompt_hash if own is not None else ""
+        self.haro_lines = haro.lines if haro is not None else frozenset()
+        self.haro_ngrams = haro.ngrams if haro is not None else frozenset()
+        self.self_lines = own.lines if own is not None else frozenset()
+        self.self_ngrams = own.ngrams if own is not None else frozenset()
+        self.lines = self.haro_lines | self.self_lines
+        self.ngrams = self.haro_ngrams | self.self_ngrams
+
+    @property
+    def empty(self) -> bool:
+        return not (self.lines or self.ngrams)
+
+    def classify(self, line_hits: Iterable[str], ngram_hits: Iterable[str]) -> str:
+        """``"haro"`` / ``"self"`` / ``"both"`` for the hashes that matched."""
+        lines = set(line_hits)
+        ngrams = set(ngram_hits)
+        from_haro = bool(lines & self.haro_lines) or bool(ngrams & self.haro_ngrams)
+        from_self = bool(lines & self.self_lines) or bool(ngrams & self.self_ngrams)
+        if from_haro and from_self:
+            return SOURCE_BOTH
+        if from_self:
+            return SOURCE_SELF
+        if from_haro:
+            return SOURCE_HARO
+        return ""
+
+
+_COMBINED_LOCK = threading.Lock()
+_COMBINED: Optional[tuple] = None
+
+
+def combined_store(path: Optional[str] = None) -> CombinedFingerprints:
+    """Haro's digest (refreshed from disk) unioned with the self digest.
+
+    Built once per (Haro digest, self digest) pair and memoized: this runs on
+    every reply, and unioning two five-figure hash sets per turn is not free.
+    """
+    haro = store(path)
+    own = self_fingerprints()
+    key = (id(haro.lines), id(haro.ngrams), own.prompt_hash if own else "")
+    cached = _COMBINED
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    combined = CombinedFingerprints(haro, own)
+    with _COMBINED_LOCK:
+        globals()["_COMBINED"] = (key, combined)
+    return combined
+
+
 def _has_adjacent_run(positions: Iterable[int]) -> bool:
     """True when ≥ :data:`NGRAM_RUN_THRESHOLD` matched windows sit adjacently.
 
@@ -334,15 +515,17 @@ class FingerprintScanner:
     frame goes out; the judgement is committed at :meth:`flush`.
     """
 
-    def __init__(self, fingerprints: Optional[FingerprintStore] = None) -> None:
-        self.fp = fingerprints if fingerprints is not None else store()
+    def __init__(self, fingerprints: Optional[object] = None) -> None:
+        self.fp = fingerprints if fingerprints is not None else combined_store()
         self._pending = ""
         self._offset = 0  # rune offset of the pending line's start
         self._line_hits: set[str] = set()
         self._ngram_positions: set[int] = set()
+        self._ngram_hits: set[str] = set()
         # Hits from the not-yet-terminated line, recomputed on every delta.
         self._pending_line_hits: set[str] = set()
         self._pending_positions: set[int] = set()
+        self._pending_ngram_hits: set[str] = set()
 
     @property
     def hit_count(self) -> int:
@@ -356,6 +539,24 @@ class FingerprintScanner:
         if len(self._line_hits | self._pending_line_hits) >= LINE_HIT_THRESHOLD:
             return True
         return _has_adjacent_run(self._ngram_positions | self._pending_positions)
+
+    @property
+    def source(self) -> str:
+        """Which digest the matched hashes belong to (``""`` when nothing hit).
+
+        Optional telemetry for the report body, so the operator can tell a
+        pushed-digest hit from one the container fingerprinted for itself.
+        """
+        classify = getattr(self.fp, "classify", None)
+        if classify is None:
+            return SOURCE_HARO
+        try:
+            return classify(
+                self._line_hits | self._pending_line_hits,
+                self._ngram_hits | self._pending_ngram_hits,
+            )
+        except Exception:  # noqa: BLE001 - telemetry never breaks the redaction
+            return ""
 
     def feed(self, text: str) -> bool:
         """Consume one delta; True once the reply is reproducing protected text."""
@@ -378,48 +579,56 @@ class FingerprintScanner:
         raw, self._pending = self._pending, ""
         self._pending_line_hits = set()
         self._pending_positions = set()
+        self._pending_ngram_hits = set()
         self._commit_line(raw)
         return self.tripped
 
     # ── internals ──────────────────────────────────────────────────────
-    def _scan_line(self, raw: str) -> tuple[set[str], set[int], int]:
-        """``(line hits, matched window positions, rune length)`` for one raw line."""
+    def _scan_line(self, raw: str) -> tuple[set[str], set[int], set[str], int]:
+        """``(line hits, window positions, gram hits, rune length)`` for one line."""
         line = normalize_line(unicodedata.normalize("NFKC", raw))
         hits: set[str] = set()
         positions: set[int] = set()
+        grams: set[str] = set()
         if self.fp.lines and len(line) >= MIN_LINE_RUNES:
             digest = line_hash(line)
             if digest in self.fp.lines:
                 hits.add(digest)
         if self.fp.ngrams:
             for index, window in enumerate(line_windows(line)):
-                if ngram_hash(window) in self.fp.ngrams:
+                digest = ngram_hash(window)
+                if digest in self.fp.ngrams:
                     positions.add(self._offset + index)
-        return hits, positions, len(line)
+                    grams.add(digest)
+        return hits, positions, grams, len(line)
 
     def _commit_line(self, raw: str) -> None:
-        hits, positions, length = self._scan_line(raw)
+        hits, positions, grams, length = self._scan_line(raw)
         self._line_hits |= hits
         self._ngram_positions |= positions
+        self._ngram_hits |= grams
         # +1 for the '\n' that separated this line from the next, so windows of
         # two different lines can never look adjacent.
         self._offset += length + 1
         self._pending_line_hits = set()
         self._pending_positions = set()
+        self._pending_ngram_hits = set()
 
     def _probe_pending(self) -> None:
         """Judge the unterminated line without committing it (bounded cost)."""
         if not self._pending or len(self._pending) > MAX_PENDING_LINE_CHARS:
             self._pending_line_hits = set()
             self._pending_positions = set()
+            self._pending_ngram_hits = set()
             return
-        hits, positions, _ = self._scan_line(self._pending)
+        hits, positions, grams, _ = self._scan_line(self._pending)
         self._pending_line_hits = hits
         self._pending_positions = positions
+        self._pending_ngram_hits = grams
 
 
 def scan_text(
-    text: str, fingerprints: Optional[FingerprintStore] = None
+    text: str, fingerprints: Optional[object] = None
 ) -> tuple[bool, int]:
     """Whole-text form: ``(tripped, hit_count)``."""
     scanner = FingerprintScanner(fingerprints)
