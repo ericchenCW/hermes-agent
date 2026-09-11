@@ -88,8 +88,8 @@ def deployment(monkeypatch, tmp_path: Path):
     (home / ".env").write_text("API_KEY=supersecretvalue\n")
 
     kb = tmp_path / "knowledge"
-    (kb / "canway-it-support").mkdir(parents=True)
-    (kb / "canway-it-support" / "a.md").write_text("kb line\n")
+    (kb / "xingye-it-support").mkdir(parents=True)
+    (kb / "xingye-it-support" / "a.md").write_text("kb line\n")
     out = tmp_path / "out"
     out.mkdir()
     (out / "report").mkdir()
@@ -374,7 +374,7 @@ class TestReadguardAudit:
         from tools import file_tools
 
         monkeypatch.setenv("HERMES_KB_READ_PER_TURN", "1")
-        docs = deployment["kb"] / "canway-it-support"
+        docs = deployment["kb"] / "xingye-it-support"
         (docs / "b.md").write_text("second\n")
         file_tools.read_file_tool(str(docs / "a.md"))
         raw = file_tools.read_file_tool(str(docs / "b.md"))
@@ -426,11 +426,11 @@ class TestExportForbidden:
     def _commands(self, kb: Path, out: Path) -> list[str]:
         return [
             f"tar czf {out}/kb.tgz {kb}",
-            f"cp -r {kb}/canway-it-support {out}/",
+            f"cp -r {kb}/xingye-it-support {out}/",
             f"rsync -a {kb}/ {out}/",
             f"find {kb} -name '*.md' -exec cp {{}} {out} \\;",
-            f"zip -r {out}/kb.zip {kb}/canway-it-support",
-            f'python3 -c "import shutil;shutil.copytree(\'{kb}/canway-it-support\',\'{out}/x\')"',
+            f"zip -r {out}/kb.zip {kb}/xingye-it-support",
+            f'python3 -c "import shutil;shutil.copytree(\'{kb}/xingye-it-support\',\'{out}/x\')"',
         ]
 
     def test_all_export_shapes_refused(self, deployment):
@@ -444,11 +444,11 @@ class TestExportForbidden:
         "shape",
         [
             "cp -R {kb} {out}/",
-            "cp -a {kb}/canway-it-support {out}/",
+            "cp -a {kb}/xingye-it-support {out}/",
             "tar cf - {kb}",
             "7z a {out}/kb.7z {kb}",
             "find {kb} -type f | xargs cp -t {out}",
-            "cat {kb}/canway-it-support/* > {out}/all.md",
+            "cat {kb}/xingye-it-support/* > {out}/all.md",
             "scp -r {kb} user@host:/tmp",
         ],
     )
@@ -461,10 +461,10 @@ class TestExportForbidden:
     @pytest.mark.parametrize(
         "shape",
         [
-            "cp {kb}/canway-it-support/a.md {out}/",
+            "cp {kb}/xingye-it-support/a.md {out}/",
             "tar czf {out}/a.tgz {out}/report",
-            "cat {kb}/canway-it-support/a.md",
-            "grep -n line {kb}/canway-it-support/a.md",
+            "cat {kb}/xingye-it-support/a.md",
+            "grep -n line {kb}/xingye-it-support/a.md",
         ],
     )
     def test_single_file_and_non_kb_shapes_allowed(self, deployment, shape):
@@ -475,7 +475,7 @@ class TestExportForbidden:
         from tools import terminal_tool
 
         raw = terminal_tool.terminal_tool(
-            command=f"cp -r {deployment['kb']}/canway-it-support {deployment['out']}/"
+            command=f"cp -r {deployment['kb']}/xingye-it-support {deployment['out']}/"
         )
         payload = json.loads(raw)
         assert payload["error"] == KB_EXPORT_DENIED_CODE
@@ -487,7 +487,7 @@ class TestExportForbidden:
 
         raw = terminal_tool.terminal_tool(
             command=(
-                f"cp {deployment['kb']}/canway-it-support/a.md {deployment['out']}/"
+                f"cp {deployment['kb']}/xingye-it-support/a.md {deployment['out']}/"
             )
         )
         payload = json.loads(raw)
@@ -506,7 +506,7 @@ class TestKbReadQuota:
     def _kb_docs(self, kb: Path, count: int) -> list[Path]:
         docs = []
         for i in range(count):
-            doc = kb / "canway-it-support" / f"doc-{i}.md"
+            doc = kb / "xingye-it-support" / f"doc-{i}.md"
             doc.write_text(f"knowledge body {i}\n")
             docs.append(doc)
         return docs
@@ -571,7 +571,7 @@ class TestKbReadQuota:
     def test_bypass_lifts_the_quota(self, deployment, monkeypatch):
         monkeypatch.setenv("HERMES_KB_READ_PER_TURN", "1")
         monkeypatch.setenv("HERMES_READ_SAFE_ROOTS_BYPASS", "1")
-        doc = deployment["kb"] / "canway-it-support" / "a.md"
+        doc = deployment["kb"] / "xingye-it-support" / "a.md"
         for _ in range(5):
             assert check_kb_read_quota(str(doc)) is None
 
@@ -579,7 +579,7 @@ class TestKbReadQuota:
         from gateway.session_context import clear_session_vars, set_session_vars
 
         monkeypatch.setenv("HERMES_KB_READ_PER_TURN", "1")
-        doc = deployment["kb"] / "canway-it-support" / "a.md"
+        doc = deployment["kb"] / "xingye-it-support" / "a.md"
 
         tokens = set_session_vars(session_id="sess-a")
         try:
@@ -675,7 +675,7 @@ class TestExecPathExemption:
             lambda **kw: json.dumps({"session_id": "proc-1"}),
         )
         raw = terminal_tool.terminal_tool(
-            command=f"cp -r {deployment['kb']}/canway-it-support {deployment['out']}/",
+            command=f"cp -r {deployment['kb']}/xingye-it-support {deployment['out']}/",
             background=True,
             _host_local=True,
         )

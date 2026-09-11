@@ -422,16 +422,16 @@ def test_guard_leaves_an_innocent_reply_alone_with_fingerprints_loaded(home):
 
 SKILL_LIKE_PROMPT = (
     "技能说明：先用 kb_search 工具检索知识库，命中之后再用 read_file 读取原文。\n"
-    "所有资料都放在 /knowledge/canway-it-support/ 下面，例如 "
-    "/knowledge/canway-it-support/guides/access/vpn-user-guide.md 与 "
-    "/knowledge/canway-it-support/reference/internal-platform-urls.md。\n"
+    "所有资料都放在 /knowledge/xingye-it-support/ 下面，例如 "
+    "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md 与 "
+    "/knowledge/xingye-it-support/reference/internal-platform-urls.md。\n"
     "回答末尾必须列出实际依据的来源路径，一行一个，不要编造。\n"
 )
 #: The exact replies the 2026-09-11 regression lost (`fp-analysis.log`).
-CITED_PATH_REPLY = "依据：/knowledge/canway-it-support/guides/access/vpn-user-guide.md"
+CITED_PATH_REPLY = "依据：/knowledge/xingye-it-support/guides/access/vpn-user-guide.md"
 KB_SEARCH_REPLY = "我用 kb_search 检索了「门禁卡怎么办理」，命中 3 条。"
 READ_FILE_REPLY = (
-    "我读了 /knowledge/canway-it-support/reference/internal-platform-urls.md 这篇文档。"
+    "我读了 /knowledge/xingye-it-support/reference/internal-platform-urls.md 这篇文档。"
 )
 #: …and a line of the prompt's Chinese prose, which must still convict.
 SKILL_CHINESE_LINE = "回答末尾必须列出实际依据的来源路径，一行一个，不要编造。"
@@ -445,7 +445,7 @@ def test_low_entropy_window_rule():
     assert fp.is_low_entropy_window("用 kb_se") is False
     # A whole line that is nothing but a path is not looked up either.
     assert fp.is_low_entropy_line(
-        "/knowledge/canway-it-support/guides/access/vpn-user-guide.md") is True
+        "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md") is True
     assert fp.is_low_entropy_line("依据: /knowledge/x.md") is False
 
 
@@ -1006,7 +1006,7 @@ def test_v2_digest_format_declares_version_two():
     assert fp.ngram_hash("/knowled") not in digest["ngrams"]
     assert fp.ngram_hash("kb_searc") not in digest["ngrams"]
     assert fp.line_hash(
-        "/knowledge/canway-it-support/guides/access/vpn-user-guide.md"
+        "/knowledge/xingye-it-support/guides/access/vpn-user-guide.md"
     ) not in digest["lines"]
     # …and the Chinese prose it exists to protect is still there.
     assert fp.line_hash(fp.normalize_lines(SKILL_CHINESE_LINE)[0]) in digest["lines"]
@@ -1067,14 +1067,14 @@ def test_the_self_digest_is_built_with_the_v2_rules(home):
 
 # ── the identity answer is never protected text (2026-09-11, red item B) ──
 # The 2026-09-11 regression redacted 「你是谁？」 4/4 on the灰度 bot: the reply
-# "我是 haro管理员，由 嘉为科技 Haro 平台 提供。" produced five adjacent CJK
+# "我是 haro管理员，由 星野科技 Haro 平台 提供。" produced five adjacent CJK
 # windows against the ``agent_identity`` source (source=self/haro), which is the
 # one prompt section the model is ORDERED to recite.  Two exits are pinned
 # below — the build side never fingerprints the segment, the match side never
 # convicts on the answer sentence.
 
 IDENT_NAME = "haro管理员"
-IDENT_CREATOR = "嘉为科技 Haro 平台"
+IDENT_CREATOR = "星野科技 Haro 平台"
 IDENT_ANSWER = f"我是 {IDENT_NAME}，由 {IDENT_CREATOR} 提供。"
 
 
@@ -1100,12 +1100,12 @@ def test_identity_answer_is_whitelisted_on_the_matching_side(home, monkeypatch):
 
 
 @pytest.mark.parametrize("variant", [
-    "我是 haro管理员，由 嘉为科技 Haro 平台 提供。",
-    "我是haro管理员，由嘉为科技 Haro 平台提供。",       # spaces dropped
-    "我是 haro管理员, 由 嘉为科技 Haro 平台 提供.",      # ASCII punctuation
-    "我是 haro管理员，由 嘉为科技 Haro 平台 提供",       # no terminator
-    "「我是 haro管理员，由 嘉为科技 Haro 平台 提供」",   # quoted back
-    "你是 haro管理员，由 嘉为科技 Haro 平台 提供。",     # the prompt's own wording
+    "我是 haro管理员，由 星野科技 Haro 平台 提供。",
+    "我是haro管理员，由星野科技 Haro 平台提供。",       # spaces dropped
+    "我是 haro管理员, 由 星野科技 Haro 平台 提供.",      # ASCII punctuation
+    "我是 haro管理员，由 星野科技 Haro 平台 提供",       # no terminator
+    "「我是 haro管理员，由 星野科技 Haro 平台 提供」",   # quoted back
+    "你是 haro管理员，由 星野科技 Haro 平台 提供。",     # the prompt's own wording
 ])
 def test_identity_answer_variants_are_whitelisted(home, monkeypatch, variant):
     _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
@@ -1131,23 +1131,50 @@ def test_the_whitelist_does_not_open_other_cjk_recitation(home, monkeypatch):
     assert fp.scan_text(SOUL_LINE, fp.store())[0] is True
 
 
-def test_the_self_digest_excludes_the_identity_segment(home, monkeypatch):
-    """Build side: the segment contributes neither lines nor grams."""
+def test_the_self_digest_excludes_only_the_identity_answer_line(home, monkeypatch):
+    """Build side, 裁定 B: the 答复句 line is dropped, the 规则行 is kept."""
     _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
     prompt = _identity_prompt() + "\n\n" + SOUL_BLOCK
     digest = fp.register_system_prompt(prompt)
     assert digest is not None
-    for line in _identity_prompt().split("\n"):
-        normalized = fp.normalize_line(unicodedata.normalize("NFKC", line))
-        assert fp.line_hash(normalized) not in digest.lines
-        windows = {fp.ngram_hash(w) for w in fp.line_windows(normalized)}
-        assert windows and not (windows & digest.ngrams)
+    intro_line, rule_line = _identity_prompt().split("\n")
+
+    # 答复句: its own line hash never reaches the digest.  Some of its windows
+    # still do — the rule line quotes 「{answer_line()}」 inside itself — and
+    # that is fine: the MATCH-side whitelist exempts them (asserted below).
+    intro = fp.normalize_line(unicodedata.normalize("NFKC", intro_line))
+    assert fp.line_hash(intro) not in digest.lines
+
+    # …while the 规则行 is ordinary protected text: it is an instruction to
+    # obey, never to recite, so it stays in the set.
+    rule = fp.normalize_line(unicodedata.normalize("NFKC", rule_line))
+    assert fp.line_hash(rule) in digest.lines
+    rule_windows = {fp.ngram_hash(w) for w in fp.line_windows(rule)}
+    assert rule_windows & digest.ngrams
+
     # The rest of the prompt is fingerprinted exactly as before.
     assert fp.line_hash(
         fp.normalize_line(unicodedata.normalize("NFKC", SOUL_LINE))) in digest.lines
 
 
-def test_strip_identity_segment_also_catches_a_reworded_rule_line(monkeypatch):
+def test_self_digest_keeps_the_rule_line_yet_the_answer_stays_clean(home, monkeypatch):
+    """The 规则行 quotes the answer sentence, so its windows do enter the self
+    digest -- but the MATCH-side whitelist keeps 「你是谁？」 at 0/0 anyway,
+    while reciting the whole rule line still convicts."""
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    monkeypatch.delenv(fp.SELF_FINGERPRINT_ENV, raising=False)
+    prompt = _identity_prompt() + "\n\n" + SOUL_BLOCK
+    fp.register_system_prompt(prompt)
+    rule_line = _identity_prompt().split("\n", 1)[1]
+
+    # No Haro store installed: the combined store is the self digest alone.
+    assert fp.scan_text(IDENT_ANSWER)[0] is False
+    assert fp.scan_text(IDENT_ANSWER)[1] == 0
+    assert fp.scan_text(rule_line)[0] is True
+
+
+def test_strip_identity_segment_keeps_a_reworded_rule_line(monkeypatch):
+    """裁定 B: no IDENTITY_RULE_PREFIX fallback -- only the exact 答复句 goes."""
     _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
     from agent.identity_config import IDENTITY_RULE_PREFIX
 
@@ -1157,7 +1184,7 @@ def test_strip_identity_segment_also_catches_a_reworded_rule_line(monkeypatch):
         "作答规则：回答保持简短。\n"
     )
     out = fp.strip_identity_segment(text)
-    assert IDENTITY_RULE_PREFIX not in out
+    assert IDENTITY_RULE_PREFIX in out
     assert f"你是 {IDENT_NAME}" not in out
     assert "作答规则：回答保持简短。" in out
 

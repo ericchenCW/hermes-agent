@@ -389,9 +389,9 @@ def test_short_replies_never_trip_the_line_loop_guard():
     couple of times; under 200 characters nothing may be judged a loop.
     """
     identity = (
-        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
-        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
-        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
+        "我是 haro管理员，由 星野科技 Haro 平台 提供。\n"
+        "我是 haro管理员，由 星野科技 Haro 平台 提供。\n"
+        "我是 haro管理员，由 星野科技 Haro 平台 提供。\n"
     )
     assert len(identity) < rg.LINE_LOOP_MIN_TOTAL_CHARS
     assert rg.normalized_line_loop_detected(identity) is False

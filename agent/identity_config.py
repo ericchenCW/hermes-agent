@@ -17,7 +17,7 @@ identity segment:
     agent:
       identity:
         name: "IT 小助理"            # what the agent calls itself
-        creator: "嘉为科技 Haro 平台"  # who provides/built it
+        creator: "星野科技 Haro 平台"  # who provides/built it
         intro: "..."                 # optional one-line self-introduction
 
 All three default to the empty string, and an empty ``name`` means the
@@ -229,27 +229,54 @@ def stored_prompt_identity_stale(
 
 
 # ── The identity block, as data (2026-09-11 regression, red item B) ────
-# The identity segment is the one part of the system prompt whose whole
-# purpose is to be SAID OUT LOUD: "你是谁？" must be answered with
-# ``identity.answer_line()``.  The reply guard's fingerprint digest, which
-# protects the prompt from being recited, therefore has to be told about
-# it twice over --- once on the BUILD side (the segment contributes no
-# fingerprints of its own) and once on the MATCH side (the fixed answer
-# sentence, and its cosmetic variants, carry no evidence).  Both callers
-# live in ``agent/leak_fingerprints.py``; these helpers keep the wording
-# in ONE place, so a future edit to ``build_identity_prompt`` cannot leave
-# the guard whitelisting a sentence the model no longer says.
+# The identity segment has TWO halves and they are treated differently
+# (裁定 B, 2026-09-11):
+#
+#   * the 答复句 (intro / self-introduction line, and the fixed answer
+#     sentence it states) is the one part of the system prompt whose whole
+#     purpose is to be SAID OUT LOUD -- "你是谁？" must be answered with
+#     ``identity.answer_line()``, so neither side of the guard may treat
+#     it as evidence;
+#   * the 规则行 (``IDENTITY_RULE_PREFIX`` hard constraint) is an ordinary
+#     system-prompt instruction.  The model is told to OBEY it, never to
+#     recite it -- a reply that reproduces that whole line IS a leak, so it
+#     stays in the fingerprint set on both sides.
+#
+# So the BUILD side strips only the 答复句 (:func:`identity_intro_lines`)
+# and the MATCH side whitelists only the answer sentence
+# (:func:`identity_answer_variants`).  Both callers live in
+# ``agent/leak_fingerprints.py``; these helpers keep the wording in ONE
+# place, so a future edit to ``build_identity_prompt`` cannot leave the
+# guard whitelisting a sentence the model no longer says.
 
 
-def identity_prompt_lines(identity: AgentIdentity) -> tuple:
+def identity_prompt_lines(identity: AgentIdentity, intro_only: bool = False) -> tuple:
     """The non-empty lines of the injected identity segment.
 
     Exactly what :func:`build_identity_prompt` emits: the self-introduction
     (or the operator's ``intro``) and the hard-constraint rule line.
+
+    ``intro_only=True`` returns just the first (答复句) line -- what the
+    guard's build side strips.  Prefer the explicitly named
+    :func:`identity_intro_lines` for that; this parameter exists so the
+    older call signature keeps working.
     """
-    return tuple(
+    lines = tuple(
         line for line in build_identity_prompt(identity).split("\n") if line.strip()
     )
+    return lines[:1] if intro_only else lines
+
+
+def identity_intro_lines(identity: AgentIdentity) -> tuple:
+    """Only the 答复句 line of the identity segment (裁定 B).
+
+    The first line of :func:`build_identity_prompt` -- the operator's
+    ``intro`` when configured, else "你是 {name}，由 {creator} 提供。".  The
+    rule line is deliberately NOT here: it is a system-prompt instruction,
+    and a reply that recites it verbatim is a leak, so it must stay in the
+    guard's self-generated fingerprint set.
+    """
+    return identity_prompt_lines(identity, intro_only=True)
 
 
 #: Subjects the sentence can open with -- the prompt states it as "你是 …",

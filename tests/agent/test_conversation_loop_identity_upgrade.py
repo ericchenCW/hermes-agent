@@ -29,7 +29,7 @@ from agent.conversation_loop import _restore_or_build_system_prompt
 from agent.identity_config import AgentIdentity, build_identity_prompt
 from tools import bot_mode_probe
 
-_IDENTITY = AgentIdentity(name="IT 小助理", creator="嘉为科技 Haro 平台")
+_IDENTITY = AgentIdentity(name="IT 小助理", creator="星野科技 Haro 平台")
 
 # Pre-identity prompt: no ``Model:``/``Provider:`` lines and no host block,
 # so ``_stored_prompt_matches_runtime`` considers it fresh and we reach the

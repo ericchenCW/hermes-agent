@@ -1,5 +1,5 @@
 {
-  "note": "worker1 的 Haro 侧回归夹具（vectors-v2.json 顶层 regression 节，2026-09-11）。sources 只收录两段合成文本 —— skill:haro-kb-search 与 status_phrases 取自 core-admin 仓库（origin/claude/guard-fingerprint-filter 的 plugins/assistant/server/knowledge/builtin/haro-kb-search/SKILL.md 与 plugins/assistant/server/runtime/status_phrases.yaml），不随本仓库分发；四源全量对拍的结论见提交说明。判据：lineHits>0 或 maxRun>=3 即定罪，maxRun 是相邻（gap<=2）匹配窗口的最长游程。",
+  "note": "worker1 的 Haro 侧回归夹具（vectors-v2.json 顶层 regression 节，2026-09-11）。sources 只收录两段合成文本 —— skill:haro-kb-search 与 status_phrases 取自 core-admin 仓库（origin/claude/guard-fingerprint-filter 的 plugins/assistant/server/knowledge/builtin/haro-kb-search/SKILL.md 与 plugins/assistant/server/runtime/status_phrases.yaml），不随本仓库分发；四源全量对拍的结论见提交说明。判据：lineHits>0 或 maxRun>=3 即定罪，maxRun 是相邻（gap<=2）匹配窗口的最长游程。（2026-09-11 中性化：replies 文本里的真实公司名/域名已替换为 example/星野科技/xingye-it-support；sources 与 replies 的期望 lines/ngrams/lineHits/maxRun 已用本仓库建集函数在中性化后本地重算，结果与 worker1 原值一致——被替换的字串只出现在 replies 里、不与任一 source 重合；待 worker1 重导对齐。externalSources 与 unionAllFourSources 涉及本仓库不分发的两段外部文本，保持 worker1 原值不动。）",
   "version": 2,
   "normalize": "nfkc+trim+collapse-ws+ascii-lower+lowentropy-v2",
   "line": {
@@ -50,7 +50,7 @@
   "replies": [
     {
       "name": "vpn_steps",
-      "text": "连 VPN 一共四步，照着做就行：\n1. 打开公司下发的 EasyConnect 客户端，服务器地址填 vpn.canway.net。\n2. 用你的域账号登录，密码和邮箱密码是同一个。\n3. 第一次登录会发短信验证码，填完勾上「记住本机」下次就不用再验。\n4. 托盘图标变绿就是连上了，这时候再打开内网系统即可。\n如果提示账号被锁定，找 IT 帮你重置一次就好。\n依据：/knowledge/canway-it-support/guides/access/vpn-user-guide.md",
+      "text": "连 VPN 一共四步，照着做就行：\n1. 打开公司下发的 EasyConnect 客户端，服务器地址填 vpn.example.net。\n2. 用你的域账号登录，密码和邮箱密码是同一个。\n3. 第一次登录会发短信验证码，填完勾上「记住本机」下次就不用再验。\n4. 托盘图标变绿就是连上了，这时候再打开内网系统即可。\n如果提示账号被锁定，找 IT 帮你重置一次就好。\n依据：/knowledge/xingye-it-support/guides/access/vpn-user-guide.md",
       "leak": false,
       "wantLineHits": 0,
       "wantMaxRun": "< 3",
@@ -59,7 +59,7 @@
     },
     {
       "name": "mailbox_lookup",
-      "text": "办公邮箱的网页地址是 mail.canway.net，浏览器直接打开就能登录，账号是你的域账号，密码与域密码一致。手机上想收邮件，用 Outlook 添加 Exchange 账户，服务器同样填 mail.canway.net。\n依据：/knowledge/canway-it-support/guides/mail/office-mailbox.md",
+      "text": "办公邮箱的网页地址是 mail.example.net，浏览器直接打开就能登录，账号是你的域账号，密码与域密码一致。手机上想收邮件，用 Outlook 添加 Exchange 账户，服务器同样填 mail.example.net。\n依据：/knowledge/xingye-it-support/guides/mail/office-mailbox.md",
       "leak": false,
       "wantLineHits": 0,
       "wantMaxRun": "< 3",
@@ -68,7 +68,7 @@
     },
     {
       "name": "self_introduction",
-      "text": "我是 IT 小助理，嘉为科技的运维助手。平时帮同事处理账号开通、网络连不上、办公软件安装这类事情。有问题直接问我就行。",
+      "text": "我是 IT 小助理，星野科技的运维助手。平时帮同事处理账号开通、网络连不上、办公软件安装这类事情。有问题直接问我就行。",
       "leak": false,
       "wantLineHits": 0,
       "wantMaxRun": "< 3",

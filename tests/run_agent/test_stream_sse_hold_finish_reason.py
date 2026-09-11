@@ -44,10 +44,10 @@ def test_finish_reason_on_held_chunk_is_not_a_stream_drop(monkeypatch):
 def test_colon_delta_mid_line_is_streamed_immediately(monkeypatch):
     chunks = [
         _make_stream_chunk(content="访问 https"),
-        _make_stream_chunk(content="://km.cwoa.net/login"),
+        _make_stream_chunk(content="://km.example.net/login"),
         _make_stream_chunk(content=" 登录。", finish_reason="stop"),
     ]
     response, seen = _run(chunks, monkeypatch)
     assert response.choices[0].finish_reason == "stop"
     # the ":" delta is ordinary text mid-line: it is fired as a delta, not held
-    assert seen[:2] == ["访问 https", "://km.cwoa.net/login"]
+    assert seen[:2] == ["访问 https", "://km.example.net/login"]

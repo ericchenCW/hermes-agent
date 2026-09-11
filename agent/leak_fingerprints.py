@@ -197,7 +197,7 @@ def window_is_convicting(window: str) -> bool:
 def is_low_entropy_line(normalized_line: str) -> bool:
     """True when a whole normalized line is just a path / URL / identifier.
 
-    ``/knowledge/canway-it-support/guides/access/vpn-user-guide.md`` on a line of
+    ``/knowledge/xingye-it-support/guides/access/vpn-user-guide.md`` on a line of
     its own is a citation, not the system prompt leaking.
     """
     if not normalized_line:
@@ -681,9 +681,11 @@ class SelfFingerprints:
 #
 # Two exits, deliberately kept separate:
 #
-#   * BUILD side -- :func:`strip_identity_segment` removes the segment's own
-#     lines before the container fingerprints its assembled prompt, so the
-#     self digest never carries them in the first place;
+#   * BUILD side -- :func:`strip_identity_segment` removes the segment's 答复句
+#     (self-introduction) line before the container fingerprints its assembled
+#     prompt, so the self digest never carries it in the first place.  The rule
+#     line is NOT removed (裁定 B): it is an instruction to obey, not to recite,
+#     and a reply reproducing it verbatim is a leak;
 #   * MATCH side -- the fixed answer sentence and its cosmetic variants are
 #     whitelisted, so a v1/v2 digest that Haro built WITH ``agent_identity``
 #     in it (all four bots still do) cannot convict either.
@@ -713,15 +715,22 @@ def _active_identity():
 
 
 def _identity_segment_keys(identity) -> frozenset:
-    """Normalized keys of the identity segment's own lines."""
+    """Normalized key of the identity segment's 答复句 line (裁定 B).
+
+    Only the FIRST line of :func:`~agent.identity_config.build_identity_prompt`
+    -- the self-introduction the model is ordered to say out loud.  The rule
+    line is not here on purpose: it is a plain system-prompt instruction, and a
+    reply reciting it verbatim is a leak, so it must keep producing
+    fingerprints.
+    """
     try:
-        from agent.identity_config import identity_prompt_lines
+        from agent.identity_config import identity_intro_lines
 
         return frozenset(
             key
             for key in (
                 normalize_line(unicodedata.normalize("NFKC", line))
-                for line in identity_prompt_lines(identity)
+                for line in identity_intro_lines(identity)
             )
             if key
         )
@@ -730,16 +739,23 @@ def _identity_segment_keys(identity) -> frozenset:
 
 
 def strip_identity_segment(text: Optional[str], identity=None) -> str:
-    """``text`` with the injected identity segment's lines blanked out.
+    """``text`` with the identity segment's 答复句 line blanked out.
 
-    Used on the build side only.  Lines are matched after the contract
-    normalization (so spacing/case drift cannot smuggle the segment back in)
-    plus, as a belt-and-braces second key, any line opening with
-    :data:`~agent.identity_config.IDENTITY_RULE_PREFIX` -- that covers a reworded
-    rule line whose exact text this process did not build.
+    Used on the build side only, and deliberately narrow (裁定 B, 2026-09-11):
+    the self-introduction line is the text the model is ORDERED to say, so
+    fingerprinting it convicts obedience; the ``IDENTITY_RULE_PREFIX`` rule line
+    around it is an instruction the model must obey and never recite, so it
+    stays in the self digest and a verbatim reproduction of it still convicts.
 
-    A blank line is left in place of each dropped line so the rest of the prompt
-    keeps its shape; blank lines produce no fingerprints anyway.
+    Lines are matched after the contract normalization, so spacing/case drift
+    cannot smuggle the answer line back in.  A blank line is left in place of
+    each dropped line so the rest of the prompt keeps its shape; blank lines
+    produce no fingerprints anyway.
+
+    Note the rule line quotes ``「{identity.answer_line()}」`` inside itself, so
+    a few answer-sentence windows do reach the digest through it.  That is
+    covered on the MATCH side instead: :func:`identity_whitelist` exempts the
+    answer sentence's own windows, so 「你是谁？」 still scores 0/0.
     """
     if not isinstance(text, str) or not text:
         return text or ""
@@ -747,17 +763,11 @@ def strip_identity_segment(text: Optional[str], identity=None) -> str:
     if identity is None:
         return text
     keys = _identity_segment_keys(identity)
-    try:
-        from agent.identity_config import IDENTITY_RULE_PREFIX
-    except Exception:  # noqa: BLE001
-        IDENTITY_RULE_PREFIX = "\0"
-    if not keys and not IDENTITY_RULE_PREFIX:
+    if not keys:
         return text
     out = []
     for raw in text.split("\n"):
-        stripped = raw.lstrip()
-        if (stripped.startswith(IDENTITY_RULE_PREFIX)
-                or normalize_line(unicodedata.normalize("NFKC", raw)) in keys):
+        if normalize_line(unicodedata.normalize("NFKC", raw)) in keys:
             out.append("")
         else:
             out.append(raw)
