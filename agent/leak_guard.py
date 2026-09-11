@@ -94,6 +94,10 @@ RULE_REASONING_LEAK_SUSPECT = "reasoning_leak_suspect"
 REDACTION_TEXT = "抱歉，我这次的回答生成异常，已中止。请重新发一次问题。"
 # …and for a reply caught reproducing fingerprinted text (agent/leak_fingerprints.py).
 FINGERPRINT_REDACTION_TEXT = "抱歉，这条回复包含不适合外发的内容，已拦截。"
+# Audit-only signal: an adjacent run of fingerprinted 8-grams that is nothing but
+# ASCII fragments (a cited path, a tool name). Every compliant knowledge answer
+# produces those, so the reply stands and the operator just gets a line.
+RULE_FINGERPRINT_ASCII_RUN = "fingerprint_ascii_run"
 
 # Only the opening of the reply is judged: a leak announces itself immediately
 # (the model resumes the sentence its reasoning was cut off in), and scanning a
@@ -525,6 +529,7 @@ class StreamLeakGuard:
         self._hold_logged = False
         self.redaction_text = REDACTION_TEXT
         self._fingerprints = _make_fingerprint_scanner()
+        self._fp_ascii_audited = False
 
     # ── inputs ─────────────────────────────────────────────────────────
     def on_content_delta(self, text: str) -> GuardOutcome:
@@ -631,6 +636,7 @@ class StreamLeakGuard:
             return False
         try:
             if not probe(scanner):
+                self._audit_ascii_run(scanner)
                 return False
         except Exception:
             logger.debug("fingerprint scan failed", exc_info=True)
@@ -655,6 +661,30 @@ class StreamLeakGuard:
         )
         self._report(RULE_PROMPT_LEAK, source=source)
         return True
+
+    def _audit_ascii_run(self, scanner) -> None:
+        """One body-free line for an all-ASCII fingerprint run; the reply stands.
+
+        Written at most once per reply. Nothing is withheld from the user: this
+        is the observation channel that replaced the conviction the 2026-09-11
+        regression showed was eating ordinary answers.
+        """
+        if self._fp_ascii_audited:
+            return
+        try:
+            if not getattr(scanner, "ascii_run", False):
+                return
+        except Exception:  # noqa: BLE001 - telemetry never breaks a turn
+            return
+        self._fp_ascii_audited = True
+        record_audit(
+            event="reply.audited", platform=self.platform or None,
+            session=self.session or None, subject=self.subject or None,
+            rule=RULE_FINGERPRINT_ASCII_RUN,
+            source=getattr(scanner, "source", "") or None,
+            hit_count=scanner.hit_count, original_len=len(self.content),
+            redacted=False,
+        )
 
     # ── reporting ──────────────────────────────────────────────────────
     def _report(self, rule: str, *, sample: Optional[dict] = None, source: str = "") -> None:

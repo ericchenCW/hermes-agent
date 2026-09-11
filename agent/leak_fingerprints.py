@@ -50,6 +50,21 @@ in a row do not.
 ``scripts/replyguard_fingerprints.py`` builds the file and is the reference
 implementation for the writer side.
 
+LOW-ENTROPY WINDOWS ARE NOT EVIDENCE (2026-09-11).  Haro's production digest
+fingerprints a bot's whole bound skill, so ``/knowled`` / ``kb_searc`` and the
+rest of the SKILL.md's paths and tool names ended up protected — while the same
+bot's answer rules oblige every knowledge answer to cite the ``/knowledge/…``
+path it read.  Three of four ordinary questions were redacted in the regression.
+The matching side therefore discards a window that is all
+:data:`IDENTIFIER_CHARS`, or pure ASCII with no space, or built from ≤ 3
+distinct runes, before the VERDICT, and skips a line that is nothing but a path;
+an adjacent run convicts only if one of its surviving windows holds a non-ASCII
+rune or two space-separated words.  A run that fails that bar is real but
+harmless and is reported as :attr:`FingerprintScanner.ascii_run`, which the
+reply guard writes as one ``reply.audited`` line while the reply goes out.  The
+generator functions are untouched: they are the byte-for-byte contract with the
+Go side, and a window that is never looked up can never match anyway.
+
 SECOND SOURCE: the container's own prompt.  Haro's digest only covers what Haro
 pushed — answer rules, identity, status phrases, bound skills.  The SOUL block,
 the role rules and the tool briefs are baked into the hermes image and never
@@ -99,6 +114,96 @@ NGRAM_RUN_THRESHOLD = 3
 NGRAM_ADJACENT_GAP = 2
 #: One whole protected line is enough.
 LINE_HIT_THRESHOLD = 1
+
+# ── low-entropy windows (2026-09-11 false-positive fix) ────────────────
+# Haro's production digest fingerprints the WHOLE bound skill (4470 of a bot's
+# 4555 grams came from one SKILL.md), so ``/knowled``, ``knowledg``, ``kb_searc``
+# … all landed in the protected set.  The same bot's answer rules then REQUIRE
+# every knowledge answer to end with the ``/knowledge/…`` path it used, and the
+# reply guard ate three of four ordinary questions in the 2026-09-11 regression.
+# A path segment, a tool name or a bare identifier is not evidence of anything:
+# it recurs in innocent replies by construction.  So they never convict.
+#
+# The filter is applied on the MATCHING side and on the container's own
+# self-fingerprint side.  It is deliberately NOT applied in
+# :func:`ngram_fingerprints` / :func:`line_fingerprints`, which are the
+# cross-language contract with the Haro Go generator (and are pinned by
+# ``tests/agent/fixtures/guard_vectors.json``): Haro's ngrams for a given source
+# must stay byte-identical.  Filtering the reply's windows before the lookup is
+# equivalent — a window that is never looked up can never match.
+
+#: Runes that on their own spell a path / URL / code identifier.
+IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789_/.:-"
+)
+#: A window built from this few distinct runes carries no evidence ("------").
+MAX_LOW_ENTROPY_DISTINCT = 3
+
+
+def _is_ascii(text: str) -> bool:
+    return all(ord(ch) < 128 for ch in text)
+
+
+def _word_count(text: str) -> int:
+    """Space-separated words in ``text`` (the normalization already collapsed runs)."""
+    return len([part for part in text.split(" ") if part])
+
+
+def is_low_entropy_window(window: str) -> bool:
+    """True when an 8-rune window is too common to be evidence of a leak.
+
+    Any one of:
+
+    * ≤ :data:`MAX_LOW_ENTROPY_DISTINCT` distinct runes (``--------``);
+    * every rune in :data:`IDENTIFIER_CHARS` (``/knowled``, ``kb_searc``);
+    * pure ASCII with no space at all (an identifier in any other alphabet soup).
+    """
+    if not window:
+        return True
+    if len(set(window)) <= MAX_LOW_ENTROPY_DISTINCT:
+        return True
+    if all(ch in IDENTIFIER_CHARS for ch in window):
+        return True
+    return _is_ascii(window) and " " not in window
+
+
+def window_is_convicting(window: str) -> bool:
+    """True when a matched window may carry a run to a conviction.
+
+    A window earns that only by holding a non-ASCII rune (Chinese prose — the
+    thing the digest actually protects) or two space-separated words.  A run of
+    bare ASCII fragments is audited, never convicted.
+    """
+    return (not _is_ascii(window)) or _word_count(window) >= 2
+
+
+def is_low_entropy_line(normalized_line: str) -> bool:
+    """True when a whole normalized line is just a path / URL / identifier.
+
+    ``/knowledge/canway-it-support/guides/access/vpn-user-guide.md`` on a line of
+    its own is a citation, not the system prompt leaking.
+    """
+    if not normalized_line:
+        return True
+    if " " in normalized_line:
+        return False
+    return all(ch in IDENTIFIER_CHARS for ch in normalized_line)
+
+
+def convicting_matches(matches: dict) -> dict:
+    """The subset of ``{position: window}`` that may carry a conviction.
+
+    Low-entropy windows are looked up like any other — the run they form is
+    worth an audit line — but they are removed before the verdict, so a cited
+    path can never redact a reply on its own.
+    """
+    return {
+        position: window
+        for position, window in matches.items()
+        if not is_low_entropy_window(window)
+    }
 
 #: Env switch for the container-side self fingerprints (default on; "0"/"false"/
 #: "no"/"off" turns them off and leaves only whatever Haro pushed).
@@ -202,6 +307,34 @@ def ngram_fingerprints(text: str) -> list[str]:
     windows: set[str] = set()
     for line in normalize_lines(text):
         windows.update(line_windows(line))
+    return sorted(ngram_hash(window) for window in windows)
+
+
+def line_fingerprints_filtered(text: str) -> list[str]:
+    """:func:`line_fingerprints` minus the pure path/URL/identifier lines.
+
+    Used for the container's OWN digest only — the tool briefs are full of
+    ``/opt/data/skills/x/SKILL.md``, and registering those would have the bot
+    redact every reply that cites where it read something.
+    """
+    return sorted(
+        {
+            line_hash(line)
+            for line in normalize_lines(text)
+            if len(line) >= MIN_LINE_RUNES and not is_low_entropy_line(line)
+        }
+    )
+
+
+def ngram_fingerprints_filtered(text: str) -> list[str]:
+    """:func:`ngram_fingerprints` minus the low-entropy windows (self digest only)."""
+    windows: set[str] = set()
+    for line in normalize_lines(text):
+        windows.update(
+            window
+            for window in line_windows(line)
+            if not is_low_entropy_window(window)
+        )
     return sorted(ngram_hash(window) for window in windows)
 
 
@@ -390,8 +523,8 @@ def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
         return current
     digest = SelfFingerprints(
         prompt_hash,
-        frozenset(line_fingerprints(text)),
-        frozenset(ngram_fingerprints(text)),
+        frozenset(line_fingerprints_filtered(text)),
+        frozenset(ngram_fingerprints_filtered(text)),
     )
     with _SELF_LOCK:
         globals()["_SELF"] = digest
@@ -492,7 +625,9 @@ def _has_adjacent_run(positions: Iterable[int]) -> bool:
 
     Positions are rune offsets of the matching windows in the reply's normalized
     text; a run continues while successive offsets differ by at most
-    :data:`NGRAM_ADJACENT_GAP`.
+    :data:`NGRAM_ADJACENT_GAP`.  Kept for callers that only have offsets;
+    :func:`classify_runs` is what the scanner uses, because a run also has to
+    prove it is made of something other than ASCII fragments.
     """
     ordered = sorted(set(positions))
     if len(ordered) < NGRAM_RUN_THRESHOLD:
@@ -505,6 +640,39 @@ def _has_adjacent_run(positions: Iterable[int]) -> bool:
     return False
 
 
+def classify_runs(matches: dict) -> tuple[bool, bool]:
+    """``(convicted, ascii_run)`` for ``{window position: window text}``.
+
+    A run of ≥ :data:`NGRAM_RUN_THRESHOLD` adjacent matches convicts only when
+    at least one of its windows :func:`window_is_convicting` — otherwise the run
+    is real but made of ASCII fragments (a path, a tool name, an English
+    identifier), which the 2026-09-11 regression showed every compliant answer
+    produces.  Those are reported as ``ascii_run`` so the operator can watch
+    them without the user losing a reply.
+    """
+    convicted = False
+    ascii_run = False
+    run: list[int] = []
+
+    def close() -> None:
+        nonlocal convicted, ascii_run
+        if len(run) < NGRAM_RUN_THRESHOLD:
+            return
+        if any(window_is_convicting(matches[position]) for position in run):
+            convicted = True
+        else:
+            ascii_run = True
+
+    for position in sorted(matches):
+        if run and position - run[-1] <= NGRAM_ADJACENT_GAP:
+            run.append(position)
+            continue
+        close()
+        run = [position]
+    close()
+    return convicted, ascii_run
+
+
 class FingerprintScanner:
     """Streaming matcher: feed content deltas, ask whether the gate has tripped.
 
@@ -513,6 +681,11 @@ class FingerprintScanner:
     windows never cross a break).  An unterminated trailing line is still judged
     *provisionally* on every delta so a single-line leak is caught before the
     frame goes out; the judgement is committed at :meth:`flush`.
+
+    Low-entropy windows are dropped before the VERDICT (and a line that is
+    nothing but a path is not looked up at all), so a digest that fingerprinted
+    a skill's paths and tool names cannot redact an answer for citing one — see
+    :func:`is_low_entropy_window` and :attr:`ascii_run`.
     """
 
     def __init__(self, fingerprints: Optional[object] = None) -> None:
@@ -520,25 +693,46 @@ class FingerprintScanner:
         self._pending = ""
         self._offset = 0  # rune offset of the pending line's start
         self._line_hits: set[str] = set()
-        self._ngram_positions: set[int] = set()
+        #: ``{window position: window text}`` — the text decides whether a run
+        #: may convict (see :func:`classify_runs`).
+        self._ngram_matches: dict[int, str] = {}
         self._ngram_hits: set[str] = set()
         # Hits from the not-yet-terminated line, recomputed on every delta.
         self._pending_line_hits: set[str] = set()
-        self._pending_positions: set[int] = set()
+        self._pending_matches: dict[int, str] = {}
         self._pending_ngram_hits: set[str] = set()
+
+    # ── verdict ────────────────────────────────────────────────────────
+    def _all_matches(self) -> dict:
+        merged = dict(self._ngram_matches)
+        merged.update(self._pending_matches)
+        return merged
 
     @property
     def hit_count(self) -> int:
-        return (
-            len(self._line_hits | self._pending_line_hits)
-            + len(self._ngram_positions | self._pending_positions)
-        )
+        return len(self._line_hits | self._pending_line_hits) + len(self._all_matches())
 
     @property
     def tripped(self) -> bool:
         if len(self._line_hits | self._pending_line_hits) >= LINE_HIT_THRESHOLD:
             return True
-        return _has_adjacent_run(self._ngram_positions | self._pending_positions)
+        return classify_runs(convicting_matches(self._all_matches()))[0]
+
+    @property
+    def ascii_run(self) -> bool:
+        """A real adjacent run that may not convict — audited, never redacted.
+
+        Either the run is built from low-entropy windows (a cited
+        ``/knowledge/…`` path: the 2026-09-11 regression's whole false-positive
+        class) or it survived the filter but carries neither a non-ASCII rune
+        nor two words.  The reply goes out; the operator gets one line.
+        """
+        if self.tripped:
+            return False
+        matches = self._all_matches()
+        if _has_adjacent_run(matches):
+            return True
+        return classify_runs(convicting_matches(matches))[1]
 
     @property
     def source(self) -> str:
@@ -577,20 +771,27 @@ class FingerprintScanner:
         if self.fp.empty:
             return False
         raw, self._pending = self._pending, ""
-        self._pending_line_hits = set()
-        self._pending_positions = set()
-        self._pending_ngram_hits = set()
+        self._clear_pending()
         self._commit_line(raw)
         return self.tripped
 
     # ── internals ──────────────────────────────────────────────────────
-    def _scan_line(self, raw: str) -> tuple[set[str], set[int], set[str], int]:
-        """``(line hits, window positions, gram hits, rune length)`` for one line."""
+    def _clear_pending(self) -> None:
+        self._pending_line_hits = set()
+        self._pending_matches = {}
+        self._pending_ngram_hits = set()
+
+    def _scan_line(self, raw: str) -> tuple[set[str], dict, set[str], int]:
+        """``(line hits, {position: window}, gram hits, rune length)`` for one line."""
         line = normalize_line(unicodedata.normalize("NFKC", raw))
         hits: set[str] = set()
-        positions: set[int] = set()
+        matches: dict[int, str] = {}
         grams: set[str] = set()
-        if self.fp.lines and len(line) >= MIN_LINE_RUNES:
+        if (
+            self.fp.lines
+            and len(line) >= MIN_LINE_RUNES
+            and not is_low_entropy_line(line)
+        ):
             digest = line_hash(line)
             if digest in self.fp.lines:
                 hits.add(digest)
@@ -598,32 +799,28 @@ class FingerprintScanner:
             for index, window in enumerate(line_windows(line)):
                 digest = ngram_hash(window)
                 if digest in self.fp.ngrams:
-                    positions.add(self._offset + index)
+                    matches[self._offset + index] = window
                     grams.add(digest)
-        return hits, positions, grams, len(line)
+        return hits, matches, grams, len(line)
 
     def _commit_line(self, raw: str) -> None:
-        hits, positions, grams, length = self._scan_line(raw)
+        hits, matches, grams, length = self._scan_line(raw)
         self._line_hits |= hits
-        self._ngram_positions |= positions
+        self._ngram_matches.update(matches)
         self._ngram_hits |= grams
         # +1 for the '\n' that separated this line from the next, so windows of
         # two different lines can never look adjacent.
         self._offset += length + 1
-        self._pending_line_hits = set()
-        self._pending_positions = set()
-        self._pending_ngram_hits = set()
+        self._clear_pending()
 
     def _probe_pending(self) -> None:
         """Judge the unterminated line without committing it (bounded cost)."""
         if not self._pending or len(self._pending) > MAX_PENDING_LINE_CHARS:
-            self._pending_line_hits = set()
-            self._pending_positions = set()
-            self._pending_ngram_hits = set()
+            self._clear_pending()
             return
-        hits, positions, grams, _ = self._scan_line(self._pending)
+        hits, matches, grams, _ = self._scan_line(self._pending)
         self._pending_line_hits = hits
-        self._pending_positions = positions
+        self._pending_matches = matches
         self._pending_ngram_hits = grams
 
 

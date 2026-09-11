@@ -368,9 +368,44 @@ def test_normalize_line_collapses_punctuation_and_digits():
     assert rg.normalize_line("第 1 项检查通过") != rg.normalize_line("第 2 项检查通过")
 
 
+_REPEATED_LINE = (
+    "这是一句被模型反复输出的中文句子，用来验证复读守卫仍然按四次重复来判定，"
+    "而不是三次；它本身足够长，所以三次重复就已经越过了两百字符的下限。"
+)
+
+
 def test_normalized_line_loop_needs_four_occurrences():
-    assert rg.normalized_line_loop_detected("同一句话。\n" * 3) is False
-    assert rg.normalized_line_loop_detected("同一句话。\n" * 4) is True
+    three = _REPEATED_LINE + "\n" + (_REPEATED_LINE + "\n") * 2
+    # Long past the 200-character floor, so only the repeat count can decide.
+    assert len(three) >= rg.LINE_LOOP_MIN_TOTAL_CHARS
+    assert rg.normalized_line_loop_detected(three) is False
+    assert rg.normalized_line_loop_detected(three + _REPEATED_LINE + "\n") is True
+
+
+def test_short_replies_never_trip_the_line_loop_guard():
+    """2026-09-11 regression: 「你是谁？」 was aborted as a repetition loop.
+
+    The real reply was a one-sentence identity statement the model restated a
+    couple of times; under 200 characters nothing may be judged a loop.
+    """
+    identity = (
+        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
+        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
+        "我是 haro管理员，由 嘉为科技 Haro 平台 提供。\n"
+    )
+    assert len(identity) < rg.LINE_LOOP_MIN_TOTAL_CHARS
+    assert rg.normalized_line_loop_detected(identity) is False
+    assert rg.tail_repetition_detected(identity) is False
+    # …and a bare four-times-repeated short line is still under the floor.
+    assert rg.normalized_line_loop_detected("同一句话。\n" * 4) is False
+
+
+def test_short_normalized_lines_are_ignored():
+    """A 5-rune line repeating is below LINE_LOOP_MIN_CHARS even when long."""
+    text = "收到，好的。\n" * 60
+    assert len(text) >= rg.LINE_LOOP_MIN_TOTAL_CHARS
+    assert len(rg.normalize_line("收到，好的。")) < rg.LINE_LOOP_MIN_CHARS
+    assert rg.normalized_line_loop_detected(text) is False
 
 
 def test_normalized_line_loop_window_forgets_old_lines():

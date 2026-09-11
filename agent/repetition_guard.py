@@ -86,6 +86,13 @@ STREAM_MIN_REPEATS = 3
 # streaming loop is the hottest path in the agent).
 STREAM_CHECK_INTERVAL = 256
 
+# Nothing shorter than this may be judged a loop at all (2026-09-11 regression:
+# "你是谁？" was answered with three short variants of one identity sentence and
+# the guard aborted the turn). A reply that has not yet cost 200 characters has
+# not cost anything worth aborting for, and a model that really is looping will
+# cross the line within milliseconds.
+STREAM_MIN_REPLY_CHARS = 200
+
 
 def stream_repetition_guard_enabled() -> bool:
     """False when ``HERMES_REPETITION_GUARD`` is set to a falsey value."""
@@ -112,6 +119,8 @@ def tail_repetition_detected(
     """
     if not isinstance(text, str):
         return False
+    if len(text) < STREAM_MIN_REPLY_CHARS:
+        return False
     if len(text) < fragment * min_repeats:
         return False
     tail = text[-window:]
@@ -130,18 +139,25 @@ def tail_repetition_detected(
 # punctuation and digits collapses those variants onto one key and trips the
 # guard at 3388 characters instead — before the model can burn 16k tokens.
 #
-# Deliberately narrow: FOUR occurrences of the same normalized line inside a
-# forty-line window.  A genuine list or table repeats structure, not content,
-# so its normalized lines stay distinct; a heading legitimately recurring three
-# times in forty lines is still under the bar.
+# Deliberately narrow: FOUR occurrences of the same normalized line — of at
+# least LINE_LOOP_MIN_CHARS runes, inside a forty-line window, and never before
+# the reply has cost LINE_LOOP_MIN_TOTAL_CHARS characters.  A genuine list or
+# table repeats structure, not content, so its normalized lines stay distinct; a
+# heading legitimately recurring three times in forty lines is still under the
+# bar; and a two-line identity answer (「你是谁？」, 2026-09-11) is never judged
+# at all.
 
 # Sliding window, in non-empty normalized lines.
 LINE_LOOP_WINDOW = 40
 # Occurrences of one normalized line inside that window that trip the guard.
 LINE_LOOP_MIN_REPEATS = 4
-# Normalized lines below this length are ignored: "1." / "是" / "```" recur
-# legitimately in any structured answer.
-LINE_LOOP_MIN_CHARS = 2
+# Normalized lines below this length are ignored: "1." / "是" / "```" / "收到"
+# recur legitimately in any structured answer, and a short identity sentence
+# ("我是 haro管理员") repeated by a polite model is not a degeneration.
+LINE_LOOP_MIN_CHARS = 6
+# …and no verdict at all before the reply has cost this many raw characters,
+# for the same reason as STREAM_MIN_REPLY_CHARS above.
+LINE_LOOP_MIN_TOTAL_CHARS = STREAM_MIN_REPLY_CHARS
 
 _LINE_NOISE_RE = _re.compile(r"\s+")
 _LINE_PUNCT_RE = _re.compile(r"[^\w]+", _re.UNICODE)
@@ -172,12 +188,16 @@ class NormalizedLineLoopDetector:
     """
 
     def __init__(self, *, window: int = LINE_LOOP_WINDOW, min_repeats: int = LINE_LOOP_MIN_REPEATS,
-                 min_chars: int = LINE_LOOP_MIN_CHARS) -> None:
+                 min_chars: int = LINE_LOOP_MIN_CHARS,
+                 min_total_chars: int = LINE_LOOP_MIN_TOTAL_CHARS) -> None:
         self._window = deque(maxlen=window)
         self._counts: Counter = Counter()
         self._min_repeats = min_repeats
         self._min_chars = min_chars
+        self._min_total_chars = min_total_chars
         self._pending = ""
+        #: Raw characters fed so far — the guard stays silent below the floor.
+        self._total_chars = 0
         self.tripped = False
 
     def feed(self, text: str) -> bool:
@@ -186,6 +206,7 @@ class NormalizedLineLoopDetector:
             return True
         if not isinstance(text, str) or not text:
             return False
+        self._total_chars += len(text)
         self._pending += text
         if "\n" not in self._pending:
             return False
@@ -206,6 +227,10 @@ class NormalizedLineLoopDetector:
                 del self._counts[evicted]
         self._window.append(key)
         self._counts[key] += 1
+        if self._total_chars < self._min_total_chars:
+            # Counted, so the window is warm the moment the reply grows past the
+            # floor — only the VERDICT waits.
+            return False
         if self._counts[key] >= self._min_repeats:
             self.tripped = True
             return True
