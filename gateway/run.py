@@ -1337,7 +1337,10 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 
 
 # Tool output may hold literal MEDIA: examples (docs, logs); only deliberate media producers may auto-append.
-_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image_generate"}
+# compose_sheet is a fork-only producer (tools/compose_sheet_tool.py): its result's last line is either a
+# single "MEDIA:/opt/data/cache/sheets/xxx.jpg" tag or "NO_IMAGES" (no MEDIA: substring, never matches). It
+# goes through the generic "MEDIA:" in content path below, same as text_to_speech — no dedicated branch needed.
+_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image_generate", "compose_sheet"}
 
 # Replay-tail sanitization lives in agent/replay_cleanup.py so every resume surface shares one implementation.
 from agent.replay_cleanup import (  # noqa: E402

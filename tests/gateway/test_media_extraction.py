@@ -326,6 +326,56 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_gateway_auto_append_collects_compose_sheet_media_tag(self):
+        """compose_sheet (fork-only long-image producer) must auto-append its MEDIA: tag,
+        same as text_to_speech/image_generate. Regression for the 2026-09-11 15:49 report
+        where a generated printer-guide long image never reached the WeCom user because
+        compose_sheet was missing from _AUTO_APPEND_MEDIA_TOOL_NAMES."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "北京打印机怎么用"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sheet", "function": {"name": "compose_sheet"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sheet",
+                "content": "MEDIA:/opt/data/cache/sheets/steps-1.jpg",
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/opt/data/cache/sheets/steps-1.jpg"]
+        assert voice is False
+
+    def test_gateway_auto_append_compose_sheet_no_images_yields_no_tags(self):
+        """compose_sheet's NO_IMAGES sentinel has no MEDIA: substring, so it must not
+        match and no tag should be collected."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "北京打印机怎么用"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sheet", "function": {"name": "compose_sheet"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sheet",
+                "content": "NO_IMAGES",
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == []
+        assert voice is False
+
 
     def test_collect_history_media_paths_includes_image_generate_json(self):
         """Regression for #46627: the history media-path collector must pick up
