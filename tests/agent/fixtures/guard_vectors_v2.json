@@ -1,0 +1,316 @@
+{
+  "_comment": "跨语言对拍向量 v2（契约 §6 低熵过滤）：Haro Go 侧生成器必须逐字节复现。见 agent/leak_fingerprints.py。lineHashes/ngrams 均去重升序。",
+  "version": 2,
+  "normalize": "nfkc+trim+collapse-ws+ascii-lower+lowentropy-v2",
+  "line": {
+    "hash": "sha256-16",
+    "minRunes": 12
+  },
+  "ngram": {
+    "n": 8,
+    "unit": "rune",
+    "hash": "fnv1a-64"
+  },
+  "lowEntropy": {
+    "fence": [
+      "```",
+      "~~~"
+    ],
+    "markdownMarkers": "-*>#| and ordered-list prefixes (1. / 2))",
+    "identifierChars": "A-Za-z0-9_/.:-+=?&%#@~",
+    "minAsciiLineRunes": 24,
+    "windowNeedsNonAscii": true,
+    "reasons": [
+      "fenced",
+      "ascii_ident",
+      "short_ascii"
+    ]
+  },
+  "cases": [
+    {
+      "name": "fenced_block_drops_chinese_inside",
+      "note": "围栏代码块整体剔除：块内的中文行不登记，围栏行本身也不登记",
+      "raw": "说明如下：请照抄下面的命令执行\n```bash\n这一行在围栏里面必须整体剔除掉\n```\n说明结束：请按照上面的步骤逐条操作。\n",
+      "normalized_lines": [
+        "说明如下:请照抄下面的命令执行",
+        "说明结束:请按照上面的步骤逐条操作。"
+      ],
+      "dropped_lines": [
+        {
+          "line": "```bash",
+          "reason": "fenced"
+        },
+        {
+          "line": "这一行在围栏里面必须整体剔除掉",
+          "reason": "fenced"
+        },
+        {
+          "line": "```",
+          "reason": "fenced"
+        }
+      ],
+      "lineHashes": [
+        "7b925e82c829b05da7821028a4c73243",
+        "99dad6517a4abedea12d3430b3f840ab"
+      ],
+      "ngrams": [
+        "003923562a3d2f0c",
+        "0172b17711393dec",
+        "048fd9c581fbcba1",
+        "09eb48a5cc4bcbe9",
+        "12697ec9e0397a3e",
+        "2ef4616a41854920",
+        "3c18a83b5619a426",
+        "3f968060a2a6b250",
+        "4272864fdad6ec9c",
+        "439b916b8bf742a5",
+        "4c7322a734ec7d89",
+        "59729add8feb9ac0",
+        "7c770c357783f022",
+        "8798bae91336965d",
+        "88effad4a961bb87",
+        "8984e60ab3d56163",
+        "ab274fc5d6f8d5e5",
+        "dc6a3e32e806784d",
+        "f4b0dd4949599a64"
+      ]
+    },
+    {
+      "name": "unterminated_fence_runs_to_eof",
+      "note": "未配对的围栏视为到文末，后续所有行都剔除",
+      "raw": "这一行在围栏之前必须完整保留下来\n~~~\n围栏未配对,这一行同样要被剔除掉\n",
+      "normalized_lines": [
+        "这一行在围栏之前必须完整保留下来"
+      ],
+      "dropped_lines": [
+        {
+          "line": "~~~",
+          "reason": "fenced"
+        },
+        {
+          "line": "围栏未配对,这一行同样要被剔除掉",
+          "reason": "fenced"
+        }
+      ],
+      "lineHashes": [
+        "0c21902d69f325000d0c466bd34f366b"
+      ],
+      "ngrams": [
+        "00ebd688bc164db1",
+        "426622398e5e8328",
+        "7b0674f1890278fb",
+        "8910970cc8a2c9e9",
+        "d1f502aa0d321f55",
+        "dcfb7d697b84999d",
+        "e091c47113bb07c5",
+        "f84f6225b0be005b",
+        "fbfc63f9efd9a8c4"
+      ]
+    },
+    {
+      "name": "bullet_path_is_ascii_ident",
+      "note": "去掉 markdown 记号后是纯路径 → ascii_ident 剔除",
+      "raw": "- /opt/data/skills/x/SKILL.md\n技能目录的用途说明这一行要保留下来\n",
+      "normalized_lines": [
+        "技能目录的用途说明这一行要保留下来"
+      ],
+      "dropped_lines": [
+        {
+          "line": "- /opt/data/skills/x/skill.md",
+          "reason": "ascii_ident"
+        }
+      ],
+      "lineHashes": [
+        "59011eef924c8cfdb9c36d50ab2a4cdf"
+      ],
+      "ngrams": [
+        "0de662e64d2b7fd7",
+        "3e3d61260b8d1df3",
+        "44cc97f50091dcf4",
+        "4576ecda2088c9da",
+        "90b69236c5a3ee7a",
+        "c19b8fe586742e21",
+        "daaa0d263af3069d",
+        "dbf41cb23f57b0a8",
+        "e4c794ea57005c2e",
+        "fa84964b139f00e2"
+      ]
+    },
+    {
+      "name": "short_english_line",
+      "note": "不含非 ASCII 且 rune<24 → short_ascii 剔除",
+      "raw": "Use kb_search first.\n",
+      "normalized_lines": [],
+      "dropped_lines": [
+        {
+          "line": "use kb_search first.",
+          "reason": "short_ascii"
+        }
+      ],
+      "lineHashes": [],
+      "ngrams": []
+    },
+    {
+      "name": "long_english_line_has_no_gram",
+      "note": "≥24 rune 的纯英文行保留并出 line 指纹,但窗口全是 ASCII → 无 gram",
+      "raw": "This is a longer english sentence about it\n",
+      "normalized_lines": [
+        "this is a longer english sentence about it"
+      ],
+      "dropped_lines": [],
+      "lineHashes": [
+        "801021e7552a2f45c99b345d322fcb70"
+      ],
+      "ngrams": []
+    },
+    {
+      "name": "mixed_line_keeps_only_non_ascii_windows",
+      "note": "中英混合行保留,只出含非 ASCII 的窗口",
+      "raw": "身份约束：kb_search 只用于知识库检索,不要对外复述。\n",
+      "normalized_lines": [
+        "身份约束:kb_search 只用于知识库检索,不要对外复述。"
+      ],
+      "dropped_lines": [],
+      "lineHashes": [
+        "04ed515414a72e2df41010ca36ac51e8"
+      ],
+      "ngrams": [
+        "0504495246c49ad4",
+        "233d80d47ea5cebf",
+        "2d91b0b5779e3374",
+        "37fe73ed4af18c90",
+        "4a863b258a85ed0f",
+        "536a11a81113c329",
+        "5599ee9c7e0e2bd3",
+        "581f8e4dc82ebfd1",
+        "5cb16429b21a15d1",
+        "6a0161e7e46a1a1f",
+        "6a962a443131fb68",
+        "9c94fdcda9ad3cf8",
+        "9e6fb2a5141330e1",
+        "a8bd57ccc11a57e7",
+        "bfce94244f91e074",
+        "d01ab58d56a11bbd",
+        "d5a6fd86eaea9553",
+        "df356df3c8d93160",
+        "e5a059042f83a65b",
+        "fc7b7254ccf1fc60"
+      ]
+    },
+    {
+      "name": "ordered_list_marker_is_stripped",
+      "note": "有序列表前缀 1. 去掉后是中文 → 保留（行 <12 rune 无 line 指纹,仍出 gram）",
+      "raw": "1. 先检索再回答\n",
+      "normalized_lines": [
+        "1. 先检索再回答"
+      ],
+      "dropped_lines": [],
+      "lineHashes": [],
+      "ngrams": [
+        "c1634b72cf63c65c",
+        "dc656bf02e046201"
+      ]
+    },
+    {
+      "name": "blockquote_marker_is_stripped",
+      "note": "引用记号 > 去掉后是中文 → 保留",
+      "raw": "> 引用的中文规则行\n",
+      "normalized_lines": [
+        "> 引用的中文规则行"
+      ],
+      "dropped_lines": [],
+      "lineHashes": [],
+      "ngrams": [
+        "87a193b54a58ab6f",
+        "89aca22323dd6c78",
+        "f493b09c66c1a188"
+      ]
+    },
+    {
+      "name": "crlf_and_fullwidth",
+      "note": "CRLF 换行 + 全角 NFKC 折叠 + 全角冒号",
+      "raw": "第一行：ＡＢＣ 采集进程是否正常运行\r\n第二行：ok\r\n",
+      "normalized_lines": [
+        "第一行:abc 采集进程是否正常运行",
+        "第二行:ok"
+      ],
+      "dropped_lines": [],
+      "lineHashes": [
+        "9f15c83f15aefaaa52f428d72dedbd27"
+      ],
+      "ngrams": [
+        "2007d0c2c58f3086",
+        "21385717981c67d9",
+        "2491738d3134ff25",
+        "2cec7b681c7c84f3",
+        "319e86a7634b5f94",
+        "3b9b298c7ae5145b",
+        "4243c6f2189d781d",
+        "535486f5251a0b36",
+        "723a1d4cc7fca1f6",
+        "95db105c74ae60ca",
+        "adeec47912aae6f7"
+      ]
+    },
+    {
+      "name": "mixed_document",
+      "note": "综合文档：围栏 / 路径行 / 短英文行 / 长英文行 / 中文正文各一",
+      "raw": "回答末尾必须列出实际依据的来源路径，一行一个。\n* /knowledge/canway-it-support/guides/access/vpn-user-guide.md\nUse kb_search first.\nThis is a longer english sentence about it\n```json\n{\"a\": 1}\n这一行也在围栏内要剔\n```\n1. 先检索再回答\n",
+      "normalized_lines": [
+        "回答末尾必须列出实际依据的来源路径,一行一个。",
+        "this is a longer english sentence about it",
+        "1. 先检索再回答"
+      ],
+      "dropped_lines": [
+        {
+          "line": "* /knowledge/canway-it-support/guides/access/vpn-user-guide.md",
+          "reason": "ascii_ident"
+        },
+        {
+          "line": "use kb_search first.",
+          "reason": "short_ascii"
+        },
+        {
+          "line": "```json",
+          "reason": "fenced"
+        },
+        {
+          "line": "{\"a\": 1}",
+          "reason": "fenced"
+        },
+        {
+          "line": "这一行也在围栏内要剔",
+          "reason": "fenced"
+        },
+        {
+          "line": "```",
+          "reason": "fenced"
+        }
+      ],
+      "lineHashes": [
+        "7dadb07ebbefc59cae56523a68a38b7a",
+        "801021e7552a2f45c99b345d322fcb70"
+      ],
+      "ngrams": [
+        "249baeece0cbdef0",
+        "2f21324df24ca963",
+        "3bcb6c05c7ec265c",
+        "41f211e982493e51",
+        "48a663af9fedfa85",
+        "6a70dc8737e3c6d5",
+        "6b9eb5dcb89caa1e",
+        "875ebccce20a2323",
+        "87623534bd7e6c9d",
+        "92e8a92a14e28082",
+        "95f3114dc87a720d",
+        "a9195d1d701b40ec",
+        "b51e0d3e268f09e8",
+        "bc811cdf91596faa",
+        "c1634b72cf63c65c",
+        "c91b23272918a074",
+        "dc656bf02e046201",
+        "e0d69d46792eed9b"
+      ]
+    }
+  ]
+}

@@ -30,10 +30,18 @@ sides must produce byte-identical hashes, so every step is pinned:
   fewer than 8 runes contributes no gram.  The file-wide list is deduplicated
   and sorted ascending.
 
+FORMAT v2 (contract §6, 2026-09-11) adds three BUILD-side gates, applied by the
+Go generator and by this module alike, so both sides protect the same set:
+fenced code blocks contribute nothing; a line that is bare path/identifier runes
+after its markdown markers are stripped, or that holds no non-ASCII rune and is
+under 24 runes, contributes nothing; and only a window holding a non-ASCII rune
+becomes a gram.  ``build_fingerprints(..., version=1)`` still writes the
+original unfiltered digest, and both versions are read.
+
 On-disk shape::
 
-    {"version": 1, "botId": "…", "generatedAt": "<RFC3339>",
-     "normalize": "nfkc+trim+collapse-ws+ascii-lower",
+    {"version": 2, "botId": "…", "generatedAt": "<RFC3339>",
+     "normalize": "nfkc+trim+collapse-ws+ascii-lower+lowentropy-v2",
      "line":  {"hash": "sha256-16", "minRunes": 12},
      "ngram": {"n": 8, "unit": "rune", "hash": "fnv1a-64"},
      "sources": [{"id": "answer_rules", "lines": 12, "ngrams": 430}, …],
@@ -92,8 +100,15 @@ from typing import Iterable, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 # ── contract constants (mirrored in the Haro Go generator) ─────────────
-FORMAT_VERSION = 1
-NORMALIZE_ID = "nfkc+trim+collapse-ws+ascii-lower"
+#: Digest format written by default: v2 applies the §6 low-entropy build-side
+#: filter below.  v1 (no filter) is still written on request and still read.
+FORMAT_VERSION = 2
+FORMAT_VERSION_V1 = 1
+SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})
+NORMALIZE_ID_V1 = "nfkc+trim+collapse-ws+ascii-lower"
+NORMALIZE_ID_V2 = "nfkc+trim+collapse-ws+ascii-lower+lowentropy-v2"
+#: Backwards-compatible alias: the v1 normalization id.
+NORMALIZE_ID = NORMALIZE_ID_V1
 LINE_HASH_ID = "sha256-16"
 LINE_HASH_BYTES = 16
 #: A normalized line shorter than this is not registered: "是"/"步骤如下" recur
@@ -205,6 +220,122 @@ def convicting_matches(matches: dict) -> dict:
         if not is_low_entropy_window(window)
     }
 
+# ── §6 low-entropy build-side filter, v2 (2026-09-11) ──────────────────
+# The match-side filter above keeps a *cited path* from redacting a reply, but
+# the low-entropy material is still in the digest, and both sides have to agree
+# on what is in it.  Contract §6 therefore moves three gates to the BUILD side,
+# where Haro's Go generator applies exactly the same three:
+#
+#   1. a fenced code block (``` / ~~~ up to its matching fence, fences included,
+#      an unterminated fence running to EOF) contributes nothing at all;
+#   2. a line whose markdown markers have been stripped is dropped when it is
+#      nothing but path/URL/identifier runes with no space (``ascii_ident``), or
+#      when it holds no non-ASCII rune at all and is shorter than 24 runes
+#      (``short_ascii``);
+#   3. an 8-rune window with no non-ASCII rune contributes no gram.
+#
+# Two things are deliberately NOT moved.  The marker stripping decides only
+# whether a line is kept — the hashes are still taken over the whole normalized
+# line, so a line that survives both versions keeps the same fingerprint.  And
+# the match-side filter stays in place as a double safety, because a v1 digest
+# (Haro not yet upgraded) still has to be survivable.
+
+#: Markdown line markers stripped from both ends before the v2 line tests.
+MD_MARKER_CHARS = "-*>#|"
+#: An ordered-list prefix (``1.`` / ``2)``) at the head of a line.
+_ORDERED_LIST_RE = re.compile(r"\d+[.)](?=\s|$)")
+#: Runes that on their own spell a path / URL / query string / identifier.
+#: A superset of :data:`IDENTIFIER_CHARS` — §6 also covers ``?a=b&c#d``.
+V2_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789_/.:-+=?&%#@~"
+)
+#: An all-ASCII line shorter than this carries no evidence ("Use kb_search first.").
+V2_MIN_ASCII_LINE_RUNES = 24
+#: Opening/closing code fences.
+FENCE_MARKERS = ("```", "~~~")
+
+#: Drop reasons recorded by :func:`classify_lines_v2` (and by the v2 vectors).
+DROP_FENCED = "fenced"
+DROP_ASCII_IDENT = "ascii_ident"
+DROP_SHORT_ASCII = "short_ascii"
+
+
+def strip_markdown_markers(normalized_line: str) -> str:
+    """Strip leading/trailing markdown markers (``- * > # |``, ``1.``/``2)``).
+
+    Only the v2 keep/drop decision looks at the result; the fingerprints are
+    still taken over the unstripped normalized line.
+    """
+    text = normalized_line.strip()
+    while text:
+        before = text
+        match = _ORDERED_LIST_RE.match(text)
+        if match:
+            text = text[match.end():].lstrip(" ")
+        text = text.lstrip(MD_MARKER_CHARS + " ")
+        if text == before:
+            break
+    return text.rstrip(MD_MARKER_CHARS + " ").strip()
+
+
+def fence_marker(normalized_line: str) -> Optional[str]:
+    """The fence marker a line opens/closes with, or ``None``."""
+    for marker in FENCE_MARKERS:
+        if normalized_line.startswith(marker):
+            return marker
+    return None
+
+
+def line_drop_reason_v2(normalized_line: str) -> Optional[str]:
+    """Why §6 drops this (non-fenced) normalized line, or ``None`` to keep it."""
+    text = strip_markdown_markers(normalized_line)
+    if not text:
+        return DROP_SHORT_ASCII
+    if " " not in text and all(ch in V2_IDENTIFIER_CHARS for ch in text):
+        return DROP_ASCII_IDENT
+    if _is_ascii(text) and len(text) < V2_MIN_ASCII_LINE_RUNES:
+        return DROP_SHORT_ASCII
+    return None
+
+
+def window_is_registered_v2(window: str) -> bool:
+    """§6 rule 3 — only a window holding a non-ASCII rune becomes a gram."""
+    return not _is_ascii(window)
+
+
+def classify_lines_v2(text: str) -> list[tuple[str, Optional[str]]]:
+    """``[(normalized_line, drop_reason or None), …]``, empty lines omitted.
+
+    The single place the three §6 gates are decided, so the generator, the
+    self digest and the vectors can never disagree with one another.
+    """
+    out: list[tuple[str, Optional[str]]] = []
+    open_fence: Optional[str] = None
+    for line in normalize_lines(text):
+        if open_fence is not None:
+            if line:
+                out.append((line, DROP_FENCED))
+            if line.startswith(open_fence):
+                open_fence = None
+            continue
+        marker = fence_marker(line)
+        if marker is not None:
+            open_fence = marker
+            out.append((line, DROP_FENCED))
+            continue
+        if not line:
+            continue
+        out.append((line, line_drop_reason_v2(line)))
+    return out
+
+
+def kept_lines_v2(text: str) -> list[str]:
+    """The normalized lines §6 keeps, in order."""
+    return [line for line, reason in classify_lines_v2(text) if reason is None]
+
+
 #: Env switch for the container-side self fingerprints (default on; "0"/"false"/
 #: "no"/"off" turns them off and leaves only whatever Haro pushed).
 SELF_FINGERPRINT_ENV = "HERMES_GUARD_SELF_FINGERPRINT"
@@ -289,53 +420,66 @@ def line_windows(normalized_line: str) -> list[str]:
     ]
 
 
-def line_fingerprints(text: str) -> list[str]:
-    """Registered line hashes of ``text`` (deduplicated, ascending)."""
+def _check_version(version: int) -> int:
+    version = int(version)
+    if version not in SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(f"unsupported fingerprint format version: {version!r}")
+    return version
+
+
+def build_lines(text: str, version: int = FORMAT_VERSION) -> list[str]:
+    """The normalized lines a digest of ``version`` is built from."""
+    if _check_version(version) == FORMAT_VERSION_V1:
+        return [line for line in normalize_lines(text) if line]
+    return kept_lines_v2(text)
+
+
+def line_fingerprints(text: str, version: int = FORMAT_VERSION) -> list[str]:
+    """Registered line hashes of ``text`` (deduplicated, ascending).
+
+    ``version=2`` (the default) applies the §6 build-side filter first;
+    ``version=1`` reproduces the original unfiltered contract byte for byte.
+    """
     return sorted(
         {
             line_hash(line)
-            for line in normalize_lines(text)
+            for line in build_lines(text, version)
             if len(line) >= MIN_LINE_RUNES
         }
     )
 
 
-def ngram_fingerprints(text: str) -> list[str]:
-    """8-gram hashes of ``text`` (deduplicated, ascending)."""
+def ngram_fingerprints(text: str, version: int = FORMAT_VERSION) -> list[str]:
+    """8-gram hashes of ``text`` (deduplicated, ascending).
+
+    ``version=2`` (the default) drops the lines §6 drops and then keeps only the
+    windows holding a non-ASCII rune; ``version=1`` keeps every window.
+    """
     # Windows are deduplicated BEFORE hashing: a 10 KB prompt repeats plenty of
     # them, and fnv1a over a window is the whole cost of generation.
+    keep = (
+        (lambda _window: True)
+        if _check_version(version) == FORMAT_VERSION_V1
+        else window_is_registered_v2
+    )
     windows: set[str] = set()
-    for line in normalize_lines(text):
-        windows.update(line_windows(line))
+    for line in build_lines(text, version):
+        windows.update(window for window in line_windows(line) if keep(window))
     return sorted(ngram_hash(window) for window in windows)
 
 
 def line_fingerprints_filtered(text: str) -> list[str]:
-    """:func:`line_fingerprints` minus the pure path/URL/identifier lines.
+    """The v2 line hashes — the set the container's own digest registers.
 
-    Used for the container's OWN digest only — the tool briefs are full of
-    ``/opt/data/skills/x/SKILL.md``, and registering those would have the bot
-    redact every reply that cites where it read something.
+    Kept as a name because the self digest used to filter on its own; it is now
+    exactly :func:`line_fingerprints` at v2, so the two sides cannot drift.
     """
-    return sorted(
-        {
-            line_hash(line)
-            for line in normalize_lines(text)
-            if len(line) >= MIN_LINE_RUNES and not is_low_entropy_line(line)
-        }
-    )
+    return line_fingerprints(text, FORMAT_VERSION)
 
 
 def ngram_fingerprints_filtered(text: str) -> list[str]:
-    """:func:`ngram_fingerprints` minus the low-entropy windows (self digest only)."""
-    windows: set[str] = set()
-    for line in normalize_lines(text):
-        windows.update(
-            window
-            for window in line_windows(line)
-            if not is_low_entropy_window(window)
-        )
-    return sorted(ngram_hash(window) for window in windows)
+    """The v2 8-gram hashes — see :func:`line_fingerprints_filtered`."""
+    return ngram_fingerprints(text, FORMAT_VERSION)
 
 
 def _rfc3339_now() -> str:
@@ -353,14 +497,20 @@ def build_fingerprints(
     *,
     bot_id: str,
     generated_at: Optional[str] = None,
+    version: int = FORMAT_VERSION,
 ) -> dict:
-    """The on-disk digest for ``[(source_id, text), …]``. Hashes only, never text."""
+    """The on-disk digest for ``[(source_id, text), …]``. Hashes only, never text.
+
+    ``version=2`` (the default) is the §6 low-entropy build; pass
+    ``version=1`` for the original unfiltered contract.
+    """
+    version = _check_version(version)
     lines: set[str] = set()
     ngrams: set[str] = set()
     manifest = []
     for source_id, text in sources:
-        source_lines = line_fingerprints(text)
-        source_ngrams = ngram_fingerprints(text)
+        source_lines = line_fingerprints(text, version)
+        source_ngrams = ngram_fingerprints(text, version)
         lines.update(source_lines)
         ngrams.update(source_ngrams)
         manifest.append(
@@ -371,10 +521,12 @@ def build_fingerprints(
             }
         )
     return {
-        "version": FORMAT_VERSION,
+        "version": version,
         "botId": str(bot_id or ""),
         "generatedAt": generated_at or _rfc3339_now(),
-        "normalize": NORMALIZE_ID,
+        "normalize": (
+            NORMALIZE_ID_V1 if version == FORMAT_VERSION_V1 else NORMALIZE_ID_V2
+        ),
         "line": {"hash": LINE_HASH_ID, "minRunes": MIN_LINE_RUNES},
         "ngram": {"n": NGRAM_N, "unit": NGRAM_UNIT, "hash": NGRAM_HASH_ID},
         "sources": manifest,
@@ -404,6 +556,7 @@ class FingerprintStore:
         self._stamp: Optional[tuple] = None
         self._path: Optional[str] = None
         self.bot_id: str = ""
+        self.format_version: int = 0
         self.ngrams: frozenset[str] = frozenset()
         self.lines: frozenset[str] = frozenset()
 
@@ -418,6 +571,7 @@ class FingerprintStore:
     def _clear(self) -> None:
         self.ngrams = self.lines = frozenset()
         self.bot_id = ""
+        self.format_version = 0
 
     def refresh(self, path: Optional[str] = None) -> "FingerprintStore":
         """Re-read the digest if it changed. Never raises: a broken file is
@@ -442,12 +596,28 @@ class FingerprintStore:
                 if not isinstance(data, dict):
                     raise ValueError("fingerprint digest is not an object")
                 self.bot_id = str(data.get("botId") or "")
+                try:
+                    self.format_version = int(data.get("version") or 0)
+                except (TypeError, ValueError):
+                    self.format_version = 0
+                # v1 and v2 differ only in WHAT was fingerprinted; the hash
+                # encoding is identical, so both read the same way (and an
+                # unknown future version still loads rather than going inert —
+                # the match side's own low-entropy filter is the backstop).
+                if self.format_version not in SUPPORTED_FORMAT_VERSIONS:
+                    logger.warning(
+                        "Reply guard: fingerprint digest %s declares version %r "
+                        "(known: %s) — reading its hashes anyway.",
+                        path, self.format_version,
+                        sorted(SUPPORTED_FORMAT_VERSIONS),
+                    )
                 self.lines = frozenset(str(h) for h in (data.get("lines") or []))
                 self.ngrams = frozenset(str(h) for h in (data.get("ngrams") or []))
                 logger.info(
                     "Reply guard: loaded %d line and %d 8-gram fingerprints "
-                    "(bot=%s) from %s",
-                    len(self.lines), len(self.ngrams), self.bot_id or "-", path,
+                    "(bot=%s, format v%d) from %s",
+                    len(self.lines), len(self.ngrams), self.bot_id or "-",
+                    self.format_version, path,
                 )
             except Exception:
                 logger.warning(
@@ -523,8 +693,11 @@ def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
         return current
     digest = SelfFingerprints(
         prompt_hash,
-        frozenset(line_fingerprints_filtered(text)),
-        frozenset(ngram_fingerprints_filtered(text)),
+        # Same §6 v2 build as the generator — the two halves of the union must
+        # be built by one rule, or a v2 Haro digest and a v1-ish self digest
+        # would disagree about what counts as protected.
+        frozenset(line_fingerprints(text, FORMAT_VERSION)),
+        frozenset(ngram_fingerprints(text, FORMAT_VERSION)),
     )
     with _SELF_LOCK:
         globals()["_SELF"] = digest

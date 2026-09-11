@@ -17,7 +17,8 @@ inert.
 This is the reference writer for the format described in
 ``agent/leak_fingerprints.py``, which also holds the matching side and the
 thresholds.  The Haro Go generator must agree with it byte for byte;
-``tests/agent/fixtures/guard_vectors.json`` is the cross-check corpus.
+``tests/agent/fixtures/guard_vectors_v2.json`` is the cross-check corpus for the
+default v2 build; ``guard_vectors.json`` pins the v1 one (``--format-version 1``).
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.leak_fingerprints import build_fingerprints, read_sources  # noqa: E402
+from agent.leak_fingerprints import (  # noqa: E402
+    FORMAT_VERSION,
+    SUPPORTED_FORMAT_VERSIONS,
+    build_fingerprints,
+    read_sources,
+)
 
 
 def parse_source(raw: str) -> tuple[str, str]:
@@ -52,6 +58,11 @@ def main(argv=None) -> int:
     parser.add_argument("--generated-at",
                         help="RFC3339 timestamp (default: now, UTC) — pin it for "
                              "reproducible output")
+    parser.add_argument("--format-version", type=int, default=FORMAT_VERSION,
+                        choices=sorted(SUPPORTED_FORMAT_VERSIONS),
+                        help="digest format: 2 (default) applies the contract §6 "
+                             "low-entropy filter; 1 writes the original "
+                             "unfiltered digest")
     parser.add_argument("-o", "--output", help="write here instead of stdout")
     args = parser.parse_args(argv)
 
@@ -62,6 +73,7 @@ def main(argv=None) -> int:
         read_sources(args.sources),
         bot_id=args.bot_id,
         generated_at=args.generated_at,
+        version=args.format_version,
     )
     payload = json.dumps(digest, ensure_ascii=False, indent=2) + "\n"
     if args.output:
@@ -69,7 +81,8 @@ def main(argv=None) -> int:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(payload)
         print(f"{len(digest['lines'])} line + {len(digest['ngrams'])} 8-gram "
-              f"fingerprints → {args.output}", file=sys.stderr)
+              f"fingerprints (format v{digest['version']}) → {args.output}",
+              file=sys.stderr)
     else:
         sys.stdout.write(payload)
     return 0
