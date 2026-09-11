@@ -38,6 +38,9 @@ DEFAULT_CONFIG = {
     #   HERMES_LENGTH_CONTINUATION_MAX_TOKENS — continuation output cap
     #   HERMES_REPETITION_GUARD=0            — disable the streaming
     #       repetition-loop abort
+    #   HERMES_REPETITION_REASONING_RETRY=0  — on a repetition loop inside the
+    #       REASONING stream, abort the turn (the pre-2026-09-11 behaviour)
+    #       instead of re-asking once with thinking switched off
     "model": "",
     "providers": {},
     "fallback_providers": [],
