@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import re as _re
 from collections import Counter, deque
+from typing import Optional
 
 # Below this length the check doesn't run: short truncations trivially
 # contain repeated tokens and are legitimately continued.
@@ -108,6 +109,7 @@ def tail_repetition_detected(
     window: int = STREAM_TAIL_WINDOW,
     fragment: int = STREAM_MIN_FRAGMENT,
     min_repeats: int = STREAM_MIN_REPEATS,
+    total_chars: Optional[int] = None,
 ) -> bool:
     """True when the tail of ``text`` is an obvious verbatim repeat loop.
 
@@ -115,11 +117,20 @@ def tail_repetition_detected(
     characters as the probe, and counts its (non-overlapping) occurrences.
     ``str.count`` is a C-level scan, so this is O(window) per call.
 
+    ``total_chars`` is how many characters the reply has cost SO FAR, for
+    the streaming caller that only hands over the trailing window: the
+    :data:`STREAM_MIN_REPLY_CHARS` floor is about the whole reply, and
+    measuring it on a pre-sliced tail would silently never bind (the tail
+    reaches 2048 characters long before the floor could matter).  Defaults
+    to ``len(text)`` for the whole-text callers.
+
     Fail-open on anything it cannot judge (non-string, too short).
     """
     if not isinstance(text, str):
         return False
-    if len(text) < STREAM_MIN_REPLY_CHARS:
+    if total_chars is None:
+        total_chars = len(text)
+    if total_chars < STREAM_MIN_REPLY_CHARS:
         return False
     if len(text) < fragment * min_repeats:
         return False

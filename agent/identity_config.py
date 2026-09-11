@@ -226,3 +226,107 @@ def stored_prompt_identity_stale(
         if not line.lstrip().startswith(IDENTITY_RULE_PREFIX)
     )
     return bool(_VENDOR_PROSE.search(rest))
+
+
+# ── The identity block, as data (2026-09-11 regression, red item B) ────
+# The identity segment is the one part of the system prompt whose whole
+# purpose is to be SAID OUT LOUD: "你是谁？" must be answered with
+# ``identity.answer_line()``.  The reply guard's fingerprint digest, which
+# protects the prompt from being recited, therefore has to be told about
+# it twice over --- once on the BUILD side (the segment contributes no
+# fingerprints of its own) and once on the MATCH side (the fixed answer
+# sentence, and its cosmetic variants, carry no evidence).  Both callers
+# live in ``agent/leak_fingerprints.py``; these helpers keep the wording
+# in ONE place, so a future edit to ``build_identity_prompt`` cannot leave
+# the guard whitelisting a sentence the model no longer says.
+
+
+def identity_prompt_lines(identity: AgentIdentity) -> tuple:
+    """The non-empty lines of the injected identity segment.
+
+    Exactly what :func:`build_identity_prompt` emits: the self-introduction
+    (or the operator's ``intro``) and the hard-constraint rule line.
+    """
+    return tuple(
+        line for line in build_identity_prompt(identity).split("\n") if line.strip()
+    )
+
+
+#: Subjects the sentence can open with -- the prompt states it as "你是 …",
+#: the model answers it as "我是 …".
+_ANSWER_SUBJECTS = ("我是", "你是")
+#: Separators a model substitutes for the full-width comma.
+_ANSWER_SEPARATORS = ("，", ",", "、", " ", "")
+#: Terminators it appends (or does not).
+_ANSWER_TAILS = ("", "。", ".", "！", "!", "；", ";", "，", ",", "~")
+#: Quote pairs it wraps the sentence in when quoting the rule back.
+_ANSWER_QUOTES = (("", ""), ("「", "」"), ('"', '"'), ("“", "”"), ("『", "』"))
+
+
+def identity_answer_variants(identity: AgentIdentity) -> tuple:
+    """The fixed identity answer and the variants a model actually emits.
+
+    The canonical form is ``我是 {name}，由 {creator} 提供``.  Models
+    re-punctuate and re-space it freely (and the guard's normalization only
+    collapses whitespace and lowercases ASCII, so ``，`` vs ``,`` really do
+    produce different 8-rune windows), hence the cross product below.
+
+    Deliberately narrow: ONLY this sentence.  The rule line that surrounds
+    it in the prompt is not here --- reciting *that* is still a leak.  A
+    configured ``intro`` is not here either: it is free-form operator text,
+    and whitelisting an arbitrary paragraph would be a real hole.
+    """
+    name = identity.name
+    if not name:
+        return ()
+    creator = identity.creator
+    cores = []
+    for subject in _ANSWER_SUBJECTS:
+        if not creator:
+            cores.append(f"{subject} {name}")
+            cores.append(f"{subject}{name}")
+            continue
+        for separator in _ANSWER_SEPARATORS:
+            for space in (" ", ""):
+                cores.append(
+                    f"{subject}{space}{name}{separator}由{space}{creator}{space}提供"
+                )
+    out = []
+    for core in cores:
+        for tail in _ANSWER_TAILS:
+            for opening, closing in _ANSWER_QUOTES:
+                out.append(f"{opening}{core}{tail}{closing}")
+    # dict.fromkeys keeps first-seen order and drops the duplicates the
+    # cross product produces when creator/space are empty.
+    return tuple(dict.fromkeys(out))
+
+
+_ACTIVE_IDENTITY: Optional[AgentIdentity] = None
+
+
+def note_active_identity(identity: Optional[AgentIdentity]) -> None:
+    """Record the identity the system prompt was just built with.
+
+    The reply guard runs far from the prompt builder and has no agent
+    handle; this is how it learns which name/creator pair is in force.
+    Fire-and-forget, process-wide, last write wins -- one container serves
+    one bot.
+    """
+    global _ACTIVE_IDENTITY
+    _ACTIVE_IDENTITY = identity
+
+
+def active_identity() -> Optional[AgentIdentity]:
+    """The identity in force, falling back to a pure-env resolution.
+
+    ``note_active_identity`` may not have run yet (the guard can be asked
+    before the first prompt assembly, and tests build scanners directly),
+    and ``HERMES_IDENTITY_NAME`` / ``HERMES_IDENTITY_CREATOR`` are what the
+    Haro-managed containers are white-labeled with anyway.
+    """
+    if _ACTIVE_IDENTITY is not None:
+        return _ACTIVE_IDENTITY
+    try:
+        return resolve_identity(None)
+    except Exception:  # noqa: BLE001 - the guard must never break a turn
+        return None

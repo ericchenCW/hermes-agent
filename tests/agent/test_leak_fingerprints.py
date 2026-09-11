@@ -87,7 +87,24 @@ def home(tmp_path, monkeypatch):
     fp._STORE.__init__()
     fp.clear_self_fingerprints()
     monkeypatch.delenv(fp.SELF_FINGERPRINT_ENV, raising=False)
+    # The identity whitelist is process-wide too, and it resolves from the env.
+    _reset_identity(monkeypatch)
     return tmp_path
+
+
+def _reset_identity(monkeypatch, name=None, creator=None):
+    """Point the guard's identity whitelist at ``name``/``creator`` (or nothing)."""
+    from agent import identity_config as ic
+
+    monkeypatch.setattr(ic, "_ACTIVE_IDENTITY", None, raising=False)
+    for env, value in ((ic.ENV_IDENTITY_NAME, name), (ic.ENV_IDENTITY_CREATOR, creator)):
+        if value:
+            monkeypatch.setenv(env, value)
+        else:
+            monkeypatch.delenv(env, raising=False)
+    monkeypatch.delenv(ic.ENV_IDENTITY_INTRO, raising=False)
+    monkeypatch.delenv(fp.IDENTITY_WHITELIST_ENV, raising=False)
+    fp.clear_identity_whitelist()
 
 
 def _install(home_dir, text=PROTECTED_PROMPT, bot_id="sre-bot", version=1):
@@ -1046,3 +1063,179 @@ def test_the_self_digest_is_built_with_the_v2_rules(home):
     assert digest.ngrams == frozenset(fp.ngram_fingerprints(prompt, version=2))
     assert fp.line_hash("围栏里的中文行不该进入自生成指纹集合") not in digest.lines
     assert fp.line_hash(fp.normalize_lines(SKILL_CHINESE_LINE)[0]) in digest.lines
+
+
+# ── the identity answer is never protected text (2026-09-11, red item B) ──
+# The 2026-09-11 regression redacted 「你是谁？」 4/4 on the灰度 bot: the reply
+# "我是 haro管理员，由 嘉为科技 Haro 平台 提供。" produced five adjacent CJK
+# windows against the ``agent_identity`` source (source=self/haro), which is the
+# one prompt section the model is ORDERED to recite.  Two exits are pinned
+# below — the build side never fingerprints the segment, the match side never
+# convicts on the answer sentence.
+
+IDENT_NAME = "haro管理员"
+IDENT_CREATOR = "嘉为科技 Haro 平台"
+IDENT_ANSWER = f"我是 {IDENT_NAME}，由 {IDENT_CREATOR} 提供。"
+
+
+def _identity_prompt(name=IDENT_NAME, creator=IDENT_CREATOR):
+    from agent.identity_config import AgentIdentity, build_identity_prompt
+
+    return build_identity_prompt(AgentIdentity(name=name, creator=creator))
+
+
+def test_identity_answer_is_whitelisted_on_the_matching_side(home, monkeypatch):
+    """A Haro digest built WITH agent_identity may not redact the answer."""
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    # Exactly what Haro's ``agent_identity`` source is: name + creator.
+    _install(home, text=f"{IDENT_NAME}\n{IDENT_CREATOR}\n", version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+    assert fp.scan_text(IDENT_ANSWER, fp.store())[0] is False
+
+    # …and switching the whitelist off restores the old (convicting) behaviour,
+    # which is what proves the digest really does carry the sentence.
+    monkeypatch.setenv(fp.IDENTITY_WHITELIST_ENV, "0")
+    fp.clear_identity_whitelist()
+    assert fp.scan_text(IDENT_ANSWER, fp.store())[0] is True
+
+
+@pytest.mark.parametrize("variant", [
+    "我是 haro管理员，由 嘉为科技 Haro 平台 提供。",
+    "我是haro管理员，由嘉为科技 Haro 平台提供。",       # spaces dropped
+    "我是 haro管理员, 由 嘉为科技 Haro 平台 提供.",      # ASCII punctuation
+    "我是 haro管理员，由 嘉为科技 Haro 平台 提供",       # no terminator
+    "「我是 haro管理员，由 嘉为科技 Haro 平台 提供」",   # quoted back
+    "你是 haro管理员，由 嘉为科技 Haro 平台 提供。",     # the prompt's own wording
+])
+def test_identity_answer_variants_are_whitelisted(home, monkeypatch, variant):
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    _install(home, text=_identity_prompt(), version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+    assert fp.scan_text(variant, fp.store())[0] is False
+
+
+def test_the_whitelist_does_not_cover_the_rest_of_the_identity_segment(home, monkeypatch):
+    """Only the answer sentence is open. The rule line around it is still protected."""
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    _install(home, text=_identity_prompt(), version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+    rule_line = _identity_prompt().split("\n", 1)[1]
+    assert fp.scan_text(rule_line, fp.store())[0] is True
+
+
+def test_the_whitelist_does_not_open_other_cjk_recitation(home, monkeypatch):
+    """A configured identity must not soften anything else in the digest."""
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    _install(home, text=SOUL_BLOCK, version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+    assert fp.scan_text(SOUL_LINE, fp.store())[0] is True
+
+
+def test_the_self_digest_excludes_the_identity_segment(home, monkeypatch):
+    """Build side: the segment contributes neither lines nor grams."""
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    prompt = _identity_prompt() + "\n\n" + SOUL_BLOCK
+    digest = fp.register_system_prompt(prompt)
+    assert digest is not None
+    for line in _identity_prompt().split("\n"):
+        normalized = fp.normalize_line(unicodedata.normalize("NFKC", line))
+        assert fp.line_hash(normalized) not in digest.lines
+        windows = {fp.ngram_hash(w) for w in fp.line_windows(normalized)}
+        assert windows and not (windows & digest.ngrams)
+    # The rest of the prompt is fingerprinted exactly as before.
+    assert fp.line_hash(
+        fp.normalize_line(unicodedata.normalize("NFKC", SOUL_LINE))) in digest.lines
+
+
+def test_strip_identity_segment_also_catches_a_reworded_rule_line(monkeypatch):
+    _reset_identity(monkeypatch, IDENT_NAME, IDENT_CREATOR)
+    from agent.identity_config import IDENTITY_RULE_PREFIX
+
+    text = (
+        f"你是 {IDENT_NAME}，由 {IDENT_CREATOR} 提供。\n"
+        f"{IDENTITY_RULE_PREFIX}，这是一段被改写过的规则行，措辞与本进程构建的不同）：…\n"
+        "作答规则：回答保持简短。\n"
+    )
+    out = fp.strip_identity_segment(text)
+    assert IDENTITY_RULE_PREFIX not in out
+    assert f"你是 {IDENT_NAME}" not in out
+    assert "作答规则：回答保持简短。" in out
+
+
+def test_no_identity_configured_changes_nothing(home, monkeypatch):
+    """Stock installs (empty name) keep the previous behaviour byte for byte."""
+    _reset_identity(monkeypatch)
+    assert fp.identity_whitelist() == (frozenset(), frozenset())
+    assert fp.strip_identity_segment(SOUL_BLOCK) == SOUL_BLOCK
+
+
+# ── worker1's Haro-side regression fixture (2026-09-11) ────────────────
+REGRESSION_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "guard_regression_worker1.json")
+
+
+def _regression():
+    with open(REGRESSION_FIXTURE, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _max_run(matches):
+    """Longest run of adjacent (gap ≤ NGRAM_ADJACENT_GAP) matched window offsets."""
+    best = run = 0
+    previous = None
+    for position in sorted(matches):
+        run = run + 1 if previous is not None and position - previous <= fp.NGRAM_ADJACENT_GAP else 1
+        previous = position
+        best = max(best, run)
+    return best
+
+
+def test_regression_sources_reproduce_haros_counts():
+    """§1+§6 v2 build side: our digest matches Haro's per-source counts."""
+    data = _regression()
+    for source in data["sources"]:
+        assert len(fp.line_fingerprints(source["text"], 2)) == source["lines"], source["id"]
+        assert len(fp.ngram_fingerprints(source["text"], 2)) == source["ngrams"], source["id"]
+
+
+def test_regression_replies_match_haros_verdicts(home, monkeypatch):
+    """Three compliant replies stay clean; the recited rule line still convicts."""
+    data = _regression()
+    identity = data["identity"]
+    _reset_identity(monkeypatch, identity["name"], identity["creator"])
+    text = "\n".join(source["text"] for source in data["sources"])
+    _install(home, text=text, version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+    store = fp.store()
+    for reply in data["replies"]:
+        scanner = fp.FingerprintScanner(store)
+        scanner.feed(reply["text"])
+        scanner.flush()
+        line_hits = len(scanner._line_hits | scanner._pending_line_hits)
+        max_run = _max_run(scanner._all_matches())
+        assert line_hits == reply["wantLineHits"], reply["name"]
+        assert line_hits == reply["haroGotLineHits"], reply["name"]
+        assert max_run == reply["haroGotMaxRun"], reply["name"]
+        if reply["leak"]:
+            assert max_run >= fp.NGRAM_RUN_THRESHOLD and scanner.tripped is True, reply["name"]
+        else:
+            assert max_run < fp.NGRAM_RUN_THRESHOLD and scanner.tripped is False, reply["name"]
+
+
+def test_regression_identity_answer_needs_the_whitelist(home, monkeypatch):
+    """红项 B on worker1's own fixture: convicted before, clean after."""
+    data = _regression()
+    identity = data["identity"]
+    answer = f"我是 {identity['name']}，由 {identity['creator']} 提供。"
+    text = "\n".join(source["text"] for source in data["sources"])
+    _install(home, text=text, version=2)
+    monkeypatch.setenv(fp.SELF_FINGERPRINT_ENV, "0")
+
+    _reset_identity(monkeypatch, identity["name"], identity["creator"])
+    monkeypatch.setenv(fp.IDENTITY_WHITELIST_ENV, "0")
+    fp.clear_identity_whitelist()
+    assert fp.scan_text(answer, fp.store())[0] is True
+
+    monkeypatch.delenv(fp.IDENTITY_WHITELIST_ENV, raising=False)
+    fp.clear_identity_whitelist()
+    assert fp.scan_text(answer, fp.store())[0] is False

@@ -27,6 +27,7 @@ from agent.prompt_builder import (
 from agent import prompt_builder as _pb
 from agent.identity_config import (
     build_identity_prompt,
+    note_active_identity,
     resolve_identity,
     scrub_vendor_names,
     strip_builtin_identity,
@@ -667,6 +668,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # the one block that must keep the literal vendor names (its hard constraint says "never call
     # yourself Hermes"), so the scrub below must not see it.
     _identity = _resolve_agent_identity(agent)
+    # idcsre patch — hand the resolved identity to the reply guard (2026-09-11 red item B):
+    # the identity segment must contribute no fingerprints of its own, and the fixed answer
+    # sentence must never convict a reply.  See agent/identity_config.note_active_identity.
+    note_active_identity(_identity)
     _identity_prefix = build_identity_prompt(_identity) if _identity else ""
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len, _identity)
     # The skill_view() pointer dangles without skill tools OR without the

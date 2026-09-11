@@ -672,6 +672,146 @@ class SelfFingerprints:
         return not (self.lines or self.ngrams)
 
 
+# ── The identity segment is never protected text (2026-09-11, red item B) ──
+# ``agent_identity`` is the ONE prompt section whose whole purpose is to be said
+# out loud: the rule line orders the model to answer "你是谁？" with exactly
+# ``我是 {name}，由 {creator} 提供``.  Fingerprinting it therefore convicts the
+# model for obeying it -- on 2026-09-11 every identity answer was redacted
+# (5 adjacent CJK windows, source=self/haro), 4/4, on all four managed bots.
+#
+# Two exits, deliberately kept separate:
+#
+#   * BUILD side -- :func:`strip_identity_segment` removes the segment's own
+#     lines before the container fingerprints its assembled prompt, so the
+#     self digest never carries them in the first place;
+#   * MATCH side -- the fixed answer sentence and its cosmetic variants are
+#     whitelisted, so a v1/v2 digest that Haro built WITH ``agent_identity``
+#     in it (all four bots still do) cannot convict either.
+#
+# The whitelist covers that sentence and nothing else.  The rule line around it
+# names the vendors we refuse to recite ("never call yourself Hermes"), and
+# reciting *that* line is still a leak -- it stays in Haro's digest, and item 9
+# of the regression (复述身份规则那一整行) still convicts through ``source=haro``.
+
+IDENTITY_WHITELIST_ENV = "HERMES_GUARD_IDENTITY_WHITELIST"
+
+
+def identity_whitelist_enabled() -> bool:
+    """``HERMES_GUARD_IDENTITY_WHITELIST`` -- on unless explicitly switched off."""
+    raw = (os.environ.get(IDENTITY_WHITELIST_ENV) or "").strip().lower()
+    return raw not in _FALSE_VALUES if raw else True
+
+
+def _active_identity():
+    """The identity in force, or None.  Never raises."""
+    try:
+        from agent.identity_config import active_identity
+
+        return active_identity()
+    except Exception:  # noqa: BLE001 - the guard must never break a turn
+        return None
+
+
+def _identity_segment_keys(identity) -> frozenset:
+    """Normalized keys of the identity segment's own lines."""
+    try:
+        from agent.identity_config import identity_prompt_lines
+
+        return frozenset(
+            key
+            for key in (
+                normalize_line(unicodedata.normalize("NFKC", line))
+                for line in identity_prompt_lines(identity)
+            )
+            if key
+        )
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def strip_identity_segment(text: Optional[str], identity=None) -> str:
+    """``text`` with the injected identity segment's lines blanked out.
+
+    Used on the build side only.  Lines are matched after the contract
+    normalization (so spacing/case drift cannot smuggle the segment back in)
+    plus, as a belt-and-braces second key, any line opening with
+    :data:`~agent.identity_config.IDENTITY_RULE_PREFIX` -- that covers a reworded
+    rule line whose exact text this process did not build.
+
+    A blank line is left in place of each dropped line so the rest of the prompt
+    keeps its shape; blank lines produce no fingerprints anyway.
+    """
+    if not isinstance(text, str) or not text:
+        return text or ""
+    identity = identity if identity is not None else _active_identity()
+    if identity is None:
+        return text
+    keys = _identity_segment_keys(identity)
+    try:
+        from agent.identity_config import IDENTITY_RULE_PREFIX
+    except Exception:  # noqa: BLE001
+        IDENTITY_RULE_PREFIX = "\0"
+    if not keys and not IDENTITY_RULE_PREFIX:
+        return text
+    out = []
+    for raw in text.split("\n"):
+        stripped = raw.lstrip()
+        if (stripped.startswith(IDENTITY_RULE_PREFIX)
+                or normalize_line(unicodedata.normalize("NFKC", raw)) in keys):
+            out.append("")
+        else:
+            out.append(raw)
+    return "\n".join(out)
+
+
+_IDENTITY_WL_LOCK = threading.Lock()
+#: ``(identity key, (line hashes, windows))`` -- one identity per container, so a
+#: single memo slot is enough.
+_IDENTITY_WL: Optional[tuple] = None
+
+
+def identity_whitelist() -> tuple:
+    """``(whitelisted line hashes, whitelisted 8-rune windows)`` for the answer sentence.
+
+    Empty when no identity is configured or the feature is switched off, in
+    which case the scanner behaves exactly as before.
+    """
+    if not identity_whitelist_enabled():
+        return frozenset(), frozenset()
+    identity = _active_identity()
+    if identity is None:
+        return frozenset(), frozenset()
+    key = (identity.name, identity.creator)
+    cached = _IDENTITY_WL
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        from agent.identity_config import identity_answer_variants
+
+        variants = identity_answer_variants(identity)
+    except Exception:  # noqa: BLE001
+        variants = ()
+    hashes: set = set()
+    windows: set = set()
+    for sentence in variants:
+        line = normalize_line(unicodedata.normalize("NFKC", sentence))
+        if not line:
+            continue
+        if len(line) >= MIN_LINE_RUNES:
+            hashes.add(line_hash(line))
+        windows.update(line_windows(line))
+    built = (frozenset(hashes), frozenset(windows))
+    with _IDENTITY_WL_LOCK:
+        globals()["_IDENTITY_WL"] = (key, built)
+    return built
+
+
+def clear_identity_whitelist() -> None:
+    """Drop the memoized whitelist (identity change; tests)."""
+    with _IDENTITY_WL_LOCK:
+        globals()["_IDENTITY_WL"] = None
+
+
 _SELF_LOCK = threading.Lock()
 _SELF: Optional[SelfFingerprints] = None
 
@@ -691,13 +831,18 @@ def register_system_prompt(text: Optional[str]) -> Optional[SelfFingerprints]:
     current = _SELF
     if current is not None and current.prompt_hash == prompt_hash:
         return current
+    # The identity segment is excluded before anything is hashed: it is the text
+    # the model is ORDERED to say, so protecting it convicts obedience (red item
+    # B, 2026-09-11).  Keyed by the hash of the ORIGINAL prompt, so the memo
+    # still turns over exactly when the prompt does.
+    body = strip_identity_segment(text)
     digest = SelfFingerprints(
         prompt_hash,
         # Same §6 v2 build as the generator — the two halves of the union must
         # be built by one rule, or a v2 Haro digest and a v1-ish self digest
         # would disagree about what counts as protected.
-        frozenset(line_fingerprints(text, FORMAT_VERSION)),
-        frozenset(ngram_fingerprints(text, FORMAT_VERSION)),
+        frozenset(line_fingerprints(body, FORMAT_VERSION)),
+        frozenset(ngram_fingerprints(body, FORMAT_VERSION)),
     )
     with _SELF_LOCK:
         globals()["_SELF"] = digest
@@ -863,6 +1008,9 @@ class FingerprintScanner:
 
     def __init__(self, fingerprints: Optional[object] = None) -> None:
         self.fp = fingerprints if fingerprints is not None else combined_store()
+        #: The identity answer sentence carries no evidence — see
+        #: :func:`identity_whitelist`.  Resolved once per reply.
+        self._wl_lines, self._wl_windows = identity_whitelist()
         self._pending = ""
         self._offset = 0  # rune offset of the pending line's start
         self._line_hits: set[str] = set()
@@ -966,10 +1114,14 @@ class FingerprintScanner:
             and not is_low_entropy_line(line)
         ):
             digest = line_hash(line)
-            if digest in self.fp.lines:
+            if digest in self.fp.lines and digest not in self._wl_lines:
                 hits.add(digest)
         if self.fp.ngrams:
             for index, window in enumerate(line_windows(line)):
+                if window in self._wl_windows:
+                    # A window of the bot's own identity answer. Not looked up at
+                    # all: it is neither evidence nor worth an audit line.
+                    continue
                 digest = ngram_hash(window)
                 if digest in self.fp.ngrams:
                     matches[self._offset + index] = window

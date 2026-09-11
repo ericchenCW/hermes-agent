@@ -2784,7 +2784,11 @@ class _StreamingCall(StreamingWaitMonitor):
         # burns the whole output budget (and minutes of wall clock) before the truncation handler
         # ever runs; qwen3-style models can spend 16k tokens on one repeated paragraph.
         _rep_guard_on = stream_repetition_guard_enabled()
-        _rep_guard_state = {"aborted": False, "kind": "", "reasoning_chars": 0, "content_chars": 0}
+        _rep_guard_state = {"aborted": False, "kind": "", "reasoning_chars": 0, "content_chars": 0,
+                            # Raw characters seen per stream — the verbatim probe's
+                            # STREAM_MIN_REPLY_CHARS floor is about the whole reply, not
+                            # about the trailing window handed to it.
+                            "reasoning_total": 0, "content_total": 0}
         # idcsre patch — reasoning-leak guard for THIS attempt (a retry gets a fresh one).
         _leak_guard = self._leak_guard = make_stream_leak_guard(self.agent)
         pending_text_parts: list[str] = []
@@ -2836,6 +2840,8 @@ class _StreamingCall(StreamingWaitMonitor):
                     return _rep_guard_abort(kind, "normalized line")
             except Exception:
                 logger.debug("normalized-line loop probe failed", exc_info=True)
+            total_key = f"{kind}_total"
+            total_chars = _rep_guard_state[total_key] = _rep_guard_state[total_key] + delta_len
             key = f"{kind}_chars"
             pending = _rep_guard_state[key] + delta_len
             if pending < _REP_CHECK_INTERVAL:
@@ -2853,7 +2859,7 @@ class _StreamingCall(StreamingWaitMonitor):
                     if tail_len >= _REP_TAIL_WINDOW:
                         break
                 tail_chunks.reverse()
-                if not tail_repetition_detected("".join(tail_chunks)):
+                if not tail_repetition_detected("".join(tail_chunks), total_chars=total_chars):
                     return False
             except Exception:
                 return False
