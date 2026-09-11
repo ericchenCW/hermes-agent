@@ -1,17 +1,20 @@
 """compose_sheet — build a numbered screenshot sheet from a knowledge-base document.
 
-Wraps the vetted ``compose_from_doc.py`` script of the canway-it-support-kb
-skill so read-only chat users can get step sheets without a shell.  The tool
-accepts only a document path relative to the knowledge-base root plus a few
-switches; it never takes a command line.
+Wraps the vetted ``compose_from_doc.py`` script of the haro-kb-search skill so
+read-only chat users can get step sheets without a shell.  The tool accepts
+only a document path relative to the knowledge-base root plus a few
+switches; it never takes a command line.  (The skill used to be named
+canway-it-support-kb; that path is still probed for compatibility with
+deployments that have not renamed it yet.)
 
 Env (all optional):
-  CANWAY_KB_ROOT          knowledge-base root   (default /opt/data/kb/canway-it-support)
-  COMPOSE_SHEET_SCRIPT    composing script      (default /opt/data/skills/canway-it-support-kb/scripts/compose_from_doc.py)
+  CANWAY_KB_ROOT          knowledge-base root   (default: auto-probed, falling back to /opt/data/kb/canway-it-support)
+  COMPOSE_SHEET_SCRIPT    composing script      (default: auto-probed, falling back to the haro-kb-search skill path)
   COMPOSE_SHEET_PYTHON    interpreter           (default: the running interpreter)
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import pathlib
@@ -21,17 +24,43 @@ import sys
 from tools.registry import registry
 
 DEFAULT_KB_ROOT = "/opt/data/kb/canway-it-support"
+ALT_KB_ROOT = "/knowledge/canway-it-support"
+ALT_KB_PARENT = "/knowledge"
+HARO_SCRIPT = "/opt/data/skills/haro-kb-search/scripts/compose_from_doc.py"
 DEFAULT_SCRIPT = "/opt/data/skills/canway-it-support-kb/scripts/compose_from_doc.py"
+SKILLS_SCRIPT_GLOB = "/opt/data/skills/*/scripts/compose_from_doc.py"
 MAX_STEPS = 40
 TIMEOUT_SECONDS = 180
 
 
 def _kb_root() -> pathlib.Path:
-    return pathlib.Path(os.environ.get("CANWAY_KB_ROOT") or DEFAULT_KB_ROOT)
+    env = os.environ.get("CANWAY_KB_ROOT")
+    if env:
+        return pathlib.Path(env)
+    for candidate in (DEFAULT_KB_ROOT, ALT_KB_ROOT):
+        p = pathlib.Path(candidate)
+        if p.is_dir():
+            return p
+    parent = pathlib.Path(ALT_KB_PARENT)
+    if parent.is_dir():
+        subdirs = [p for p in parent.iterdir() if p.is_dir()]
+        if len(subdirs) == 1:
+            return subdirs[0]
+    return pathlib.Path(DEFAULT_KB_ROOT)
 
 
 def _script() -> pathlib.Path:
-    return pathlib.Path(os.environ.get("COMPOSE_SHEET_SCRIPT") or DEFAULT_SCRIPT)
+    env = os.environ.get("COMPOSE_SHEET_SCRIPT")
+    if env:
+        return pathlib.Path(env)
+    for candidate in (HARO_SCRIPT, DEFAULT_SCRIPT):
+        p = pathlib.Path(candidate)
+        if p.is_file():
+            return p
+    matches = sorted(glob.glob(SKILLS_SCRIPT_GLOB))
+    if matches:
+        return pathlib.Path(matches[0])
+    return pathlib.Path(DEFAULT_SCRIPT)
 
 
 def resolve_doc(doc: str) -> pathlib.Path:
