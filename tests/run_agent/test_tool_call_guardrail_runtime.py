@@ -446,6 +446,12 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]
     assert "stopped retrying" in halt_text
+    # Regression: this text reaches the end user directly (it never goes back through the
+    # model), so it must never leak the internal decision code, "guardrail" jargon, or the
+    # tool's internal name.
+    assert "repeated_exact_failure_block" not in halt_text
+    assert "guardrail" not in halt_text.lower()
+    assert "web_search" not in halt_text
 
     # The halt message must have been pushed through the callback at least
     # once.  Empty-queue SSE writers were the bug — clients saw no content

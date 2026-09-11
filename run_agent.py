@@ -1215,11 +1215,12 @@ class AIAgent(
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        # User-facing text only: no internal codes, "guardrail" jargon, or tool
+        # internal names here — those belong in logs/metadata, not the reply.
         return (
-            f"I stopped retrying {decision.tool_name or 'a tool'} because it hit the tool-call guardrail "
-            f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
-            "to change strategy instead of repeating the same call."
+            "I stopped retrying because a query kept failing without making progress. "
+            "The next step is to change strategy instead of repeating the same call. "
+            "（某项查询连续失败，已停止重试；请更换思路重试，而非重复相同请求。）"
         )
 
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,

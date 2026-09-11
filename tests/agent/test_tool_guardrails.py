@@ -140,6 +140,12 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.action == "block"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+    # The prose sent to the model must tell it to explain the stop to the user in the
+    # user's own language without leaking internal codes/jargon/tool names — the machine
+    # -readable identifier stays only in ``blocked.code`` (JSON/log use), never in prose.
+    assert "reply in the user's own language" in blocked.message
+    assert "internal codes" in blocked.message
+    assert "向用户解释时请使用用户的语言" in blocked.message
 
 
 

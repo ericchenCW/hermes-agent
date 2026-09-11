@@ -222,20 +222,35 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
 
 
+# Appended to every "block"/"halt" verdict text (not "warning") below: these strings ride along in
+# the tool-result content the model sees, and the model may explain the stop to the end user. That
+# explanation must not leak internal codes/jargon — only the block/halt decision's ``code`` field
+# (JSON, for logs/programmatic use) carries the real identifier; this sentence is prose guidance only.
+_USER_FACING_EXPLANATION_CONSTRAINT = (
+    " When explaining this to the user, reply in the user's own language, and never surface internal "
+    "codes, the word \"guardrail\", or internal tool names — just say a query kept failing repeatedly "
+    "and retries were stopped, then suggest an alternative. "
+    "（向用户解释时请使用用户的语言，不要出现内部代码名、guardrail 字样或工具内部名，只需说明某项查询"
+    "连续失败、已停止重试，并给出替代做法。）"
+)
+
 # Guardrail verdict text injected into the conversation, keyed by decision code.
 # ``same_tool_failure_warning`` is built by _tool_failure_recovery_hint (tool-specific).
 _DECISION_MESSAGES: dict[str, str] = {
     "repeated_exact_failure_block": (
         "Blocked {tool_name}: the same tool call failed {count} times with identical arguments. "
         "Stop retrying it unchanged; change strategy or explain the blocker."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
     "idempotent_no_progress_block": (
         "Blocked {tool_name}: this read-only call returned the same result {count} times. "
         "Stop repeating it unchanged; use the result already provided or try a different query."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
     "same_tool_failure_halt": (
         "Stopped {tool_name}: it failed {count} times this turn. "
         "Stop retrying the same failing tool path and choose a different approach."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
     "repeated_exact_failure_warning": (
         "{tool_name} has failed {count} times with identical arguments. This looks like a loop; "
@@ -248,14 +263,17 @@ _DECISION_MESSAGES: dict[str, str] = {
     "identical_call_streak_halt": (
         "Stopped {tool_name}: the same call with identical arguments returned the same result "
         "{count} times in a row. Stop repeating it unchanged; use the result already provided or change strategy."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
     "loop_web_search_cap": (
         "Blocked web_search: this turn has already made {cap} web searches, the per-turn limit. "
         "This looks like a runaway search loop. Work with the results you already have and give the user your answer."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
     "loop_subagent_cap": (
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
+        + _USER_FACING_EXPLANATION_CONSTRAINT
     ),
 }
 
