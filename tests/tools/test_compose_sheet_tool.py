@@ -1,9 +1,12 @@
 """compose_sheet tool: KB-relative path validation and script invocation."""
+import io
 import json
 import os
+import random
 import subprocess
 
 import pytest
+from PIL import Image
 
 from tools import compose_sheet_tool as cst
 
@@ -157,3 +160,82 @@ class TestKbRootProbing:
         monkeypatch.setattr(cst, "DEFAULT_SCRIPT", str(tmp_path / "no" / "legacy.py"))
         monkeypatch.setattr(cst, "SKILLS_SCRIPT_GLOB", str(tmp_path / "no-skills" / "*" / "scripts" / "compose_from_doc.py"))
         assert cst.check_compose_sheet_requirements() is False
+
+
+def _make_big_jpeg(path, size=(3000, 6000)):
+    """Write a large, hard-to-compress JPEG (noisy speckles beat flat-color compression)."""
+    im = Image.new("RGB", size, color=(120, 60, 200))
+    px = im.load()
+    rng = random.Random(1)
+    for x in range(0, size[0], 7):
+        for y in range(0, size[1], 7):
+            px[x, y] = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+    im.save(path, format="JPEG", quality=95)
+    return path.stat().st_size
+
+
+class TestMediaPostprocessing:
+    """Oversized MEDIA:<path>.jpg output is recompressed under COMPOSE_SHEET_MAX_BYTES."""
+
+    def test_oversized_image_is_compressed_to_dash_c_file_under_limit(self, tmp_path, monkeypatch):
+        sheets = tmp_path / "sheets"; sheets.mkdir()
+        img = sheets / "steps-1.jpg"
+        orig_size = _make_big_jpeg(img)
+        assert orig_size > cst.COMPOSE_SHEET_MAX_BYTES
+        out = cst._postprocess_media(f"图 1: a\nMEDIA:{img}")
+        lines = out.splitlines()
+        assert lines[-1] == f"MEDIA:{img.with_name('steps-1-c.jpg')}"
+        assert any(line.startswith("已压缩：原") for line in lines)
+        compressed = img.with_name("steps-1-c.jpg")
+        assert compressed.is_file()
+        assert compressed.stat().st_size <= cst.COMPOSE_SHEET_MAX_BYTES
+        # original is left untouched
+        assert img.is_file() and img.stat().st_size == orig_size
+
+    def test_multiple_media_lines_each_handled_independently(self, tmp_path, monkeypatch):
+        sheets = tmp_path / "sheets"; sheets.mkdir()
+        big = sheets / "steps-big.jpg"
+        _make_big_jpeg(big)
+        small = sheets / "steps-small.jpg"
+        Image.new("RGB", (200, 200), color=(1, 2, 3)).save(small, format="JPEG", quality=90)
+        assert small.stat().st_size <= cst.COMPOSE_SHEET_MAX_BYTES
+        out = cst._postprocess_media(f"图 1: a\nMEDIA:{big}\n图 2: b\nMEDIA:{small}")
+        media_lines = [l for l in out.splitlines() if l.startswith("MEDIA:")]
+        assert media_lines == [f"MEDIA:{big.with_name('steps-big-c.jpg')}", f"MEDIA:{small}"]
+
+    def test_within_limit_passes_through_unchanged(self, tmp_path):
+        sheets = tmp_path / "sheets"; sheets.mkdir()
+        img = sheets / "steps-2.jpg"
+        Image.new("RGB", (400, 400), color=(9, 9, 9)).save(img, format="JPEG", quality=90)
+        original = f"图 1: a\nMEDIA:{img}"
+        assert cst._postprocess_media(original) == original
+
+    def test_missing_media_file_passes_through_unchanged(self):
+        original = "图 1: a\nMEDIA:/opt/data/cache/sheets/does-not-exist.jpg"
+        assert cst._postprocess_media(original) == original
+
+    def test_no_images_output_is_not_touched(self):
+        assert cst._postprocess_media("NO_IMAGES") == "NO_IMAGES"
+
+    def test_still_too_big_after_compression_adds_warning_but_keeps_smallest_result(self, tmp_path, monkeypatch):
+        sheets = tmp_path / "sheets"; sheets.mkdir()
+        img = sheets / "steps-huge.jpg"
+        _make_big_jpeg(img)
+        monkeypatch.setattr(cst, "MIN_LONG_EDGE", 5900)  # force an unreachable floor -> stays over budget
+        out = cst._postprocess_media(f"MEDIA:{img}", max_bytes=1)
+        lines = out.splitlines()
+        assert any(line.startswith("WARNING:") for line in lines)
+        assert lines[-1] == f"MEDIA:{img.with_name('steps-huge-c.jpg')}"
+        assert img.with_name("steps-huge-c.jpg").is_file()
+
+    def test_compose_sheet_end_to_end_runs_postprocessing(self, kb, tmp_path, monkeypatch):
+        sheets = tmp_path / "sheets"; sheets.mkdir()
+        img = sheets / "steps-e2e.jpg"
+        _make_big_jpeg(img)
+
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"图 1: a\nMEDIA:{img}\n", stderr="")
+
+        monkeypatch.setattr(cst.subprocess, "run", fake_run)
+        out = cst.compose_sheet("guides/access/vpn-user-guide.md")
+        assert out.splitlines()[-1] == f"MEDIA:{img.with_name('steps-e2e-c.jpg')}"
