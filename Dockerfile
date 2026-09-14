@@ -273,6 +273,150 @@ COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra memory-holographic
 
+# ---------- Ops toolkit (Haro 智能体市场 裁定 2: 单一全家桶镜像) ----------
+# The market installs three classes of 运维智能体 (network device, cloud,
+# Kubernetes) out of ONE image: the class distinction lives in the Haro-side
+# skill combination, not in three image variants nobody could keep in sync.
+#
+# NOTHING HERE GOES INTO HERMES' OWN VENV, and the split is not tidiness:
+# azure-cli alone pins dozens of transitive versions (cryptography, requests,
+# PyYAML…) that hermes also depends on. A resolver that reports success is not
+# telling you it left hermes' versions alone — it will happily downgrade
+# cryptography by two majors to satisfy a CLI, and the agent only finds out at
+# runtime, in a failure nobody can attribute back to this layer. DO NOT MERGE
+# THE ENVIRONMENTS TO SAVE DISK.
+#
+# Three installation paths, each picked for a reason that was measured rather
+# than assumed:
+#
+#   * azure-cli comes from Microsoft's own apt repository, NOT from PyPI.
+#     `pip install azure-cli` resolves to 2.0.67 — a 2018 release — because
+#     every current version needs `--prerelease=allow` for its
+#     azure-mgmt-* dependencies, and that 2018 build then fails to start at
+#     all (`azure/__init__.py` does `import pkg_resources`). The deb ships its
+#     own interpreter under /opt/az and gives 2.90.0. Debian trixie has no
+#     azure-cli suite yet, so the bookworm one is used; it carries its own
+#     Python and does not link against the distro's.
+#   * ansible and tccli go in through `uv tool install`, which gives each one
+#     a private environment and puts only its entry points on PATH. ansible is
+#     installed as `ansible-core --with ansible`: the `ansible` meta package
+#     alone ships collections but no executables.
+#   * netmiko and pysnmp are libraries, not CLIs. They live in one shared
+#     environment reached through `opskit-python`, which is what a skill's
+#     python snippet calls.
+#
+# `opskit-python` is a two-line wrapper rather than a symlink on purpose: a
+# symlinked interpreter resolves sys.prefix to /usr and then cannot see the
+# environment's own site-packages at all (`import netmiko` → ModuleNotFoundError
+# while the same interpreter works by absolute path).
+#
+# Versions are resolved at build time rather than pinned because this layer is
+# still being sized; /opt/opskit/versions.txt records what the build actually
+# installed, and the self check below both prints it and fails the build if any
+# tool cannot start.
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        unzip apt-transport-https gnupg && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV OPSKIT_HOME=/opt/opskit
+ENV UV_TOOL_DIR=/opt/opskit/tools
+ENV UV_TOOL_BIN_DIR=/opt/opskit/bin
+
+RUN set -eu; \
+    mkdir -p "${OPSKIT_HOME}/bin" /etc/apt/keyrings; \
+    curl -fsSL --retry 3 --max-time 60 https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg; \
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ bookworm main\n' \
+        "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/azure-cli.list; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends azure-cli; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    uv tool install --python 3.13 ansible-core --with ansible; \
+    uv tool install --python 3.13 tccli; \
+    uv venv --python 3.13 "${OPSKIT_HOME}/venv"; \
+    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip install --no-cache-dir netmiko pysnmp; \
+    printf '#!/bin/sh\nexec %s/venv/bin/python "$@"\n' "${OPSKIT_HOME}" > /usr/local/bin/opskit-python; \
+    chmod 0755 /usr/local/bin/opskit-python
+
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH:-arm64}" in \
+        arm64) kube_arch="arm64"; aws_arch="aarch64"; rel_arch="arm64" ;; \
+        amd64) kube_arch="amd64"; aws_arch="x86_64"; rel_arch="amd64" ;; \
+        *) echo "Unsupported TARGETARCH=${TARGETARCH} for the ops toolkit" >&2; exit 1 ;; \
+    esac; \
+    kube_version="$(curl -fsSL --retry 3 --max-time 60 https://dl.k8s.io/release/stable.txt)"; \
+    curl -fsSL --retry 3 --max-time 300 -o "${OPSKIT_HOME}/bin/kubectl" \
+        "https://dl.k8s.io/release/${kube_version}/bin/linux/${kube_arch}/kubectl"; \
+    chmod 0755 "${OPSKIT_HOME}/bin/kubectl"; \
+    curl -fsSL --retry 3 --max-time 600 -o /tmp/awscli.zip \
+        "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip"; \
+    unzip -q /tmp/awscli.zip -d /tmp/awscli; \
+    /tmp/awscli/aws/install -i "${OPSKIT_HOME}/aws-cli" -b "${OPSKIT_HOME}/bin"; \
+    rm -rf /tmp/awscli /tmp/awscli.zip; \
+    ali_version="$(curl -fsSL --retry 3 --max-time 60 https://api.github.com/repos/aliyun/aliyun-cli/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)"; \
+    [ -n "${ali_version}" ] || { echo "could not resolve the aliyun-cli release" >&2; exit 1; }; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/aliyun.tgz \
+        "https://github.com/aliyun/aliyun-cli/releases/download/v${ali_version}/aliyun-cli-linux-${ali_version}-${rel_arch}.tgz"; \
+    tar -xzf /tmp/aliyun.tgz -C "${OPSKIT_HOME}/bin"; \
+    rm -f /tmp/aliyun.tgz; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/koocli.tar.gz \
+        "https://hwcloudcli.obs.cn-north-1.myhuaweicloud.com/cli/latest/huaweicloud-cli-linux-${rel_arch}.tar.gz"; \
+    tar -xzf /tmp/koocli.tar.gz -C /tmp; \
+    find /tmp -maxdepth 2 -name hcloud -type f -exec cp {} "${OPSKIT_HOME}/bin/hcloud" ';' ; \
+    chmod 0755 "${OPSKIT_HOME}/bin/hcloud"; \
+    rm -rf /tmp/koocli.tar.gz; \
+    for tool in kubectl aws aliyun hcloud; do \
+        ln -sf "${OPSKIT_HOME}/bin/${tool}" "/usr/local/bin/${tool}"; \
+    done
+
+# /opt/opskit/bin is where `uv tool install` puts its entry points and where
+# the downloaded binaries live. It goes at the END of PATH: an ops CLI must
+# never shadow one of hermes' own commands.
+ENV PATH="${PATH}:/opt/opskit/bin"
+
+# Build-time self check: every tool must actually run, not merely be present.
+# A tool that installs but cannot start is the failure mode this layer is most
+# exposed to — the PyPI azure-cli mentioned above did exactly that, and an
+# earlier version of this check missed it by piping everything into `tee`,
+# where a failing command neither aborts the build nor is visible in the
+# output. So each tool is checked one at a time, an empty answer counts as a
+# failure, and the build stops on the first one. hcloud prints a privacy
+# statement and waits for a keypress on first run, hence its own line.
+RUN set -eu; \
+    : > "${OPSKIT_HOME}/versions.txt"; \
+    record() { printf '%-16s %s\n' "$1" "$2" >> "${OPSKIT_HOME}/versions.txt"; }; \
+    check() { \
+        name="$1"; shift; \
+        out="$("$@" 2>&1)" || { echo "ops toolkit: ${name} could not run" >&2; exit 1; }; \
+        out="$(printf '%s' "${out}" | head -1)"; \
+        [ -n "${out}" ] || { echo "ops toolkit: ${name} printed nothing" >&2; exit 1; }; \
+        record "${name}" "${out}"; \
+    }; \
+    check ansible ansible --version; \
+    check ansible-playbook ansible-playbook --version; \
+    check netmiko opskit-python -c 'import netmiko; print(netmiko.__version__)'; \
+    check pysnmp opskit-python -c 'import pysnmp; print(pysnmp.__version__)'; \
+    check tccli tccli --version; \
+    check azure-cli sh -c 'az version -o json | sed -n "s/.*\"azure-cli\": \"\\([^\"]*\\)\".*/\\1/p" | head -1'; \
+    check kubectl kubectl version --client=true; \
+    check aws aws --version; \
+    check aliyun aliyun version; \
+    check hcloud sh -c 'yes y | hcloud version 2>&1 | tail -1 | sed "s/.*version: //"'; \
+    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip freeze >> "${OPSKIT_HOME}/versions.txt"; \
+    cat "${OPSKIT_HOME}/versions.txt"; \
+    # The checks above are the first time these CLIs run, and each of them
+    # writes a config tree into the building user's home (az telemetry state,
+    # KooCLI's local cipher key). None of it is a credential, but baking one
+    # build's CLI state into every container is state nobody asked for — and
+    # KooCLI's cipher key is what it would later encrypt an AK/SK with. The
+    # runtime user is `hermes` with HERMES_HOME as its home, so it generates
+    # its own; root's copy is dead weight either way.
+    rm -rf /root/.azure /root/.hcloud /root/.aliyun /root/.kube
+
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
 # invalidate the (relatively slow) web + ui-tui build layer.
