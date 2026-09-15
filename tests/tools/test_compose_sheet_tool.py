@@ -239,3 +239,42 @@ class TestMediaPostprocessing:
         monkeypatch.setattr(cst.subprocess, "run", fake_run)
         out = cst.compose_sheet("guides/access/vpn-user-guide.md")
         assert out.splitlines()[-1] == f"MEDIA:{img.with_name('steps-e2e-c.jpg')}"
+
+
+class TestFailureDetail:
+    """compose_from_doc.py prints the whole numbered 图 N table to stdout BEFORE it invokes
+    compose_sheet.py, so on the production failure shape (2026-09-15 09:38 / 09:45, a 47-image
+    document, rc=1 after 0.12s) stdout is thousands of chars and stderr is the only thing that says
+    why. The old ``(stderr + stdout)[-800:]`` dropped stderr entirely — the longer the output, the
+    less visible the reason. These pin the inversion shut."""
+
+    def test_stderr_survives_a_very_long_stdout(self, kb, monkeypatch):
+        # ~4.2k chars, the size the real 47-image 广州打印机 table printed on 2026-09-15.
+        long_table = "\n".join(
+            f"  图 {n}: 在控制面板里点击“查看设备和打印机”，然后按提示继续 [image{n}.png]" for n in range(1, 48))
+        assert len(long_table) > 2 * cst.DETAIL_MAX_CHARS
+        stderr = "Traceback (most recent call last):\n  File \"compose_sheet.py\", line 144\nSystemExit: image not found: /knowledge/x/assets/g/image44.jpg"
+        monkeypatch.setattr(
+            cst.subprocess, "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=long_table, stderr=stderr))
+        detail = json.loads(cst.compose_sheet("guides/access/vpn-user-guide.md"))["detail"]
+        assert "image not found" in detail, detail
+        assert "SystemExit" in detail
+        # ...and the stdout tail is still there as context (which step it died on).
+        assert "图 47" in detail
+
+    def test_detail_stays_bounded(self, kb, monkeypatch):
+        monkeypatch.setattr(
+            cst.subprocess, "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="o" * 9000, stderr="e" * 9000))
+        detail = json.loads(cst.compose_sheet("guides/access/vpn-user-guide.md"))["detail"]
+        assert len(detail) <= cst.DETAIL_MAX_CHARS
+
+    def test_stderr_only_and_stdout_only_failures(self):
+        assert cst._failure_detail("boom", "") == "boom"
+        assert cst._failure_detail("", "tail") == "tail"
+
+    def test_stderr_keeps_its_floor_against_a_huge_stdout(self):
+        detail = cst._failure_detail("E" * 4000, "O" * 4000)
+        assert detail.count("E") >= cst.DETAIL_STDERR_MIN_CHARS
+        assert "O" in detail

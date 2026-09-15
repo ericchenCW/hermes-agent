@@ -204,6 +204,34 @@ def _postprocess_media(out: str, max_bytes: int = COMPOSE_SHEET_MAX_BYTES) -> st
     return "\n".join(result)
 
 
+DETAIL_MAX_CHARS = 800
+DETAIL_STDERR_MIN_CHARS = 500
+_DETAIL_SEP = "\n--- stdout 末尾 ---\n"
+
+
+def _failure_detail(stderr: str, stdout: str, max_chars: int = DETAIL_MAX_CHARS,
+                    stderr_min: int = DETAIL_STDERR_MIN_CHARS) -> str:
+    """Failure detail with stderr given a guaranteed budget.
+
+    The old form was ``((stderr or "") + stdout)[-max_chars:]``: compose_from_doc.py prints the whole
+    numbered 图 N table (thousands of chars for a 47-image document) to stdout BEFORE invoking
+    compose_sheet.py, so on a failure the tail window held only the table and the actual error was
+    dropped in full — the longer the output, the less visible the reason, exactly backwards. Keep the
+    TAIL of each stream (a traceback's last lines carry the exception; the table's tail carries the
+    step it died on) and never let stdout push stderr below ``stderr_min``."""
+    err = (stderr or "").strip()
+    out = (stdout or "").strip()
+    if not err:
+        return out[-max_chars:]
+    if not out:
+        return err[-max_chars:]
+    err_keep = min(len(err), max(stderr_min, max_chars - len(out) - len(_DETAIL_SEP)))
+    out_keep = max(0, max_chars - err_keep - len(_DETAIL_SEP))
+    if out_keep <= 0:
+        return err[-max_chars:]
+    return err[-err_keep:] + _DETAIL_SEP + out[-out_keep:]
+
+
 def compose_sheet(doc: str, os_name: str | None = None, section: str | None = None, max_steps: int | None = None) -> str:
     try:
         target = resolve_doc(doc)
@@ -224,7 +252,8 @@ def compose_sheet(doc: str, os_name: str | None = None, section: str | None = No
         return json.dumps({"error": f"compose timed out after {TIMEOUT_SECONDS}s"}, ensure_ascii=False)
     out = (proc.stdout or "").strip()
     if proc.returncode != 0:
-        return json.dumps({"error": "compose failed", "detail": ((proc.stderr or "") + out)[-800:]}, ensure_ascii=False)
+        return json.dumps(
+            {"error": "compose failed", "detail": _failure_detail(proc.stderr or "", out)}, ensure_ascii=False)
     if not out:
         return "NO_IMAGES"
     return _postprocess_media(out, COMPOSE_SHEET_MAX_BYTES)
