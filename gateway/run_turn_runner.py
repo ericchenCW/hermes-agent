@@ -1672,8 +1672,13 @@ class TurnRunner:
         a stale MEDIA: path from an earlier turn never rides a later reply; the history-path dedup is
         the secondary guard — and the sole one when mid-run compression shrank the list."""
         from gateway.run import _collect_auto_append_media_tags
-        if "MEDIA:" in final_response:
-            return final_response
+        # Deliberately NOT `if "MEDIA:" in final_response: return`. A model that retypes the producer's
+        # path with a typo ("steps-1789464927863.jpg" -> "st-1789464927863.jpg") used to disable the
+        # auto-append wholesale: the bogus directive is dropped by the delivery-path filter ("Skipping
+        # MEDIA directive path (not found on this host)") and the real tag was never appended, so the
+        # image the tool had already produced was silently never sent. The per-PATH check below keeps
+        # the "deliver each file once" contract (a correctly transcribed path is still not re-appended)
+        # without making delivery depend on the model copying a filename byte-for-byte.
         # Scan tool results for MEDIA:<path> tags that need to be delivered as native audio/file
         # attachments. The TTS tool embeds MEDIA: tags in its JSON response, but the model's final text
         # reply usually doesn't include them. We collect unique tags from tool results and append any that
@@ -1692,8 +1697,13 @@ class TurnRunner:
         )
         if not media_tags:
             return final_response
-        unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
-        return final_response + "\n" + "\n".join(unique_tags)
+        # Only tags whose PATH the reply does not already carry: a path the model transcribed correctly
+        # is already an explicit attach request, and appending it again would deliver the file twice.
+        missing = [tag for tag in dict.fromkeys(media_tags) if tag[len("MEDIA:"):] not in final_response]
+        if not missing:
+            return final_response
+        voice = ["[[audio_as_voice]]"] if has_voice_directive and "[[audio_as_voice]]" not in final_response else []
+        return final_response + "\n" + "\n".join(voice + missing)
 
     def run_sync(self):
         """Executor-thread body of the turn; returns the gateway result dict.
