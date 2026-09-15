@@ -247,7 +247,15 @@ def compose_sheet(doc: str, os_name: str | None = None, section: str | None = No
     if section:
         cmd += ["--section", str(section)[:60]]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, cwd=str(_kb_root()))
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=TIMEOUT_SECONDS,
+            cwd=str(_kb_root()),
+        )
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"compose timed out after {TIMEOUT_SECONDS}s"}, ensure_ascii=False)
     out = (proc.stdout or "").strip()
