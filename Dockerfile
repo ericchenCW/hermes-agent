@@ -306,7 +306,14 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 #     skill's python snippet calls. pyvmomi is VMware's own vSphere SDK and
 #     is what the asset-scan skill talks to vCenter with; it installs the
 #     `pyVmomi` and `pyVim` packages under one distribution, so both are
-#     checked below.
+#     checked below. It carries a `>=8` floor — the one version constraint in
+#     this layer — because a 7.x resolve does not fail on a current vCenter or
+#     on vcsim, it fails on their responses, as `xml document: ... parse
+#     error`, which reads like a broken server rather than an old client.
+#     The floor is a floor and not a pin: what a build actually resolved is
+#     recorded by the self check below and in versions.txt. Note the version
+#     is read from distribution metadata — pyvmomi 9.x has no
+#     `pyVmomi.__version__` attribute, so reading one raises AttributeError.
 #
 # `opskit-python` is a two-line wrapper rather than a symlink on purpose: a
 # symlinked interpreter resolves sys.prefix to /usr and then cannot see the
@@ -340,7 +347,7 @@ RUN set -eu; \
     uv tool install --python 3.13 ansible-core --with ansible; \
     uv tool install --python 3.13 tccli; \
     uv venv --python 3.13 "${OPSKIT_HOME}/venv"; \
-    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip install --no-cache-dir netmiko pysnmp pyvmomi; \
+    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip install --no-cache-dir netmiko pysnmp 'pyvmomi>=8'; \
     printf '#!/bin/sh\nexec %s/venv/bin/python "$@"\n' "${OPSKIT_HOME}" > /usr/local/bin/opskit-python; \
     chmod 0755 /usr/local/bin/opskit-python
 
@@ -403,7 +410,7 @@ RUN set -eu; \
     check ansible-playbook ansible-playbook --version; \
     check netmiko opskit-python -c 'import netmiko; print(netmiko.__version__)'; \
     check pysnmp opskit-python -c 'import pysnmp; print(pysnmp.__version__)'; \
-    check pyvmomi opskit-python -c 'import pyVmomi, pyVim; from pyVmomi import vim; print(pyVmomi.__file__)'; \
+    check pyvmomi opskit-python -c 'import pyVmomi, pyVim; from pyVmomi import vim; import importlib.metadata as m; print(m.version("pyvmomi"))'; \
     check tccli tccli --version; \
     check azure-cli sh -c 'az version -o json | sed -n "s/.*\"azure-cli\": \"\\([^\"]*\\)\".*/\\1/p" | head -1'; \
     check kubectl kubectl version --client=true; \
