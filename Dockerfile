@@ -301,9 +301,12 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 #     a private environment and puts only its entry points on PATH. ansible is
 #     installed as `ansible-core --with ansible`: the `ansible` meta package
 #     alone ships collections but no executables.
-#   * netmiko and pysnmp are libraries, not CLIs. They live in one shared
-#     environment reached through `opskit-python`, which is what a skill's
-#     python snippet calls.
+#   * netmiko, pysnmp and pyvmomi are libraries, not CLIs. They live in one
+#     shared environment reached through `opskit-python`, which is what a
+#     skill's python snippet calls. pyvmomi is VMware's own vSphere SDK and
+#     is what the asset-scan skill talks to vCenter with; it installs the
+#     `pyVmomi` and `pyVim` packages under one distribution, so both are
+#     checked below.
 #
 # `opskit-python` is a two-line wrapper rather than a symlink on purpose: a
 # symlinked interpreter resolves sys.prefix to /usr and then cannot see the
@@ -337,7 +340,7 @@ RUN set -eu; \
     uv tool install --python 3.13 ansible-core --with ansible; \
     uv tool install --python 3.13 tccli; \
     uv venv --python 3.13 "${OPSKIT_HOME}/venv"; \
-    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip install --no-cache-dir netmiko pysnmp; \
+    VIRTUAL_ENV="${OPSKIT_HOME}/venv" uv pip install --no-cache-dir netmiko pysnmp pyvmomi; \
     printf '#!/bin/sh\nexec %s/venv/bin/python "$@"\n' "${OPSKIT_HOME}" > /usr/local/bin/opskit-python; \
     chmod 0755 /usr/local/bin/opskit-python
 
@@ -400,6 +403,7 @@ RUN set -eu; \
     check ansible-playbook ansible-playbook --version; \
     check netmiko opskit-python -c 'import netmiko; print(netmiko.__version__)'; \
     check pysnmp opskit-python -c 'import pysnmp; print(pysnmp.__version__)'; \
+    check pyvmomi opskit-python -c 'import pyVmomi, pyVim; from pyVmomi import vim; print(pyVmomi.__file__)'; \
     check tccli tccli --version; \
     check azure-cli sh -c 'az version -o json | sed -n "s/.*\"azure-cli\": \"\\([^\"]*\\)\".*/\\1/p" | head -1'; \
     check kubectl kubectl version --client=true; \
@@ -579,6 +583,33 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
 VOLUME [ "/opt/data" ]
+
+# ---------- Build provenance ----------
+# Which fork branch and commit this image was built from, readable from inside
+# a running container. The fork carries several long-lived parallel branches
+# whose images are tagged by a short SHA alone, and a tag says nothing about
+# which line it came from: `fullkit-*` is built from sre-trim-leak-guard while
+# an identically-shaped `trim-*` may be built from sre-trim, and picking the
+# wrong one has already meant running production on a branch that predates a
+# P0 fix.
+#
+# Both values default to `unknown` rather than being resolved here: the build
+# context is a tarball with no .git, so a RUN step cannot find this out, and a
+# default that guessed would be worse than one that admits it does not know.
+# A build that wants provenance passes it:
+#
+#   docker build --build-arg HERMES_BUILD_BRANCH="$(git branch --show-current)" \
+#                --build-arg HERMES_BUILD_COMMIT="$(git rev-parse HEAD)" ...
+#
+# Read it back with `docker exec <c> cat /opt/hermes/build-info.txt`, or from
+# the environment as $HERMES_BUILD_BRANCH / $HERMES_BUILD_COMMIT. The file is
+# written last so changing these args rebuilds only this layer.
+ARG HERMES_BUILD_BRANCH=unknown
+ARG HERMES_BUILD_COMMIT=unknown
+ENV HERMES_BUILD_BRANCH=${HERMES_BUILD_BRANCH}
+ENV HERMES_BUILD_COMMIT=${HERMES_BUILD_COMMIT}
+RUN printf 'branch %s\ncommit %s\n' \
+        "${HERMES_BUILD_BRANCH}" "${HERMES_BUILD_COMMIT}" > /opt/hermes/build-info.txt
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
