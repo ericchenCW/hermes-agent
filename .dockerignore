@@ -4,8 +4,16 @@
 .gitmodules
 
 # Python
+# The `**/` variants are the ones that actually do the work: .dockerignore
+# matches with Go's filepath.Match, where `*` does not cross a `/`, so a bare
+# `__pycache__` only ever matched one at the context root. Everything nested
+# went into the image — a checkout that had run the test suite shipped 126
+# __pycache__ directories and 1117 .pyc files, ~35 MB, and made the image
+# depend on whether the building checkout happened to be dirty.
 __pycache__
+**/__pycache__
 *.py[cod]
+**/*.py[cod]
 *$py.class
 *.so
 .Python

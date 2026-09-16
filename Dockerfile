@@ -600,23 +600,29 @@ VOLUME [ "/opt/data" ]
 # wrong one has already meant running production on a branch that predates a
 # P0 fix.
 #
-# Both values default to `unknown` rather than being resolved here: the build
+# Only the branch is new here. The commit already has a home: HERMES_GIT_SHA,
+# which the CI workflow passes and which lands in /opt/hermes/.hermes_build_sha
+# and /etc/hermes/image-provenance.json. So this re-exports that same arg
+# instead of taking a second one — two commit values that can disagree are
+# worse than no commit value at all.
+#
+# The branch defaults to `unknown` rather than being resolved here: the build
 # context is a tarball with no .git, so a RUN step cannot find this out, and a
 # default that guessed would be worse than one that admits it does not know.
-# A build that wants provenance passes it:
+# A build that wants full provenance passes both:
 #
-#   docker build --build-arg HERMES_BUILD_BRANCH="$(git branch --show-current)" \
-#                --build-arg HERMES_BUILD_COMMIT="$(git rev-parse HEAD)" ...
+#   docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
+#                --build-arg HERMES_BUILD_BRANCH="$(git branch --show-current)" ...
 #
 # Read it back with `docker exec <c> cat /opt/hermes/build-info.txt`, or from
 # the environment as $HERMES_BUILD_BRANCH / $HERMES_BUILD_COMMIT. The file is
 # written last so changing these args rebuilds only this layer.
+ARG HERMES_GIT_SHA=
 ARG HERMES_BUILD_BRANCH=unknown
-ARG HERMES_BUILD_COMMIT=unknown
 ENV HERMES_BUILD_BRANCH=${HERMES_BUILD_BRANCH}
-ENV HERMES_BUILD_COMMIT=${HERMES_BUILD_COMMIT}
+ENV HERMES_BUILD_COMMIT=${HERMES_GIT_SHA:-unknown}
 RUN printf 'branch %s\ncommit %s\n' \
-        "${HERMES_BUILD_BRANCH}" "${HERMES_BUILD_COMMIT}" > /opt/hermes/build-info.txt
+        "${HERMES_BUILD_BRANCH}" "${HERMES_GIT_SHA:-unknown}" > /opt/hermes/build-info.txt
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
